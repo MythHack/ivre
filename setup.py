@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 
 Standard setup.py file. Run
 
@@ -27,25 +27,101 @@ $ python setup.py build
 """
 
 from distutils.core import setup
+from distutils.command.install_data import install_data
 import os
+import sys
+
+class smart_install_data(install_data):
+    """Replacement for distutils.command.install_data to handle
+    configuration files location and CGI files shebang lines.
+
+    """
+    def run(self):
+        # install files to /etc when target was /usr(/local)/etc
+        if self.install_dir.endswith('/usr') or \
+           self.install_dir.endswith('/usr/local'):
+            self.data_files = [
+                ("/%s" % path if path.startswith('etc/') else path, files)
+                for path, files in self.data_files
+            ]
+        result = install_data.run(self)
+        # handle CGI files like files in [PREFIX]/bin, replace first
+        # line based on sys.executable
+        for path, files in self.data_files:
+            for fname in files:
+                if fname.startswith('web/cgi-bin/') and fname.endswith('.py'):
+                    fullfname = os.path.join(self.install_dir, path,
+                                             os.path.basename(fname))
+                    tmpfname = "%s.tmp" % fullfname
+                    stat = os.stat(fullfname)
+                    os.rename(fullfname, tmpfname)
+                    with open(fullfname, 'w') as newf:
+                        with open(tmpfname) as oldf:
+                            oldf.readline()
+                            newf.write("#!%s\n" % sys.executable)
+                            for line in oldf:
+                                newf.write(line)
+                    os.chown(fullfname, stat.st_uid, stat.st_gid)
+                    os.chmod(fullfname, stat.st_mode)
+                    os.unlink(tmpfname)
+        return result
 
 setup(
     name='ivre',
-    version='0.9',
+    version='0.9.3',
+    author='Pierre LALET',
+    author_email='pierre@droids-corp.org',
+    url='https://ivre.rocks/',
+    download_url='https://github.com/cea-sec/ivre/tarball/master',
+    license='GPLv3+',
+    description='Network recon framework',
+    long_description="""
+IVRE is a set of tools aimed at gathering and exploiting network
+information.
+
+It consists of a Python library, a Web UI, CLI tools and several
+specialized scripts.
+""",
+    keywords=["network", "network recon", "network cartography",
+              "nmap", "bro", "p0f"],
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Environment :: Console",
+        "Environment :: Web Environment",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Information Technology",
+        "Intended Audience :: Science/Research",
+        "Intended Audience :: System Administrators",
+        "Intended Audience :: Telecommunications Industry",
+        "License :: OSI Approved :: "
+        "GNU General Public License v3 or later (GPLv3+)",
+        "Programming Language :: Python :: 2",
+        "Programming Language :: Python :: 2.6",
+        "Programming Language :: Python :: 2.7",
+        "Topic :: Scientific/Engineering :: Information Analysis",
+        "Topic :: Security",
+        "Topic :: System :: Networking",
+        "Topic :: System :: Networking :: Monitoring",
+        "Topic :: System :: Software Distribution",
+    ],
     install_requires=[
         'pycrypto',
         'pymongo>=2.7.2',
     ],
-    packages=['ivre', 'ivre/db'],
-    scripts=['bin/getmoduli', 'bin/ipdata', 'bin/ipinfo', 'bin/ipinfohost',
-             'bin/httpd-ivre', 'bin/nmap2db', 'bin/p0f2db', 'bin/analysercli',
-             'bin/passiverecon2db', 'bin/passivereconworker',
-             'bin/runscans', 'bin/runscans-agent', 'bin/runscans-agentdb',
-             'bin/plotdb', 'bin/scancli', 'bin/scanstatus'],
+    extras_require={
+        'Flow':  ["py2neo>=3"],
+    },
+    packages=['ivre', 'ivre/tools', 'ivre/db', 'ivre/parser'],
+    scripts=['bin/ivre'],
     data_files=[
         ('share/ivre/passiverecon',
          ['passiverecon/passiverecon.bro',
           'passiverecon/passiverecon2db-ignore.example']),
+        ('share/ivre/bro/flow',
+         ['bro/flow/__load__.bro',
+          'bro/flow/dhcp_names.bro',
+          'bro/flow/rpc.bro',
+          'bro/flow/settings.bro']),
         ('share/ivre/honeyd', ['honeyd/sshd']),
         ('share/ivre/geoip', []),
         ('share/ivre/docker', ['docker/Vagrantfile']),
@@ -65,9 +141,10 @@ setup(
           'docker/web-apache/doku-conf-local.php']),
         ('share/ivre/web/static',
          ['web/static/index.html',
+          'web/static/compare.html',
+          'web/static/flow.html',
           'web/static/report.html',
           'web/static/upload.html',
-          'web/static/config-sample.js',
           'web/static/favicon-loading.gif',
           'web/static/favicon.png',
           'web/static/loading.gif',
@@ -76,14 +153,17 @@ setup(
           'web/static/world-110m.json']),
         ('share/ivre/web/static/templates',
          ['web/static/templates/filters.html',
+          'web/static/templates/graph-right-click.html',
           'web/static/templates/menu.html',
           'web/static/templates/messages.html',
           'web/static/templates/progressbar.html',
+          'web/static/templates/query-builder.html',
           'web/static/templates/view-cpes-only.html',
           'web/static/templates/view-hosts.html',
           'web/static/templates/view-screenshots-only.html',
           'web/static/templates/view-scripts-only.html',
           'web/static/templates/subview-cpes.html',
+          'web/static/templates/subview-graph-elt-details.html',
           'web/static/templates/subview-host-summary.html',
           'web/static/templates/subview-port-summary.html',
           'web/static/templates/subview-ports-summary.html',
@@ -91,14 +171,20 @@ setup(
           'web/static/templates/topvalues.html']),
         # IVRE
         ('share/ivre/web/static/ivre',
-         ['web/static/ivre/ivre.css',
+         ['web/static/ivre/flow.css',
+          'web/static/ivre/ivre.css',
+          'web/static/ivre/compare.js',
           'web/static/ivre/controllers.js',
+          'web/static/ivre/filters.js',
+          'web/static/ivre/form-helpers.js',
           'web/static/ivre/graph.js',
           'web/static/ivre/ivre.js',
           'web/static/ivre/params.js',
           'web/static/ivre/tooltip.js',
           'web/static/ivre/utils.js',
           'web/static/ivre/content.js']),
+        ('share/ivre/web/static/ivre/flow',
+         ['web/static/ivre/flow/controllers.js']),
         # Bootstrap
         ('share/ivre/web/static/bs/css',
          ['web/static/bs/css/bootstrap.css',
@@ -118,6 +204,12 @@ setup(
         # AngularJS
         ('share/ivre/web/static/an/js',
          ['web/static/an/js/angular.js']),
+        # Linkurious/sigma.js
+        ('share/ivre/web/static/lk',
+         ['web/static/lk/plugins.min.js',
+          'web/static/lk/plugins.min.js.map',
+          'web/static/lk/sigma.min.js',
+          'web/static/lk/sigma.min.js.map']),
         # flag-icon-css
         ('share/ivre/web/static/fi/css',
          ['web/static/fi/css/flag-icon.css']),
@@ -144,7 +236,9 @@ setup(
          [os.path.join('doc/screenshots', x)
           for x in os.listdir('doc/screenshots')]),
         ('share/ivre/web/cgi-bin',
-         ['web/cgi-bin/scanjson.py',
+         ['web/cgi-bin/flowjson.py',
+          'web/cgi-bin/jsconfig.py',
+          'web/cgi-bin/scanjson.py',
           'web/cgi-bin/scanupload.py']),
         ('share/doc/ivre',
          ['doc/AGENT.md',
@@ -157,17 +251,7 @@ setup(
           'doc/SCREENSHOTS.md',
           'doc/TESTS.md',
           'doc/WEBUI.md']),
+        ('etc/bash_completion.d', ['bash_completion/ivre']),
     ],
-    author='Pierre LALET',
-    author_email='pierre.lalet@cea.fr',
-    url='http://pierre.droids-corp.org/blog/html/tags/ivre.html',
-    description='IVRE: Instrument de veille sur les reseaux exterieurs',
-    license='GPLv3',
-    long_description="""
-IVRE is a set of tools aimed at gathering and exploiting network
-information.
-
-It is compounded of a Python library, a Web UI, three CLIs and several
-specialized scripts.
-"""
+    cmdclass={'install_data':smart_install_data},
 )

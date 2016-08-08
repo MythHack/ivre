@@ -33,7 +33,6 @@ RUN apt-get -qy install patch && \
 RUN ln -s /usr/local/share/ivre/dokuwiki/doc var/www/dokuwiki/data/pages/doc
 RUN ln -s /usr/local/share/ivre/dokuwiki/media/logo.png var/www/dokuwiki/data/media/wiki/logo.png
 RUN ln -s /usr/local/share/ivre/dokuwiki/media/doc var/www/dokuwiki/data/media/wiki/doc
-RUN touch usr/local/share/ivre/web/static/config.js
 RUN echo 'WEB_GET_NOTEPAD_PAGES = ("localdokuwiki", ("/var/www/dokuwiki/data/pages",))' >> /etc/ivre.conf
 
 # Configure Dokuwiki
@@ -43,6 +42,9 @@ ADD doku-conf-plugins.local.php var/www/dokuwiki/conf/plugins.local.php
 ADD doku-conf-acl.auth.php var/www/dokuwiki/conf/acl.auth.php
 ADD doku-conf-users.auth.php var/www/dokuwiki/conf/users.auth.php
 RUN chown -Rh www-data:www-data var/www/dokuwiki/data var/www/dokuwiki/conf var/www/dokuwiki/lib/plugins
+
+# Needed by Neo4j
+RUN mkdir /var/www/.neo4j && chown www-data:www-data /var/www/.neo4j
 
 EXPOSE 80
 CMD service php5-fpm start && service fcgiwrap start && exec /usr/sbin/nginx

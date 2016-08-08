@@ -1,0 +1,55 @@
+.fill {
+  height: 100%;
+  min-height: 100%;
+  padding: 0;
+  margin: 0;
+}
+
+.fullfill {
+  height: 100%;
+  min-height: 100%;
+  width: 100%;
+  min-width: 100%;
+  padding: 0;
+  margin: 0;
+}
+
+.main {
+  height: 95%;
+  min-height: 95%;
+  padding: 0;
+  margin: 0;
+}
+
+.status {
+  height: 5%;
+  min-height: 5%;
+  padding: 0;
+  margin: 0;
+}
+
+.nomargin {
+  padding: 0;
+  margin: 0;
+}
+
+#graph-container {
+  z-index: 0;
+  height: 100%;
+  width: 100%;
+  position: absolute;
+  background-color: #000;
+}
+
+#timeline {
+  background-color: #000;
+}
+
+#wrapper {
+  z-index: 1;
+}
+
+#control-pane {
+  overflow: auto;
+  height: 95%;
+}

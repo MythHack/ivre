@@ -18,7 +18,7 @@
 
 /* leave room from the topbar */
 body {
-    padding-top: 50px;
+    padding-top: 40px;
 }
 
 .navbar .logo {
@@ -62,16 +62,16 @@ hr {
     margin-right: 20%;
 }
 
+.ivre-main {
+    margin-top: 10px;
+}
+
 .sidebar {
     position: fixed;
 }
 
 .sidebar .progress {
     margin-bottom: 5px;
-}
-
-.sidebar .input-group {
-     margin-bottom: 10px;
 }
 
 /* Progress bar not starting at the beginning */
@@ -247,4 +247,21 @@ form {
 
 .menu-single {
     font-weight: bold;
+}
+
+.filter-list > .input-group {
+    margin-bottom: 5px;
+}
+
+.graph-list > div > ul > li {
+    margin: 5px;
+}
+
+.navbar.graph-list .navbar-inner {
+    text-align: center;
+}
+
+.navbar.graph-list .navbar-inner .nav {
+    float: none;
+    display:inline-block;
 }

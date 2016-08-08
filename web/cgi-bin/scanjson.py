@@ -47,6 +47,12 @@ def main():
     callback = params.get("callback")
     # type of result
     action = params.get("action", "")
+    ipsasnumbers = params.get("ipsasnumbers")
+    datesasstrings = params.get("datesasstrings")
+    if callback is None:
+        sys.stdout.write('Content-Disposition: attachment; '
+                         'filename="IVRE-results.json"\r\n')
+    sys.stdout.write("\r\n")
 
     # top values
     if action.startswith('topvalues:'):
@@ -69,16 +75,17 @@ def main():
                                     least=least, topnbr=topnbr,
                                     archive=archive)]
         if callback is None:
-            sys.stdout.write("%s;\n" % json.dumps(series))
+            sys.stdout.write("%s\n" % json.dumps(series))
         else:
             sys.stdout.write("%s(%s);\n" % (callback, json.dumps(series)))
         exit(0)
 
     # extract info
     if action in ["onlyips", "ipsports", "timeline", "coordinates",
-                  "countopenports"]:
+                  "countopenports", "diffcats"]:
         preamble = "[\n"
         postamble = "]\n"
+        r2res = lambda x: x
         if action == "timeline":
             result = db.nmap.get(
                 flt, archive=archive,
@@ -90,7 +97,7 @@ def main():
             else:
                 r2time = lambda r: (int(r['starttime'].strftime('%s'))
                                     % int(params.get("modulo")))
-            if params.get("ipsasnumbers"):
+            if ipsasnumbers:
                 r2res = lambda r: [r2time(r), r['addr'],
                                    r['openports']['count']]
             else:
@@ -111,7 +118,7 @@ def main():
             result = db.nmap.get(flt, archive=archive,
                                  fields=['addr', 'openports.count'])
             count = result.count()
-            if params.get("ipsasnumbers"):
+            if ipsasnumbers:
                 r2res = lambda r: [r['addr'], r['openports']['count']]
             else:
                 r2res = lambda r: [utils.int2ip(r['addr']),
@@ -123,7 +130,7 @@ def main():
             )
             count = sum(len(host.get('ports', [])) for host in result)
             result.rewind()
-            if params.get("ipsasnumbers"):
+            if ipsasnumbers:
                 r2res = lambda r: [
                     r['addr'],
                     [[p['port'], p['state_state']]
@@ -140,10 +147,33 @@ def main():
         elif action == "onlyips":
             result = db.nmap.get(flt, archive=archive, fields=['addr'])
             count = result.count()
-            if params.get("ipsasnumbers"):
+            if ipsasnumbers:
                 r2res = lambda r: r['addr']
             else:
                 r2res = lambda r: utils.int2ip(r['addr'])
+        elif action == "diffcats":
+            if params.get("onlydiff"):
+                output = db.nmap.diff_categories(params.get("cat1"),
+                                                 params.get("cat2"),
+                                                 flt=flt,
+                                                 include_both_open=False)
+            else:
+                output = db.nmap.diff_categories(params.get("cat1"),
+                                                 params.get("cat2"),
+                                                 flt=flt)
+            count = 0
+            result = {}
+            if ipsasnumbers:
+                for res in output:
+                    result.setdefault(res["addr"], []).append([res['port'],
+                                                              res['value']])
+                    count += 1
+            else:
+                for res in output:
+                    result.setdefault(utils.int2ip(res["addr"]),
+                                      []).append([res['port'], res['value']])
+                    count += 1
+            result = result.iteritems()
         if count >= config.WEB_WARN_DOTS_COUNT:
             sys.stdout.write(
                 'if(confirm("You are about to ask your browser to display %d '
@@ -157,8 +187,8 @@ def main():
             sys.stdout.write(json.dumps(r2res(rec)) + ",\n")
         sys.stdout.write(postamble)
         if callback is not None:
-            sys.stdout.write(")")
-        sys.stdout.write(";\n")
+            sys.stdout.write(");")
+        sys.stdout.write("\n")
         if count >= config.WEB_WARN_DOTS_COUNT:
             sys.stdout.write('}\n')
         exit(0)
@@ -168,10 +198,10 @@ def main():
                          limit=limit, skip=skip, sort=sortby)
 
     if action == "count":
-        if callback is not None:
-            sys.stdout.write("%s(%d);\n" % (callback, result.count()))
+        if callback is None:
+            sys.stdout.write("%d\n" % result.count())
         else:
-            sys.stdout.write("%d;\n" % result.count())
+            sys.stdout.write("%s(%d);\n" % (callback, result.count()))
         exit(0)
 
     if unused:
@@ -181,46 +211,64 @@ def main():
         )
         sys.stdout.write(webutils.js_alert("param-unused", "warning", msg))
         sys.stderr.write('IVRE: WARNING: %r\n' % msg)
+    elif callback is not None:
+        sys.stdout.write(webutils.js_del_alert("param-unused"))
 
     if config.DEBUG:
         msg = "filter: %r" % flt
         sys.stdout.write(webutils.js_alert("filter", "info", msg))
         sys.stderr.write('IVRE: INFO: %r\n' % msg)
+        msg = "user: %r" % webutils.get_user()
+        sys.stdout.write(webutils.js_alert("user", "info", msg))
+        sys.stderr.write('IVRE: INFO: %r\n' % msg)
 
     version_mismatch = {}
+    if callback is None:
+        tab, sep = "", "\n"
+    else:
+        tab, sep = "\t", ",\n"
+        sys.stdout.write("%s([\n" % callback)
     for rec in result:
-        del rec['_id']
-        try:
-            rec['addr'] = utils.int2ip(rec['addr'])
-        except:
-            pass
+        for fld in ['_id', 'scanid']:
+            try:
+                del rec[fld]
+            except KeyError:
+                pass
+        if not ipsasnumbers:
+            try:
+                rec['addr'] = utils.int2ip(rec['addr'])
+            except:
+                pass
         for field in ['starttime', 'endtime']:
             if field in rec:
-                rec[field] = int(rec[field].strftime('%s'))
+                if not datesasstrings:
+                    rec[field] = int(rec[field].strftime('%s'))
         for port in rec.get('ports', []):
             if 'screendata' in port:
                 port['screendata'] = port['screendata'].encode('base64')
-        if 'traces' in rec:
-            for trace in rec['traces']:
-                trace['hops'].sort(key=lambda x: x['ttl'])
-                for hop in trace['hops']:
-                    try:
-                        hop['ipaddr'] = utils.int2ip(hop['ipaddr'])
-                    except:
-                        pass
-        if callback is not None:
-            sys.stdout.write("%s(%s);\n" % (callback, json.dumps(rec)))
-        else:
-            sys.stdout.write("%s;\n" % json.dumps(rec))
+        if not ipsasnumbers:
+            if 'traces' in rec:
+                for trace in rec['traces']:
+                    trace['hops'].sort(key=lambda x: x['ttl'])
+                    for hop in trace['hops']:
+                        try:
+                            hop['ipaddr'] = utils.int2ip(hop['ipaddr'])
+                        except:
+                            pass
+        sys.stdout.write("%s%s%s" % (
+            tab, json.dumps(rec, default=utils.serialize), sep
+        ))
         check = db.nmap.cmp_schema_version_host(rec)
         if check:
             version_mismatch[check] = version_mismatch.get(check, 0) + 1
+    if callback is not None:
+        sys.stdout.write("]);\n")
 
     messages = {
         1: lambda count: ("%d document%s displayed %s out-of-date. Please run "
-                          "the following commands: 'scancli --update-schema; "
-                          "scancli --update-schema --archives'"
-                          "" % (count, 's' if count > 1 else '',
+                          "the following commands: 'ivre scancli "
+                          "--update-schema; ivre scancli --update-schema "
+                          "--archives'" % (count, 's' if count > 1 else '',
                                            'are' if count > 1 else 'is')),
         -1: lambda count: ('%d document%s displayed ha%s been inserted by '
                            'a more recent version of IVRE. Please update '

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -25,13 +25,17 @@ databases.
 from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent
 from ivre import utils, xmlnmap, config
 
-import sys
-import pymongo
+import datetime
 import bson
 import json
-
+import pymongo
 import re
-import datetime
+import sys
+try:
+    from collections import OrderedDict
+except ImportError:
+    # fallback to dict for Python 2.6
+    OrderedDict = dict
 
 
 class MongoDB(DB):
@@ -158,10 +162,6 @@ class MongoDB(DB):
         return json.dumps(cursor.explain(), indent=indent,
                           default=self.serialize)
 
-    @staticmethod
-    def distinct(cursor, fieldname):
-        return cursor.distinct(fieldname)
-
     def create_indexes(self):
         for colname, indexes in self.indexes.iteritems():
             for index in indexes:
@@ -182,6 +182,12 @@ class MongoDB(DB):
             updated = False
             new_version, migration_function = self.schema_migrations[
                 colname][version]
+            if config.DEBUG:
+                sys.stderr.write(
+                    "INFO: migrating column %s from version %r to %r\n" % (
+                        colname, version, new_version,
+                    )
+                )
             # unlimited find()!
             for record in self.find(colname, self.searchversion(version)):
                 try:
@@ -212,6 +218,12 @@ class MongoDB(DB):
                                     exc.message)
                             )
             version = new_version
+            if config.DEBUG:
+                sys.stderr.write(
+                    "INFO: migration of column %s from version %r to %r DONE\n" % (
+                        colname, version, new_version,
+                    )
+                )
         if failed:
             sys.stderr.write("WARNING: failed to migrate %d documents"
                              "\n" % failed)
@@ -245,18 +257,15 @@ class MongoDB(DB):
         if flt:
             pipeline += [{"$match": flt}]
         if sortby is not None and ((limit is not None) or (skip is not None)):
-            pipeline += [{"$sort": dict(sortby)}]
+            pipeline += [{"$sort": OrderedDict(sortby)}]
         if skip is not None:
             pipeline += [{"$skip": skip}]
         if limit is not None:
             pipeline += [{"$limit": limit}]
-        if specialproj is None:
-            project = {"_id": 0, field: 1}
-            if countfield is not None:
-                project[countfield] = 1
-            pipeline += [{"$project": project}]
-        else:
-            pipeline += [{"$project": specialproj}]
+        project = {"_id": 0, field: 1} if specialproj is None else specialproj
+        if countfield is not None:
+            project[countfield] = 1
+        pipeline += [{"$project": project}]
         # hack to allow nested values as field
         # see <http://stackoverflow.com/questions/13708857/
         # mongodb-aggregation-framework-nested-arrays-subtract-expression>
@@ -284,6 +293,30 @@ class MongoDB(DB):
             pipeline += [{"$sort": {"count": -1}}]
         if topnbr is not None:
             pipeline += [{"$limit": topnbr}]
+        return pipeline
+
+    def _distinct(self, field, flt=None, sortby=None, limit=None, skip=None):
+        """This method makes use of the aggregation framework to
+        produce distinct values for a given field.
+
+        """
+        pipeline = []
+        if flt:
+            pipeline.append({'$match': flt})
+        if sortby:
+            pipeline.append({'$sort': OrderedDict(sortby)})
+        if skip is not None:
+            pipeline += [{"$skip": skip}]
+        if limit is not None:
+            pipeline += [{"$limit": limit}]
+        # hack to allow nested values as field
+        # see <http://stackoverflow.com/questions/13708857/
+        # mongodb-aggregation-framework-nested-arrays-subtract-expression>
+        for i in xrange(field.count('.'), -1, -1):
+            subfield = field.rsplit('.', i)[0]
+            if subfield in self.needunwind:
+                pipeline += [{"$unwind": "$" + subfield}]
+        pipeline.append({'$group': {'_id': '$%s' % field}})
         return pipeline
 
     # filters
@@ -408,15 +441,22 @@ class MongoDB(DB):
 
 class MongoDBNmap(MongoDB, DBNmap):
 
-    content_handler = xmlnmap.Nmap2Mongo
     needunwind = ["categories", "labels", "labels.tags",
                   "ports", "ports.scripts",
                   "ports.scripts.ssh-hostkey",
                   "ports.scripts.smb-enum-shares.shares",
                   "ports.scripts.ls.volumes",
                   "ports.scripts.ls.volumes.files",
+                  "ports.scripts.mongodb-databases.databases",
+                  "ports.scripts.mongodb-databases.databases.shards",
+                  "ports.scripts.vulns",
+                  "ports.scripts.vulns.check_results",
+                  "ports.scripts.vulns.description",
+                  "ports.scripts.vulns.extra_info",
+                  "ports.scripts.vulns.ids",
+                  "ports.scripts.vulns.refs",
                   "ports.screenwords",
-                  "extraports.filtered", "traces", "traces.hops",
+                  "traces", "traces.hops",
                   "os.osmatch", "os.osclass", "hostnames",
                   "hostnames.domains", "cpes"]
 
@@ -427,6 +467,8 @@ class MongoDBNmap(MongoDB, DBNmap):
                  **kargs):
         MongoDB.__init__(self, host, dbname, **kargs)
         DBNmap.__init__(self)
+        self.content_handler = xmlnmap.Nmap2Mongo
+        self.output_function = None
         self.colname_scans = colname_scans
         self.colname_hosts = colname_hosts
         self.colname_oldscans = colname_oldscans
@@ -462,6 +504,12 @@ class MongoDBNmap(MongoDB, DBNmap):
                  {"sparse": True}),
                 ([('ports.scripts.ls.volumes.files.filename',
                    pymongo.ASCENDING)],
+                 {"sparse": True}),
+                ([
+                    ('ports.scripts.vulns.id', pymongo.ASCENDING),
+                    ('ports.scripts.vulns.state', pymongo.ASCENDING),
+                ], {"sparse": True}),
+                ([('ports.scripts.vulns.state', pymongo.ASCENDING)],
                  {"sparse": True}),
                 ([
                     ('ports.screenshot', pymongo.ASCENDING),
@@ -500,6 +548,10 @@ class MongoDBNmap(MongoDB, DBNmap):
                 1: (2, self.migrate_schema_hosts_1_2),
                 2: (3, self.migrate_schema_hosts_2_3),
                 3: (4, self.migrate_schema_hosts_3_4),
+                4: (5, self.migrate_schema_hosts_4_5),
+                5: (6, self.migrate_schema_hosts_5_6),
+                6: (7, self.migrate_schema_hosts_6_7),
+                7: (8, self.migrate_schema_hosts_7_8),
             },
         }
         self.schema_migrations[self.colname_oldhosts] = self.schema_migrations[
@@ -535,6 +587,10 @@ class MongoDBNmap(MongoDB, DBNmap):
                 ([('scripts.id', pymongo.ASCENDING)], {}),
                 ([('scripts.ls.volumes.volume', pymongo.ASCENDING)], {}),
                 ([('scripts.ls.volumes.files.filename', pymongo.ASCENDING)], {}),
+            ]},
+            6: {"ensure": [
+                ([('ports.scripts.vulns.state', pymongo.ASCENDING)],
+                 {"sparse": True}),
             ]},
         }
         self.schema_migrations_indexes[colname_oldhosts] = {
@@ -584,8 +640,8 @@ creates the default indexes."""
         open ports based researches.
 
         """
-        assert("schema_version" not in doc)
-        assert("openports" not in doc)
+        assert "schema_version" not in doc
+        assert "openports" not in doc
         update = {"$set": {"schema_version": 1}}
         updated_ports = False
         openports = {}
@@ -618,7 +674,7 @@ creates the default indexes."""
         nmap-services file.
 
         """
-        assert(doc["schema_version"] == 1)
+        assert doc["schema_version"] == 1
         update = {"$set": {"schema_version": 2}}
         update_ports = False
         for port in doc.get("ports", []):
@@ -638,7 +694,7 @@ creates the default indexes."""
         library.
 
         """
-        assert(doc["schema_version"] == 2)
+        assert doc["schema_version"] == 2
         update = {"$set": {"schema_version": 3}}
         updated_ports = False
         updated_scripts = False
@@ -651,6 +707,7 @@ creates the default indexes."""
                     if script['id'] in script:
                         script["ls"] = xmlnmap.change_ls(
                             script.pop(script['id']))
+                        updated_ports = True
                     elif "ls" not in script:
                         data = xmlnmap.add_ls_data(script)
                         if data is not None:
@@ -674,7 +731,7 @@ creates the default indexes."""
         creates a "fake" port entry to store host scripts.
 
         """
-        assert(doc["schema_version"] == 3)
+        assert doc["schema_version"] == 3
         update = {"$set": {"schema_version": 4}}
         if 'scripts' in doc:
             doc.setdefault('ports', []).append({
@@ -683,6 +740,110 @@ creates the default indexes."""
             })
             update["$set"]["ports"] = doc["ports"]
             update["$unset"] = {"scripts": True}
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_4_5(doc):
+        """Converts a record from version 4 to version 5. Version 5
+        uses the magic value -1 instead of "host" for "port" in the
+        "fake" port entry used to store host scripts (see
+        `migrate_schema_hosts_3_4()`). Moreover, it changes the
+        structure of the values of "extraports" from [totalcount,
+        {"state": count}] to {"total": totalcount, "state": count}.
+
+        """
+        assert doc["schema_version"] == 4
+        update = {"$set": {"schema_version": 5}}
+        updated_ports = False
+        updated_extraports = False
+        for port in doc.get('ports', []):
+            if port['port'] == 'host':
+                port['port'] = -1
+                updated_ports = True
+        if updated_ports:
+            update["$set"]["ports"] = doc['ports']
+        for state, (total, counts) in doc.get('extraports', {}).items():
+            doc['extraports'][state] = {"total": total, "reasons": counts}
+            updated_extraports = True
+        if updated_extraports:
+            update["$set"]["extraports"] = doc['extraports']
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_5_6(doc):
+        """Converts a record from version 5 to version 6. Version 6 uses Nmap
+        structured data for scripts using the vulns NSE library.
+
+        """
+        assert doc["schema_version"] == 5
+        update = {"$set": {"schema_version": 6}}
+        updated = False
+        migrate_scripts = set(script for script, alias
+                              in xmlnmap.ALIASES_TABLE_ELEMS.iteritems()
+                              if alias == 'vulns')
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] in migrate_scripts:
+                    table = None
+                    if script['id'] in script:
+                        table = script.pop(script['id'])
+                        script["vulns"] = table
+                        updated = True
+                    elif "vulns" in script:
+                        table = script["vulns"]
+                    else:
+                        continue
+                    newtable = xmlnmap.change_vulns(table)
+                    if newtable != table:
+                        script["vulns"] = newtable
+                        updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_6_7(doc):
+        """Converts a record from version 6 to version 7. Version 7 creates a
+        structured output for mongodb-databases script.
+
+        """
+        assert doc["schema_version"] == 6
+        update = {"$set": {"schema_version": 7}}
+        updated = False
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] == "mongodb-databases":
+                    if 'mongodb-databases' not in script:
+                        data = xmlnmap.add_mongodb_databases_data(script)
+                        if data is not None:
+                            script['mongodb-databases'] = data
+                            updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_7_8(doc):
+        """Converts a record from version 7 to version 8. Version 8 fixes the
+        structured output for scripts using the vulns NSE library.
+
+        """
+        assert doc["schema_version"] == 7
+        update = {"$set": {"schema_version": 8}}
+        updated = False
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if 'vulns' in script:
+                    if any(elt in script['vulns'] for elt in
+                           ["ids", "refs", "description", "state", "title"]):
+                        script['vulns'] = [script['vulns']]
+                    else:
+                        script['vulns'] = [dict(tab, id=vulnid)
+                                           for vulnid, tab in
+                                           script['vulns'].iteritems()]
+                    updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
         return update
 
     def get(self, flt, archive=False, **kargs):
@@ -913,13 +1074,11 @@ have no effect if it is not expected)."""
                 rec["scanid"] = list(scanid)
         for fname, function in [("starttime", min), ("endtime", max)]:
             try:
-                rec[fname] = function(rec[fname] for rec in [rec1, rec2]
-                                      if fname in rec)
+                rec[fname] = function(record[fname] for record in [rec1, rec2]
+                                      if fname in record)
             except ValueError:
                 pass
-        rec["state"] = ("up" if "up" in [rec.get("state")
-                                         for rec in [rec1, rec2]]
-                        else rec.get("state"))
+        rec["state"] = "up" if rec1.get("state") == "up" else rec2.get("state")
         if rec["state"] is None:
             del rec["state"]
         rec["categories"] = list(
@@ -1007,7 +1166,7 @@ have no effect if it is not expected)."""
             colname_scans = self.colname_scans
         self.db[colname_hosts].remove(spec_or_id=host['_id'])
         for scanid in self.getscanids(host):
-            if self.get({'scanid': scanid}, archive=archive).count() == 0:
+            if self.find_one(colname_hosts, {'scanid': scanid}) is None:
                 self.db[colname_scans].remove(spec_or_id=scanid)
 
     def archive(self, host, unarchive=False):
@@ -1239,12 +1398,15 @@ have no effect if it is not expected)."""
                 return {'labels.group': {'$not': group} if neg else group}
             return {'labels.group': {'$ne': group} if neg else group}
         if neg:
-            return self.flt_or(self.searchlabel(group=group, neg=True),
-                               {'labels': {'$elemMatch':
-                                           {'group': group,
-                                            'tags': {'$not': label}
-                                            if type(label) is utils.REGEXP_T
-                                            else {'$ne': label}}}})
+            return self.flt_or(
+                self.searchlabel(group=group, neg=True),
+                {'labels': {'$elemMatch': {
+                    'group': group,
+                    'tags': ({'$not': label}
+                             if type(label) is utils.REGEXP_T
+                             else {'$ne': label})
+                }}},
+            )
         return {'labels': {'$elemMatch': {'group': group, 'tags': label}}}
 
     @staticmethod
@@ -1323,7 +1485,7 @@ have no effect if it is not expected)."""
 
         """
         if port == "host":
-            return {'ports.port': {'$ne': "host"} if neg else "host"}
+            return {'ports.port': {"$gte": 0} if neg else -1}
         if state == "open":
             return {"openports.%s.ports" % protocol:
                     {'$ne': port} if neg else port}
@@ -1385,7 +1547,7 @@ have no effect if it is not expected)."""
     @staticmethod
     def searchcountopenports(minn=None, maxn=None, neg=False):
         "Filters records with open port number between minn and maxn"
-        assert(minn is not None or maxn is not None)
+        assert minn is not None or maxn is not None
         flt = []
         if minn == maxn:
             return {'openports.count': {'$ne': minn} if neg else minn}
@@ -1659,6 +1821,17 @@ have no effect if it is not expected)."""
         return {'ports.service_extrainfo': 'Anonymous bind OK'}
 
     @staticmethod
+    def searchvuln(vulnid=None, status=None):
+        if status is None:
+            return {'ports.scripts.vulns.id':
+                    {'$exists': True} if vulnid is None else vulnid}
+        if vulnid is None:
+            return {'ports.scripts.vulns.status': status}
+        return {'ports.scripts.vulns': {
+            '$elemMatch': {'id': vulnid, 'status': status}
+        }}
+
+    @staticmethod
     def searchtimeago(delta, neg=False):
         if not isinstance(delta, datetime.timedelta):
             delta = datetime.timedelta(seconds=delta)
@@ -1797,11 +1970,12 @@ have no effect if it is not expected)."""
             / script:host:<scriptid>
           - cert.* / smb.* / sshkey.*
           - modbus.* / s7.* / enip.*
+          - mongo.dbs.*
+          - vulns.*
           - screenwords
           - file.* / file.*:scriptid
           - hop
         """
-        colname = self.colname_oldhosts if archive else self.colname_hosts
         outputproc = None
         if flt is None:
             flt = self.flt_empty
@@ -2222,6 +2396,29 @@ have no effect if it is not expected)."""
                 "ip": "Device IP",
             }.get(subfield, subfield)
             field = 'ports.scripts.enip-info.' + subfield
+        elif field.startswith('mongo.dbs.'):
+            flt = self.flt_and(flt, self.searchscript(name="mongodb-databases"))
+            field = 'ports.scripts.mongodb-databases.' + field[10:]
+        elif field.startswith('vulns.'):
+            flt = self.flt_and(flt, self.searchvuln())
+            subfield = field[6:]
+            if subfield == "id":
+                field = 'ports.scripts.vulns.id'
+            else:
+                field = "ports.scripts.vulns." + subfield
+                specialproj = {
+                    "_id": 0,
+                    "ports.scripts.vulns.id": 1,
+                    field: 1,
+                }
+                specialflt = [{"$project": {"_id": 0,
+                                            field: {"$concat": [
+                                                "$ports.scripts.vulns.id",
+                                                "###",
+                                                "$" + field,
+                                            ]}}}]
+                outputproc = lambda x: {'count': x['count'],
+                                        '_id': x['_id'].split('###', 1)}
         elif (field == 'file' or field.startswith('file:')
               or field.startswith('file.')):
             if ":" in field:
@@ -2270,11 +2467,152 @@ have no effect if it is not expected)."""
             specialproj=specialproj, specialflt=specialflt,
         )
         cursor = self.set_limits(
-            self.db[colname].aggregate(pipeline, cursor={})
+            self.db[self.colname_oldhosts
+                    if archive else
+                    self.colname_hosts].aggregate(pipeline, cursor={})
         )
         if outputproc is not None:
             return (outputproc(res) for res in cursor)
         return cursor
+
+    def distinct(self, field, flt=None, sortby=None, limit=None, skip=None,
+                 archive=False):
+        """This method makes use of the aggregation framework to
+        produce distinct values for a given field.
+
+        """
+        cursor = self.set_limits(
+            self.db[self.colname_oldhosts
+                    if archive else
+                    self.colname_hosts].aggregate(
+                        self._distinct(field, flt=flt, sortby=sortby,
+                                       limit=limit, skip=skip),
+                        cursor={},
+                    )
+        )
+        return (res['_id'] for res in cursor)
+
+    def diff_categories(self, category1, category2, flt=None,
+                        archive=False, include_both_open=True):
+        """`category1` and `category2` can be categories (provided as
+        str or unicode objects) or labels (provided as dicts with two
+        keys, "group" and "tags", or as a two-element tuple, (group,
+        tags)). They *must* be of the same type: both categories or
+        both labels.
+
+        Returns a generator of tuples:
+        ({'addr': address, 'proto': protocol, 'port': port}, value)
+
+        Where `address` is an integer (use `utils.int2ip` to get the
+        corresponding string), and value is:
+
+          - -1  if the port is open in category1 and not in category2,
+
+          -  0  if the port is open in both category1 and category2,
+
+          -  1  if the port is open in category2 and not in category1.
+
+        This can be useful to compare open ports from two scan results
+        against the same targets.
+
+        """
+        project = {"_id": 0, "addr": 1, "ports.protocol": 1, "ports.port": 1}
+        if isinstance(category1, basestring):
+            category_filter = self.searchcategory([category1, category2])
+            category_field = "categories"
+            unwind_match = [
+                {"$unwind": "$categories"},
+                {"$match": category_filter},
+            ]
+            project["categories"] = 1
+        else:
+            if isinstance(category1, (tuple, list)):
+                category1 = {"group": category1[0], "tags": category1[1]}
+            if isinstance(category2, (tuple, list)):
+                category2 = {"group": category2[0], "tags": category2[1]}
+            groups = (category1["group"]
+                      if category1["group"] == category2["group"] else
+                      {"$in": [cat["group"] for cat in [category1,
+                                                        category2]]})
+            labels = (category1["tags"]
+                      if category1["tags"] == category2["tags"] else
+                      {"$in": [cat["tags"] for cat in [category1, category2]]})
+            category_filter = self.searchlabel(group=groups, label=labels)
+            category_field = "labels"
+            unwind_match = [
+                {"$unwind": "$labels"},
+                {"$unwind": "$labels.tags"},
+                {"$match": {"labels.group": groups, "labels.tags": labels}},
+            ]
+            project["labels.group"] = 1
+            project["labels.tags"] = 1
+        pipeline = [
+            {"$match": (category_filter if flt is None else
+                        self.flt_and(flt, category_filter))},
+        ]
+        pipeline.extend(unwind_match)
+        pipeline.extend([
+            {"$unwind": "$ports"},
+            {"$match": {"ports.state_state": "open"}},
+            {"$project": project},
+            {"$group": {"_id": {"addr": "$addr", "proto": "$ports.protocol",
+                                "port": "$ports.port"},
+                        "categories": {"$push": "$%s" % category_field}}},
+        ])
+        cursor = self.db[self.colname_oldhosts if archive else
+                         self.colname_hosts].aggregate(pipeline, cursor={})
+        def categories_to_val(categories):
+            states = [category1 in categories, category2 in categories]
+            # assert any(states)
+            return -cmp(*states)
+        cursor = (dict(x['_id'], value=categories_to_val(x['categories']))
+                  for x in cursor)
+        if include_both_open:
+            return cursor
+        else:
+            return (result for result in cursor if result["value"])
+
+    def update_country(self, start, stop, code, create=False):
+        """Update country info on existing Nmap scan result documents"""
+        name = self.globaldb.data.country_name_by_code(code)
+        for colname in [self.colname_hosts, self.colname_oldhosts]:
+            self.db[colname].update(
+                self.searchrange(start, stop),
+                {'$set': {'infos.country_code': code,
+                          'infos.country_name': name}},
+                multi=True,
+            )
+
+    def update_city(self, start, stop, locid, create=False):
+        """Update city/location info on existing Nmap scan result documents"""
+        updatespec = dict(("infos.%s" % key, value) for key, value in
+                          self.globaldb.data.location_byid(locid).iteritems())
+        if "infos.country_code" in updatespec:
+            updatespec[
+                "infos.country_name"
+            ] = self.globaldb.data.country_name_by_code(
+                updatespec["infos.country_code"]
+            )
+        for colname in [self.colname_hosts, self.colname_oldhosts]:
+            self.db[colname].update(
+                self.searchrange(start, stop),
+                {'$set': updatespec},
+                multi=True,
+            )
+
+    def update_as(self, start, stop, asnum, asname, create=False):
+        """Update AS info on existing Nmap scan result documents"""
+        if asname is None:
+            updatespec = {'infos.as_num': asnum}
+        else:
+            updatespec = {'infos.as_num': asnum, 'infos.as_name': asname}
+        # we first update existing records
+        for colname in [self.colname_hosts, self.colname_oldhosts]:
+            self.db[colname].update(
+                self.searchrange(start, stop),
+                {'$set': updatespec},
+                multi=True,
+            )
 
     def parse_args(self, args, flt=None):
         if flt is None:
@@ -2344,10 +2682,15 @@ have no effect if it is not expected)."""
             flt = self.flt_and(flt, self.searchopenport(neg=True))
         if args.countports:
             minn, maxn = int(args.countports[0]), int(args.countports[1])
-            flt = self.flt_and(flt,self.searchcountopenports(minn=minn, maxn=maxn))
+            flt = self.flt_and(flt,
+                               self.searchcountopenports(minn=minn,
+                                                         maxn=maxn))
         if args.no_countports:
             minn, maxn = int(args.no_countports[0]), int(args.no_countports[1])
-            flt = self.flt_and(flt,self.searchcountopenports(minn=minn, maxn=maxn, neg=True))
+            flt = self.flt_and(flt,
+                               self.searchcountopenports(minn=minn,
+                                                         maxn=maxn,
+                                                         neg=True))
         if args.service is not None:
             flt = self.flt_and(
                 flt,
@@ -2464,18 +2807,10 @@ class MongoDBPassive(MongoDB, DBPassive):
                  {'unique': True}),
             ],
         }
-        try:
-            from collections import OrderedDict
-        except ImportError:
-            self.hint_indexes = {
-                "addr": [("addr", 1), ("recontype", 1), ("port", 1)],
-                "targetval": [("targetval", 1)],
-            }
-        else:
-            self.hint_indexes = OrderedDict([
-                ["addr", [("addr", 1), ("recontype", 1), ("port", 1)]],
-                ["targetval", [("targetval", 1)]],
-            ])
+        self.hint_indexes = OrderedDict([
+            ["addr", [("addr", 1), ("recontype", 1), ("port", 1)]],
+            ["targetval", [("targetval", 1)]],
+        ])
 
     def init(self):
         """Initializes the "passive" columns, i.e., drops the columns, and
@@ -2666,6 +3001,20 @@ setting values according to the keyword arguments.
             self.db[self.colname_passive].aggregate(pipeline, cursor={})
         )
 
+    def distinct(self, field, flt=None, sortby=None, limit=None, skip=None):
+        """This method makes use of the aggregation framework to
+        produce distinct values for a given field.
+
+        """
+        cursor = self.set_limits(
+            self.db[self.colname_passive].aggregate(
+                self._distinct(field, flt=flt, sortby=sortby,
+                               limit=limit, skip=skip),
+                cursor={},
+            )
+        )
+        return (res['_id'] for res in cursor)
+
     @staticmethod
     def searchsensor(sensor, neg=False):
         if neg:
@@ -2751,18 +3100,20 @@ setting values according to the keyword arguments.
         return {field: {'$lt' if neg else '$gte': now - delta}}
 
     def knownip_bycountry(self, code):
-        return self.set_limits(self.find(self.colname_ipdata,
-                                         {'country_code': code}
-                                     )).distinct('addr')
+        return self.set_limits(self.find(
+            self.colname_ipdata,
+            {'country_code': code},
+        )).distinct('addr')
 
     def knownip_byas(self, asnum):
         if type(asnum) is str:
             if asnum.startswith('AS'):
                 asnum = asnum[2:]
             asnum = int(asnum)
-        return self.set_limits(self.find(self.colname_ipdata,
-                                         {'as_num': asnum}
-                                     )).distinct('addr')
+        return self.set_limits(self.find(
+            self.colname_ipdata,
+            {'as_num': asnum}
+        )).distinct('addr')
 
     def set_data(self, addr, force=False):
         """Sets IP information in colname_ipdata."""
@@ -2781,7 +3132,9 @@ setting values according to the keyword arguments.
         # we first update existing records
         self.db[self.colname_ipdata].update(
             self.searchrange(start, stop),
-            {'$set': {'country_code': code}})
+            {'$set': {'country_code': code}},
+            multi=True,
+        )
         # then (if requested), we add a record for addresses we
         # have in database (first the active one, then the
         # passive)
@@ -2796,7 +3149,9 @@ setting values according to the keyword arguments.
         # we first update existing records
         self.db[self.colname_ipdata].update(
             self.searchrange(start, stop),
-            {'$set': {'location_id': locid}})
+            {'$set': {'location_id': locid}},
+            multi=True,
+        )
         # then (if requested), we add a record for addresses we
         # have in database (first the active one, then the
         # passive)
@@ -2815,7 +3170,9 @@ setting values according to the keyword arguments.
         # we first update existing records
         self.db[self.colname_ipdata].update(
             self.searchrange(start, stop),
-            {'$set': updatespec})
+            {'$set': updatespec},
+            multi=True,
+        )
         # then (if requested), we add a record for addresses we
         # have in database (first the active one, then the
         # passive)
@@ -2925,7 +3282,8 @@ class MongoDBData(MongoDB, DBData):
             fdesc.readline()
             self.db[self.colname_city_locations].insert(
                 self.parse_line_city_location(line)
-                for line in fdesc)
+                for line in fdesc
+            )
 
     def feed_geoip_asnum(self, fname, feedipdata=None,
                          createipdata=False):
@@ -3046,7 +3404,7 @@ class MongoDBAgent(MongoDB, DBAgent):
             ],
             self.colname_masters: [
                 ([('hostname', pymongo.ASCENDING),
-                 ('path', pymongo.ASCENDING)], {}),
+                  ('path', pymongo.ASCENDING)], {}),
             ],
         }
 

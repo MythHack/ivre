@@ -31,7 +31,9 @@ import stat
 
 # Default values:
 DB = "mongodb:///ivre"
+DB_FLOW = "neo4j://neo4j:neo4j@localhost:7474/"
 BULK_UPSERTS_MAXSIZE = 100
+NEO4J_BATCH_SIZE = 1000
 DEBUG = False
 # specific: if no value is specified for *_PATH variables, they are
 # going to be constructed by guessing the installation PREFIX (see the
@@ -40,6 +42,8 @@ GEOIP_PATH = None
 HONEYD_IVRE_SCRIPTS_PATH = None
 AGENT_MASTER_PATH = "/var/lib/ivre/master"
 TESSERACT_CMD = "tesseract"
+GZ_CMD = "zcat"
+BZ2_CMD = "bzcat"
 
 # Default Nmap scan template, see below how to add templates:
 NMAP_SCAN_TEMPLATES = {
@@ -77,13 +81,40 @@ NMAP_SCAN_TEMPLATES = {
 #     "scripts_exclude": ['broadcast', 'external']
 # })
 
+## Dictionary that helps determine server ports of communications. Each entry is
+## {proto: {port: proba}}. The when two ports are known, the port with the
+## highest probability is used.
+## When /usr/share/nmap/nmap-services is available, these probas are taken,
+## otherwise /etc/services is used with proba=0.5 for each entry.
+## KNOWN_PORTS entries have the highest priority.
+## Example:
+#  KNOWN_PORTS = {
+#      "udp": {
+#          9999: 1.0,
+#          12345: 0.5,
+#      },
+#      "tcp": {
+#          20202: 0.8,
+#      },
+#  }
+KNOWN_PORTS = {}
+
+# Enable the recording of appearance times for flows. Will slow down a bit the
+# insertion rate
+FLOW_TIME = True
+# Precision (in seconds) to use when recording times when flows appear
+FLOW_TIME_PRECISION = 3600
+# When recording flow times, record the whole range from start_time to end_time
+# This option is experimental and possibly useless in practice
+FLOW_TIME_FULL_RANGE = False
+
 WEB_ALLOWED_REFERERS = None
+WEB_NOTES_BASE = "/dokuwiki/#IP#"
 WEB_MAXRESULTS = None
-WEB_WARN_DOTS_COUNT= 20000
+WEB_WARN_DOTS_COUNT = 20000
 WEB_GET_NOTEPAD_PAGES = None
-# if overwritten, this value must match its counterpart in the
-# config.js config file config.dflt.limit.
 WEB_LIMIT = 10
+WEB_GRAPH_LIMIT = 1000
 # access control disabled by default:
 WEB_INIT_QUERIES = {}
 # Warning: None means no access control, and is equivalent to "full"

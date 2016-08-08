@@ -28,9 +28,9 @@ install:
 
 before_script:
   # init DB
-  - ipinfo --init < /dev/null
-  - scancli --init < /dev/null
-  - ipdata --init < /dev/null
+  - ivre ipinfo --init < /dev/null
+  - ivre scancli --init < /dev/null
+  - ivre ipdata --init < /dev/null
   - echo "DEBUG = True" > ~/.ivre.conf
   # install p0f & Bro (.tar files)
   - for archive in tools-travis-ivre bro-2.3.2_ubuntu-12.04 ; do wget http://pierre.droids-corp.org/p0rn/${archive}.tar.bz2 -O - | tar jxf - ; done
@@ -49,4 +49,4 @@ before_script:
   - wget -O - "https://wiki.wireshark.org/SampleCaptures?action=AttachFile&do=get&target=imap.cap.gz" | zcat > tests/samples/imap.pcap
   - for file in telnet-raw.pcap nb6-startup.pcap nb6-http.pcap nb6-telephone.pcap nb6-hotspot.pcap ; do wget "https://wiki.wireshark.org/SampleCaptures?action=AttachFile&do=get&target=$file" -O "tests/samples/$file" ; done
 
-script: cd tests/ && python tests.py
+script: cd tests/ && travis_wait 30 python tests.py

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -25,17 +25,16 @@ This sub-module contains the parser for nmap's XML output files.
 
 """
 
-from ivre import utils, config
+from ivre import utils, config, nmapout
 
 from xml.sax.handler import ContentHandler, EntityResolver
 import datetime
 import sys
 import os
 import re
-import json
 import bson
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 # Scripts that mix elem/table tags with and without key attributes,
 # which is not supported for now
@@ -48,6 +47,63 @@ ALIASES_TABLE_ELEMS = {
     "nfs-ls": "ls",
     "smb-ls": "ls",
     "ftp-anon": "ls",
+    # vulns unified output (vulns NSE module)
+    "afp-path-vuln": "vulns",
+    "distcc-cve2004-2687": "vulns",
+    "ftp-libopie": "vulns",
+    "ftp-vsftpd-backdoor": "vulns",
+    "ftp-vuln-cve2010-4221": "vulns",
+    "http-avaya-ipoffice-users": "vulns",
+    "http-cross-domain-policy": "vulns",
+    "http-dlink-backdoor": "vulns",
+    "http-frontpage-login": "vulns",
+    "http-huawei-hg5xx-vuln": "vulns",
+    "http-iis-short-name-brute": "vulns",
+    "http-method-tamper": "vulns",
+    "http-phpmyadmin-dir-traversal": "vulns",
+    "http-phpself-xss": "vulns",
+    "http-shellshock": "vulns",
+    "http-slowloris-check": "vulns",
+    "http-tplink-dir-traversal": "vulns",
+    "http-vuln-cve2006-3392": "vulns",
+    "http-vuln-cve2009-3960": "vulns",
+    "http-vuln-cve2010-2861": "vulns",
+    "http-vuln-cve2011-3192": "vulns",
+    "http-vuln-cve2011-3368": "vulns",
+    "http-vuln-cve2012-1823": "vulns",
+    "http-vuln-cve2013-0156": "vulns",
+    "http-vuln-cve2013-6786": "vulns",
+    "http-vuln-cve2013-7091": "vulns",
+    "http-vuln-cve2014-2126": "vulns",
+    "http-vuln-cve2014-2127": "vulns",
+    "http-vuln-cve2014-2128": "vulns",
+    "http-vuln-cve2014-2129": "vulns",
+    "http-vuln-cve2014-3704": "vulns",
+    "http-vuln-cve2014-8877": "vulns",
+    "http-vuln-cve2015-1427": "vulns",
+    "http-vuln-cve2015-1635": "vulns",
+    "http-vuln-misfortune-cookie": "vulns",
+    "http-vuln-wnr1000-creds": "vulns",
+    "mysql-vuln-cve2012-2122": "vulns",
+    "qconn-exec": "vulns",
+    "rdp-vuln-ms12-020": "vulns",
+    "rmi-vuln-classloader": "vulns",
+    "samba-vuln-cve-2012-1182": "vulns",
+    "smb-vuln-conficker": "vulns",
+    "smb-vuln-cve2009-3103": "vulns",
+    "smb-vuln-ms06-025": "vulns",
+    "smb-vuln-ms07-029": "vulns",
+    "smb-vuln-ms08-067": "vulns",
+    "smb-vuln-ms10-054": "vulns",
+    "smb-vuln-ms10-061": "vulns",
+    "smb-vuln-regsvc-dos": "vulns",
+    "smtp-vuln-cve2011-1720": "vulns",
+    "smtp-vuln-cve2011-1764": "vulns",
+    "ssl-ccs-injection": "vulns",
+    "ssl-dh-params": "vulns",
+    "ssl-heartbleed": "vulns",
+    "ssl-poodle": "vulns",
+    "supermicro-ipmi-conf": "vulns",
 }
 
 HTTP_SCREENSHOT_PATTERN = re.compile('^ *Saved to (.*)$', re.MULTILINE)
@@ -59,6 +115,157 @@ def http_screenshot_extract(script):
 SCREENSHOTS_SCRIPTS = {
     "http-screenshot": http_screenshot_extract,
 }
+
+_MONGODB_DATABASES_CONVERTS = {"false": False, "true": True, "nil": None}
+
+_MONGODB_DATABASES_TYPES = {
+    "totalSize": float,
+    "totalSizeMb": float,
+    "empty": lambda x: _MONGODB_DATABASES_CONVERTS.get(x, x),
+    "sizeOnDisk": float,
+    "code": lambda x: (_MONGODB_DATABASES_CONVERTS.get(x, x)
+                       if isinstance(x, basestring) else float(x)),
+    "ok": lambda x: (_MONGODB_DATABASES_CONVERTS.get(x, x)
+                     if isinstance(x, basestring) else float(x)),
+}
+
+def _parse_mongodb_databases_kv(line, out, prefix=None, force_type=None,
+                                value_name=None):
+    """Parse 'key = value' lines from mongodb-databases output"""
+    try:
+        # Line can be 'key =' or 'key = value'
+        key, value = line.split(" =", 1)
+        value = value[1:]
+    except ValueError:
+        sys.stderr.write(
+            "WARNING: unknown keyword %r\r\n" % line
+        )
+        return
+
+    if key == "$err":
+        key = "errmsg"
+    if prefix is not None:
+        key = "%s_%s" % (prefix, key)
+
+    if force_type is not None:
+        value = force_type(value)
+    else:
+        value = _MONGODB_DATABASES_TYPES.get(key, lambda x: x)(value)
+
+    if isinstance(out, dict):
+        assert key not in out
+        out[key] = value
+    elif isinstance(out, list):
+        out.append({"name": key,
+                    value_name: value})
+
+
+def add_mongodb_databases_data(script):
+    """This function converts output from mongodb-databases to a structured one.
+    For instance, the output:
+
+    totalSizeMb = 123456
+    totalSize = 123456123
+    databases
+      1
+        name = test
+        empty = false
+        sizeOnDisk = 112233
+      0
+        sizeOnDisk = 445566
+        name = test_prod
+        empty = false
+        shards
+          my_shard_0001 = 778899
+          my_shard_0000 = 778877
+    ok = 1
+
+    is converted to:
+
+    {'databases': [{'empty': False, 'name': 'test', 'sizeOnDisk': 112233},
+                   {'empty': False,
+                    'name': 'test_prod',
+                    'shards': [{'name': 'my_shard_0000',
+                                'size': 778877},
+                               {'name': 'my_shard_0001',
+                                'size': 778899}],
+                    'sizeOnDisk': 445566}],
+     'ok': '1',
+     'totalSize': 123456123,
+     'totalSizeMb': 123456}
+    """
+
+    out = {}
+    # Global modes, see MODES[1]
+    cur_key = None
+    MODES = {
+        1: {"databases": list, "bad cmd": dict},
+        3: {"shards": list},
+    }
+
+    for line in script["output"].split("\n"):
+        # Handle mode based on indentation
+        line = line.rstrip()
+        if not line:
+            continue
+        length = len(line)
+        line = line.lstrip()
+        indent = (length - len(line)) / 2
+
+        # Parse structure
+        if indent == 1:
+            # Global
+            if line in MODES[indent]:
+                out[line] = MODES[indent][line]()
+                cur_key = line
+                continue
+            cur_dict = out
+
+        elif indent == 2:
+            if isinstance(out[cur_key], list):
+                # Databases enumeration, looks like:
+                #
+                # 0
+                #   name = XXX
+                # 1
+                #   name = XXX
+                #   size = 123
+                # code = 0
+
+                if line.isdigit():
+                    out[cur_key].append({})
+                else:
+                    _parse_mongodb_databases_kv(line, out, prefix=cur_key)
+                continue
+
+            if isinstance(out[cur_key], dict):
+                # Bad command, looks like:
+                #
+                # bad cmd
+                #   listDatabases = 1
+
+                cur_dict = out[cur_key]
+
+        elif indent == 3:
+            # Database information
+            if line in MODES[indent]:
+                out["databases"][-1][line] = MODES[indent][line]()
+                continue
+            cur_dict = out["databases"][-1]
+
+        elif indent == 4:
+            # Shards information, values are always float
+            _parse_mongodb_databases_kv(line, out["databases"][-1]["shards"],
+                                        force_type=float, value_name="size")
+            continue
+
+        else:
+            raise ValueError("Unable to parse %s" % line)
+
+        # Handle a "key = value" line
+        _parse_mongodb_databases_kv(line, cur_dict)
+
+    return out
 
 def add_ls_data(script):
     """This function calls the appropriate `add_*_data()` function to
@@ -91,7 +298,7 @@ def add_smb_ls_data(script):
     cases.
 
     """
-    assert(script["id"] == "smb-ls")
+    assert script["id"] == "smb-ls"
     result = {"total": {"files": 0, "bytes": 0}, "volumes": []}
     state = 0 # outside a volume
     cur_vol = None
@@ -145,7 +352,7 @@ def add_nfs_ls_data(script):
     cases.
 
     """
-    assert(script["id"] == "nfs-ls")
+    assert script["id"] == "nfs-ls"
     result = {"total": {"files": 0, "bytes": 0}, "volumes": []}
     state = 0 # outside a volume
     cur_vol = None
@@ -202,7 +409,7 @@ def add_afp_ls_data(script):
     cases.
 
     """
-    assert(script["id"] == "afp-ls")
+    assert script["id"] == "afp-ls"
     result = {"total": {"files": 0, "bytes": 0}, "volumes": []}
     state = 0 # volumes / listings
     cur_vol = None
@@ -258,11 +465,11 @@ def add_ftp_anon_data(script):
     by humans.
 
     """
-    assert(script["id"] == "ftp-anon")
+    assert script["id"] == "ftp-anon"
     # expressions that match lines, based on large data collection
     subexprs = {
-        "user": '(?:[a-zA-Z0-9\\._-]+(?:\\s+[NLOPQS])?|\\\\x[0-9A-F]{2}|'
-        '\\*|\\(\\?\\))',
+        "user": ('(?:[a-zA-Z0-9\\._-]+(?:\\s+[NLOPQS])?|\\\\x[0-9A-F]{2}|'
+                 '\\*|\\(\\?\\))'),
         "fname": '[A-Za-z0-9%s]+' % re.escape(" ?._@[](){}~#'&$%!+\\-/,|`="),
         "perm": '[a-zA-Z\\?-]{10}',
         "day": '[0-3]?[0-9]',
@@ -270,8 +477,8 @@ def add_ftp_anon_data(script):
         "month": "(?:[0-1]?[0-9]|[A-Z][a-z]{2}|[A-Z]{3})",
         "time": "[0-9]{1,2}\\:[0-9]{2}(?:\\:[0-9]{1,2})?",
         "windate": "[0-9]{2}-[0-9]{2}-[0-9]{2,4} +[0-9]{2}:[0-9]{2}(?:[AP]M)?",
-        "vxworksdate": "[A-Z][a-z]{2}-[0-9]{2}-[0-9]{2,4}\\s+"
-        "[0-9]{2}:[0-9]{2}:[0-9]{2}",
+        "vxworksdate": ("[A-Z][a-z]{2}-[0-9]{2}-[0-9]{2,4}\\s+"
+                        "[0-9]{2}:[0-9]{2}:[0-9]{2}"),
     }
     subexprs["date"] = "(?:%s)" % "|".join([
         "%(month)s\\s+%(day)s\\s+(?:%(year)s|%(time)s)" % subexprs,
@@ -312,6 +519,7 @@ ADD_TABLE_ELEMS = {
     'modbus-discover':
     re.compile('^ *DEVICE IDENTIFICATION: *(?P<deviceid>.*?) *$', re.M),
     'ls': add_ls_data,
+    'mongodb-databases': add_mongodb_databases_data,
 }
 
 def change_smb_enum_shares(table):
@@ -346,9 +554,14 @@ def change_ls(table):
                 fileentry['size'] = int(fileentry['size'])
     return table
 
+def change_vulns(table):
+    """Adapt structured output generated by "vulns" NSE module."""
+    return [dict(tab, id=vulnid) for vulnid, tab in table.iteritems()]
+
 CHANGE_TABLE_ELEMS = {
     'smb-enum-shares': change_smb_enum_shares,
     'ls': change_ls,
+    'vulns': change_vulns,
 }
 
 IGNORE_SCRIPTS = {
@@ -399,6 +612,46 @@ IGNORE_SCRIPTS = {
     'drda-info': set(['The response contained no EXCSATRD']),
     'rdp-enum-encryption': set(['Received unhandled packet']),
     'ldap-search': set(['ERROR: Failed to bind as the anonymous user']),
+    'mongodb-databases': set([
+        'No Bson data returned',
+    ]),
+    # fixed in nmap commit 95f7b76d9f12d10832523e6f3db0e602a04b3a12
+    # https://github.com/nmap/nmap/commit/95f7b76d9f12d10832523e6f3db0e602a04b3a12
+    'snmp-hh3c-logins': set(['\n  baseoid: 1.3.6.1.4.1.25506.2.12.1.1.1']),
+    'dns-nsec-enum': set(['\n  No NSEC records found\n']),
+    'dns-nsec3-enum': set(['\n  DNSSEC NSEC3 not supported\n']),
+    'http-csrf': set(["Couldn't find any CSRF vulnerabilities."]),
+    'http-devframework': set([
+        "Couldn't determine the underlying framework or CMS. Try increasing "
+        "'httpspider.maxpagecount' value to spider more pages.",
+    ]),
+    'http-dombased-xss': set(["Couldn't find any DOM based XSS."]),
+    'http-drupal-enum': set([
+        'Nothing found amongst the top 100 resources,use '
+        '--script-args number=<number|all> for deeper analysis)',
+    ]),
+    'http-errors': set(["Couldn't find any error pages."]),
+    'http-feed': set(["Couldn't find any feeds."]),
+    'http-litespeed-sourcecode-download': set([
+        'Request with null byte did not work. This web server might not be '
+        'vulnerable',
+        'Page: /index.php was not found. Try with an existing file.',
+    ]),
+    'http-sitemap-generator': set([
+        '\n  Directory structure:\n    /\n      Other: 1\n  Longest directory '
+        'structure:\n    Depth: 0\n    Dir: /\n  Total files found (by '
+        'extension):\n    Other: 1\n',
+        '\n  Directory structure:\n  Longest directory structure:\n    '
+        'Depth: 0\n    Dir: /\n  Total files found (by extension):\n    \n',
+    ]),
+    'http-stored-xss': set(["Couldn't find any stored XSS vulnerabilities."]),
+    'http-wordpress-enum': set([
+        'Nothing found amongst the top 100 resources,use '
+        '--script-args search-limit=<number|all> for deeper analysis)',
+    ]),
+    'http-wordpress-users': set(["[Error] Wordpress installation was not found"
+                                 ". We couldn't find wp-login.php"]),
+    'ssl-date': set(['TLS randomness does not represent time']),
     # host scripts
     'firewalk': set(['None found']),
     'ipidseq': set(['Unknown']),
@@ -438,6 +691,21 @@ IGNORE_SCRIPTS_REGEXP = {
     'p2p-conficker': re.compile(
         re.escape('Host is CLEAN or ports are blocked')
     ),
+    'dns-nsec-enum': re.compile(
+        "^" + re.escape("Can't determine domain for host ") + ".*" +
+        re.escape("; use dns-nsec-enum.domains script arg.") + "$"
+    ),
+    'dns-nsec3-enum': re.compile(
+        "^" + re.escape("Can't determine domain for host ") + ".*" +
+        re.escape("; use dns-nsec3-enum.domains script arg.") + "$"
+    ),
+    'http-vhosts': re.compile(
+        "^\\\n[0-9]+" + re.escape(" names had status ") +
+        ("(?:[0-9]{3}|ERROR)")
+    ),
+    'http-fileupload-exploiter': re.compile(
+        "^(" + re.escape("\n  \n    Couldn't find a file-type field.") + ")*$"
+    ),
 }
 
 IGNORE_SCRIPT_OUTPUTS = set([
@@ -466,10 +734,17 @@ IGNORE_SCRIPT_OUTPUTS_REGEXP = set([
 MASSCAN_SERVICES_NMAP_SCRIPTS = {
     "http": "http-headers",
     "title": "http-title",
+    "ftp": "banner",
+    "unknown": "banner",
+    "ssh": "banner",
+    "vnc": "banner",
 }
 
 MASSCAN_SERVICES_NMAP_SERVICES = {
+    "ftp": "ftp", # masscan can confuse smtp (for example) for ftp
     "http": "http",
+    "ssh": "ssh",
+    "vnc": "vnc",
 }
 
 MASSCAN_ENCODING = re.compile(re.escape("\\x") + "([0-9a-f]{2})")
@@ -499,8 +774,8 @@ def ignore_script(script):
             and IGNORE_SCRIPTS_REGEXP[sid].search(output)
     ):
         return True
-    if any(output is not None and expr.search(output)
-           for expr in IGNORE_SCRIPT_OUTPUTS_REGEXP):
+    if output is not None and any(expr.search(output)
+                                  for expr in IGNORE_SCRIPT_OUTPUTS_REGEXP):
         return True
     return False
 
@@ -603,10 +878,6 @@ class NmapHandler(ContentHandler):
         """
         pass
 
-    def outputresults(self):
-        """Subclasses may display any results here."""
-        pass
-
     def startElement(self, name, attrs):
         if name == 'nmaprun':
             if self._curscan is not None:
@@ -635,6 +906,9 @@ class NmapHandler(ContentHandler):
                     self._curhost[field] = datetime.datetime.utcfromtimestamp(
                         int(self._curhost[field])
                     )
+            if 'starttime' not in self._curhost and 'endtime' in self._curhost:
+                # Masscan
+                self._curhost['starttime'] = self._curhost['endtime']
         elif name == 'address' and self._curhost is not None:
             if attrs['addrtype'] != 'ipv4':
                 self._curhost.setdefault(
@@ -671,9 +945,11 @@ class NmapHandler(ContentHandler):
                 sys.stderr.write("WARNING, self._curextraports should be None"
                                  " at this point "
                                  "(got %r)\n" % self._curextraports)
-            self._curextraports = {attrs['state']: [int(attrs['count']), {}]}
+            self._curextraports = {
+                attrs['state']: {"total": int(attrs['count']), "reasons": {}},
+            }
         elif name == 'extrareasons' and self._curextraports is not None:
-            self._curextraports[self._curextraports.keys()[0]][1][
+            self._curextraports[next(iter(self._curextraports))]["reasons"][
                 attrs['reason']] = int(attrs['count'])
         elif name == 'port':
             if self._curport is not None:
@@ -866,6 +1142,9 @@ class NmapHandler(ContentHandler):
                                      "empty, got [%r]\n" % self._curtablepath)
                 self._curtable = {}
                 return
+            if ignore_script(self._curscript):
+                self._curscript = None
+                return
             infokey = self._curscript.get('id', None)
             infokey = ALIASES_TABLE_ELEMS.get(infokey, infokey)
             if self._curtable:
@@ -913,7 +1192,9 @@ class NmapHandler(ContentHandler):
                                         # Image has been trimmed
                                         data = trim_result
                                     current['screenshot'] = "field"
-                                    current['screendata'] = self._to_binary(data)
+                                    current['screendata'] = self._to_binary(
+                                        data
+                                    )
                                     screenwords = utils.screenwords(data)
                                     if screenwords is not None:
                                         current['screenwords'] = screenwords
@@ -929,9 +1210,6 @@ class NmapHandler(ContentHandler):
                                 fname=full_fname,
                             )
                         )
-            if ignore_script(self._curscript):
-                self._curscript = None
-                return
             current.setdefault('scripts', []).append(self._curscript)
             self._curscript = None
         elif name in ['table', 'elem']:
@@ -954,11 +1232,11 @@ class NmapHandler(ContentHandler):
                 # stop recording characters
                 self._curdata = None
             self._curtablepath.pop()
-        elif name == 'hostscript':
+        elif name == 'hostscript' and 'scripts' in self._curhost:
             # "fake" port element, without a "protocol" key and with the
-            # magic value "host" for the "port" key.
+            # magic value -1 for the "port" key.
             self._curhost.setdefault('ports', []).append({
-                "port": "host",
+                "port": -1,
                 "scripts": self._curhost.pop('scripts')
             })
         elif name == 'trace':
@@ -1030,9 +1308,6 @@ class Nmap2Txt(NmapHandler):
     def _addhost(self):
         self._db.append(self._curhost)
 
-    def outputresults(self):
-        print json.dumps(self._db, default=utils.serialize)
-
 
 class Nmap2Mongo(NmapHandler):
 
@@ -1054,7 +1329,7 @@ class Nmap2Mongo(NmapHandler):
         self._collection = self._db.nmap.db[self._db.nmap.colname_hosts]
         self._scancollection = self._db.nmap.db[self._db.nmap.colname_scans]
         if gettoarchive is None:
-            self._gettoarchive = lambda c, a, s: []
+            self._gettoarchive = lambda a, s: []
         else:
             self._gettoarchive = gettoarchive
         self.merge = merge

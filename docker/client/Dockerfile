@@ -21,15 +21,16 @@ MAINTAINER Pierre LALET <pierre.lalet@cea.fr>
 ## openssl: IVRE depends on openssl exec + libssl needed for Nmap
 ## libfreetype6 libfontconfig1 fonts-dejavu: screenshots w/ phantomjs
 RUN apt-get -qy install p0f rsync screen ipython openssl tesseract-ocr \
-    libfreetype6 libfontconfig1 fonts-dejavu
+    libfreetype6 libfontconfig1 fonts-dejavu bash-completion
 
 # Install Nmap. Use included libpcap because to use the workaround for
 # Nmap issue #34 (https://github.com/nmap/nmap/issues/34) since we do
 # not know which kernel version will be used
-ADD https://github.com/nmap/nmap/tarball/master ./nmap.tar.gz
+# ADD https://github.com/nmap/nmap/tarball/master ./nmap.tar.gz
+ADD https://nmap.org/dist/nmap-7.12.tgz ./nmap.tar.gz
 RUN apt-get -qy install build-essential libssl-dev && \
     tar zxf nmap.tar.gz && \
-    mv nmap-nmap-* nmap && \
+    mv nmap-* nmap && \
     cd nmap && \
     ./configure --without-ndiff --without-zenmap --without-nping \
                 --without-ncat --without-nmap-update \

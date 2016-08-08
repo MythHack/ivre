@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@ import os
 import sys
 import errno
 import random
+import time
 from cStringIO import StringIO
 from contextlib import contextmanager
 from distutils.spawn import find_executable as which
@@ -121,10 +122,10 @@ class IvreTests(unittest.TestCase):
     def test_nmap(self):
 
         # Init DB
-        self.assertEqual(RUN(["scancli", "--count"])[1], "0\n")
-        self.assertEqual(RUN(["scancli", "--init"],
+        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "scancli", "--init"],
                               stdin=open(os.devnull))[0], 0)
-        self.assertEqual(RUN(["scancli", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], "0\n")
 
         # Insertion / "test" insertion (JSON output)
         host_counter = 0
@@ -141,35 +142,35 @@ class IvreTests(unittest.TestCase):
         scan_duplicate = re.compile("^WARNING: Scan already present in Database", re.M)
         for fname in self.nmap_files:
             # Insertion in DB
-            res, _, err = RUN(["nmap2db", "--port",
+            res, _, err = RUN(["ivre", "scan2db", "--port",
                                "-c", "TEST", "-s", "SOURCE", fname])
             self.assertEqual(res, 0)
             host_counter += sum(1 for _ in host_stored.finditer(err))
             scan_counter += sum(1 for _ in scan_stored.finditer(err))
             # Insertion test (== parsing only)
-            res, out, _ = RUN(["nmap2db", "--port", "--test",
+            res, out, _ = RUN(["ivre", "scan2db", "--port", "--test",
                                "-c", "TEST", "-s", "SOURCE", fname])
             self.assertEqual(res, 0)
             host_counter_test += sum(host_stored_test(line)
                                      for line in out.splitlines())
             # Duplicate insertion
-            res, _, err = RUN(["nmap2db", "--port",
+            res, _, err = RUN(["ivre", "scan2db", "--port",
                                "-c", "TEST", "-s", "SOURCE", fname])
             self.assertEqual(res, 0)
             scan_warning += sum(
                 1 for _ in scan_duplicate.finditer(err)
             )
 
-        RUN(["scancli", "--update-schema"])
-        RUN(["scancli", "--update-schema", "--archives"])
+        RUN(["ivre", "scancli", "--update-schema"])
+        RUN(["ivre", "scancli", "--update-schema", "--archives"])
 
         self.assertEqual(host_counter, host_counter_test)
         self.assertEqual(scan_counter, scan_warning)
 
-        res, out, _ = RUN(["scancli", "--count"])
+        res, out, _ = RUN(["ivre", "scancli", "--count"])
         self.assertEqual(res, 0)
         hosts_count = int(out)
-        res, out, _ = RUN(["scancli", "--count", "--archives"])
+        res, out, _ = RUN(["ivre", "scancli", "--count", "--archives"])
         self.assertEqual(res, 0)
         archives_count = int(out)
 
@@ -183,33 +184,40 @@ class IvreTests(unittest.TestCase):
                          host_counter)
 
         # Object ID
-        res, out, _ = RUN(["scancli", "--json", "--limit", "1"])
+        res, out, _ = RUN(["ivre", "scancli", "--json", "--limit", "1"])
         self.assertEqual(res, 0)
-        oid = json.loads(out)['_id']
-        res, out, _ = RUN(["scancli", "--count", "--id", oid])
+        oid = str(ivre.db.db.nmap.get(
+            ivre.db.db.nmap.searchhost(json.loads(out)['addr']),
+            limit=1, fields=["_id"],
+        )[0]['_id'])
+        res, out, _ = RUN(["ivre", "scancli", "--count", "--id", oid])
         self.assertEqual(res, 0)
         self.assertEqual(int(out), 1)
-        res, out, _ = RUN(["scancli", "--count", "--no-id", oid])
+        res, out, _ = RUN(["ivre", "scancli", "--count", "--no-id", oid])
         self.assertEqual(res, 0)
         self.assertEqual(int(out) + 1, hosts_count)
 
-        res, out, _ = RUN(["scancli", "--count", "--countports", "20", "20"])
+        res, out, _ = RUN(["ivre", "scancli", "--count",
+                           "--countports", "20", "20"])
         self.assertEqual(res, 0)
         portsnb_20 = int(out)
         self.check_value("nmap_20_ports", portsnb_20)
 
-        res, out, _ = RUN(["scancli", "--count", "--no-countports", "20", "20"])
+        res, out, _ = RUN(["ivre", "scancli", "--count",
+                           "--no-countports", "20", "20"])
         self.assertEqual(res, 0)
         portsnb_not_20 = int(out)
 
         self.assertEqual(portsnb_20 + portsnb_not_20, host_counter)
 
-        res, out, _ = RUN(["scancli", "--count", "--countports", "10", "100"])
+        res, out, _ = RUN(["ivre", "scancli", "--count",
+                           "--countports", "10", "100"])
         self.assertEqual(res, 0)
         portsnb_10_100 = int(out)
         self.check_value("nmap_10-100_ports", portsnb_10_100)
 
-        res, out, _ = RUN(["scancli", "--count", "--no-countports", "10", "100"])
+        res, out, _ = RUN(["ivre", "scancli", "--count",
+                           "--no-countports", "10", "100"])
         self.assertEqual(res, 0)
         portsnb_not_10_100 = int(out)
 
@@ -278,11 +286,11 @@ class IvreTests(unittest.TestCase):
                          hosts_count)
         addrs = set()
         for net in ivre.utils.range2nets(map(ivre.utils.int2ip, addrrange)):
-            result = ivre.db.db.nmap.get(
-                ivre.db.db.nmap.searchnet(net))
-            addrs = addrs.union(
-                (ivre.utils.int2ip(addr)
-                 for addr in ivre.db.db.nmap.distinct(result, "addr")))
+            addrs.update(
+                ivre.utils.int2ip(addr) for addr in
+                ivre.db.db.nmap.distinct("addr",
+                                         flt=ivre.db.db.nmap.searchnet(net))
+            )
 
         count = ivre.db.db.nmap.get(
             ivre.db.db.nmap.searchhosts(addrrange)).count()
@@ -302,12 +310,15 @@ class IvreTests(unittest.TestCase):
         nets = ivre.utils.range2nets(addrrange)
         count = 0
         for net in nets:
-            result = ivre.db.db.nmap.get(
-                ivre.db.db.nmap.searchnet(net))
-            count += result.count()
+            count += ivre.db.db.nmap.get(
+                ivre.db.db.nmap.searchnet(net)
+            ).count()
             start, stop = map(ivre.utils.ip2int,
                               ivre.utils.net2range(net))
-            for addr in ivre.db.db.nmap.distinct(result, "addr"):
+            for addr in ivre.db.db.nmap.distinct(
+                    "addr",
+                    flt=ivre.db.db.nmap.searchnet(net),
+            ):
                 self.assertTrue(start <= addr <= stop)
         self.assertEqual(count, addr_range_count)
         # Networks in `nets` are separated sets
@@ -559,16 +570,16 @@ class IvreTests(unittest.TestCase):
             cov.stop()
             cov.save()
 
-        self.assertEqual(RUN(["scancli", "--init"],
+        self.assertEqual(RUN(["ivre", "scancli", "--init"],
                               stdin=open(os.devnull))[0], 0)
 
     def test_passive(self):
 
         # Init DB
-        self.assertEqual(RUN(["ipinfo", "--count"])[1], "0\n")
-        self.assertEqual(RUN(["ipinfo", "--init"],
+        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "ipinfo", "--init"],
                               stdin=open(os.devnull))[0], 0)
-        self.assertEqual(RUN(["ipinfo", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], "0\n")
 
         # p0f & Bro insertion
         ivre.utils.makedirs("logs")
@@ -600,6 +611,7 @@ class IvreTests(unittest.TestCase):
                 env=broenv)
             broprocess.wait()
 
+        time.sleep(1) # Hack for Travis CI
         for root, _, files in os.walk("logs"):
             for fname in files:
                 with open(os.path.join(root, fname)) as fdesc:
@@ -633,9 +645,8 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(result.count(), 0)
 
         addrrange = sorted(
-            x for x in ivre.db.db.passive.get(
-                ivre.db.db.passive.flt_empty).distinct('addr')
-            if type(x) in [int, long] and x != 0
+            x for x in ivre.db.db.passive.distinct('addr')
+            if isinstance(x, (int, long)) and x
         )
         self.assertGreaterEqual(len(addrrange), 2)
         if len(addrrange) < 4:
@@ -643,28 +654,38 @@ class IvreTests(unittest.TestCase):
         else:
             addrrange = [addrrange[1], addrrange[-2]]
         result = ivre.db.db.passive.get(
-            ivre.db.db.passive.searchrange(*addrrange))
+            ivre.db.db.passive.searchrange(*addrrange)
+        )
         self.assertGreaterEqual(result.count(), 2)
-        addresses_1 = result.distinct('addr')
-        result = ivre.db.db.passive.get(ivre.db.db.passive.flt_and(
-            ivre.db.db.passive.searchcmp("addr", addrrange[0], '>='),
-            ivre.db.db.passive.searchcmp("addr", addrrange[1], '<='),
+        addresses_1 = list(ivre.db.db.passive.distinct(
+            'addr',
+            flt=ivre.db.db.passive.searchrange(*addrrange),
         ))
-        addresses_2 = result.distinct('addr')
+        addresses_2 = list(ivre.db.db.passive.distinct(
+            'addr',
+            flt=ivre.db.db.passive.flt_and(
+                ivre.db.db.passive.searchcmp("addr", addrrange[0], '>='),
+                ivre.db.db.passive.searchcmp("addr", addrrange[1], '<='),
+            ),
+        ))
         self.assertItemsEqual(addresses_1, addresses_2)
-        result = ivre.db.db.passive.get(ivre.db.db.passive.flt_and(
-            ivre.db.db.passive.searchcmp("addr", addrrange[0] - 1, '>'),
-            ivre.db.db.passive.searchcmp("addr", addrrange[1] + 1, '<'),
+        addresses_2 = list(ivre.db.db.passive.distinct(
+            'addr',
+            flt=ivre.db.db.passive.flt_and(
+                ivre.db.db.passive.searchcmp("addr", addrrange[0] - 1, '>'),
+                ivre.db.db.passive.searchcmp("addr", addrrange[1] + 1, '<'),
+            ),
         ))
-        addresses_2 = result.distinct('addr')
         self.assertItemsEqual(addresses_1, addresses_2)
         addresses_2 = set()
         nets = ivre.utils.range2nets(addrrange)
         for net in nets:
-            result = ivre.db.db.passive.get(
-                ivre.db.db.passive.searchnet(net))
             addresses_2 = addresses_2.union(
-                ivre.db.db.passive.distinct(result, "addr"))
+                ivre.db.db.passive.distinct(
+                    "addr",
+                    flt=ivre.db.db.passive.searchnet(net),
+                )
+            )
         self.assertItemsEqual(addresses_1, addresses_2)
         count = 0
         for net in nets:
@@ -673,7 +694,10 @@ class IvreTests(unittest.TestCase):
             count += result.count()
             start, stop = map(ivre.utils.ip2int,
                               ivre.utils.net2range(net))
-            for addr in ivre.db.db.passive.distinct(result, "addr"):
+            for addr in ivre.db.db.passive.distinct(
+                    "addr",
+                    flt=ivre.db.db.passive.searchnet(net),
+            ):
                 self.assertTrue(start <= addr <= stop)
         result = ivre.db.db.passive.get(
             ivre.db.db.passive.flt_and(
@@ -744,7 +768,7 @@ class IvreTests(unittest.TestCase):
             ivre.db.db.passive.flt_empty).count()
         self.assertEqual(count + new_count, total_count)
 
-        self.assertEqual(RUN(["ipinfo", "--init"],
+        self.assertEqual(RUN(["ivre", "ipinfo", "--init"],
                               stdin=open(os.devnull))[0], 0)
 
     def test_utils(self):

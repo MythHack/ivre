@@ -28,9 +28,9 @@ source tree (or the `[PREFIX]/share/ivre/docker/` directory when IVRE
 has been installed), run (from the folder where you want to store your
 data):
 
-    $ mkdir -m 1777 var_lib_mongodb var_log_mongodb ivre-share
-    $ # For people using SELinux enforced, you need to run
-    $ sudo chcon -Rt svirt_sandbox_file_t var_lib_mongodb var_log_mongodb ivre-share
+    $ mkdir -m 1777 var_{lib,log}_{mongodb,neo4j} ivre-share
+      # For people using SELinux enforced, you need to run
+    $ sudo chcon -Rt svirt_sandbox_file_t var_{lib,log}_{mongodb,neo4j} ivre-share
     
     $ cp [path to ivre source]/docker/Vagrantfile .
     $ vagrant up --no-parallel
@@ -128,7 +128,7 @@ To create the volume to store MongoDB data, run (`chmod`-ing to `1777`
 is a bit overkill, `chown`-ing it to the UID of the MongoDB user in
 the container would do):
 
-    $ mkdir -m 1777 var_lib_mongodb var_log_mongodb
+    $ mkdir -m 1777 var_{lib,log}_{mongodb,neo4j}
 
 To run an instance of the MongoDB server ready for IVRE, issue (this
 will run the instance and give it the name `ivredb`; we will use this
@@ -176,21 +176,21 @@ This gives a shell in the `ivreclient` container, and from there we
 can use IVRE's command line tools and Python API. For example, to
 initialize the database:
 
-    root@ivreclient:/# ipinfo --init
+    root@ivreclient:/# ivre ipinfo --init
     This will remove any passive information in your database. Process ? [y/N] y
-    root@ivreclient:/# ipdata --init
+    root@ivreclient:/# ivre ipdata --init
     This will remove any country/AS information in your database. Process ? [y/N] y
-    root@ivreclient:/# scancli --init
+    root@ivreclient:/# ivre scancli --init
     This will remove any scan result in your database. Process ? [y/N] y
-    root@ivreclient:/# runscans-agentdb --init
+    root@ivreclient:/# ivre runscansagentdb --init
     This will remove any agent and/or scan in your database and files. Process ? [y/N] y
-    root@ivreclient:/# ipdata --download --import-all --dont-feed-ipdata-cols
+    root@ivreclient:/# ivre ipdata --download --import-all --no-update-passive-db
     [...]
 
 The latest command will take a long time. Then we can integrate the
 Nmap results to the database:
 
-    root@ivreclient:/# nmap2db -r -s MySource -c MyCategory /ivre-share
+    root@ivreclient:/# ivre scan2db -r -s MySource -c MyCategory /ivre-share
 
 You can then exit the shell (`C-d`), this will stop the
 container.

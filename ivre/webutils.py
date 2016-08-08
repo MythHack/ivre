@@ -41,7 +41,7 @@ from ivre import config, utils
 from ivre.db import db
 
 
-JS_HEADERS = 'Content-Type: application/javascript\r\n\r\n'
+JS_HEADERS = 'Content-Type: application/javascript\r\n'
 IPADDR = re.compile('^\\d+\\.\\d+\\.\\d+\\.\\d+$')
 NETADDR = re.compile('^\\d+\\.\\d+\\.\\d+\\.\\d+'
                      '/\\d+(\\.\\d+\\.\\d+\\.\\d+)?$')
@@ -57,6 +57,13 @@ def js_alert(ident, level, message):
             '' % {"ident": ident, "level": level, "levelup": level.upper(),
                   "message": message.replace('"', '\\"')})
 
+
+def js_del_alert(ident):
+    """This function returns a string containing JS code to
+    remove an alert message.
+
+    """
+    return 'try {del_message("%s");} catch(err) {}\n' % ident
 
 
 def check_referer():
@@ -76,7 +83,7 @@ def check_referer():
         if host is None:
             # In case the server does not provide the environment
             # variable HTTP_HOST, which is the case for at least the
-            # test Web server included with IVRE (httpd-ivre,
+            # test Web server included with IVRE (ivre httpd,
             # implemented using Python BaseHTTPServer and
             # CGIHTTPServer modules, see
             # https://bugs.python.org/issue10486).
@@ -90,6 +97,7 @@ def check_referer():
         referer_ok = referer in config.WEB_ALLOWED_REFERERS
     if not referer_ok:
         sys.stdout.write(JS_HEADERS)
+        sys.stdout.write("\r\n")
         sys.stdout.write(
             js_alert(
                 "referer", "error",
@@ -218,6 +226,11 @@ QUERIES = {
 }
 
 def _parse_query(query):
+    """Returns a DB filter (valid for db.nmap) from a query string
+    usable in WEB_DEFAULT_INIT_QUERY and WEB_INIT_QUERIES
+    configuration items.
+
+    """
     if query is None:
         query = 'full'
     query = query.split(':')
@@ -446,6 +459,17 @@ def flt_from_query(query, base_flt=None):
                     flt = db.nmap.flt_and(flt, db.nmap.searchfile(
                         fname=utils.str2regexp(value[1]),
                         scripts=value[0].split(',')))
+        elif param == 'vuln':
+            try:
+                vulnid, status = value.split(':', 1)
+            except ValueError:
+                vulnid = value
+                status = None
+            except AttributeError:
+                vulnid = None
+                status = None
+            flt = db.nmap.flt_and(flt, db.nmap.searchvuln(vulnid=vulnid,
+                                                          status=status))
         elif not neg and param == 'geovision':
             flt = db.nmap.flt_and(flt, db.nmap.searchgeovision())
         elif param == 'httptitle':
@@ -536,23 +560,20 @@ def flt_from_query(query, base_flt=None):
             else:
                 sortby.append((value, 1))
         elif param in ['open', 'filtered', 'closed']:
-            if '_' in value:
-                value = value.replace('_', '/')
-            if '/' in value:
-                proto, port = value.split('/')
-            else:
-                proto, port = "tcp", value
-            port = port.split(',')
-            if len(port) > 1:
+            value = value.replace('_', '/').split(',')
+            protos = {}
+            for port in value:
+                if '/' in port:
+                    proto, port = port.split('/')
+                else:
+                    proto, port = "tcp", port
+                protos.setdefault(proto, []).append(int(port))
+            for proto, ports in protos.iteritems():
                 flt = db.nmap.flt_and(
                     flt,
-                    db.nmap.searchports([int(p) for p in port], protocol=proto,
-                                        state=param))
-            else:
-                flt = db.nmap.flt_and(
-                    flt,
-                    db.nmap.searchport(int(port[0]), protocol=proto,
-                                       state=param)
+                    db.nmap.searchport(ports[0], protocol=proto, state=param)
+                    if len(ports) == 1 else
+                    db.nmap.searchports(ports, protocol=proto, state=param)
                 )
         elif param == 'otheropenport':
             flt = db.nmap.flt_and(
