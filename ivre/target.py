@@ -420,6 +420,11 @@ def target_from_args(args):
                                categories=args.categories,
                                maxnbr=args.limit,
                                state=args.state)
+    elif args.region is not None:
+        target = TargetRegion(args.region[0], args.region[1],
+                               categories=args.categories,
+                               maxnbr=args.limit,
+                               state=args.state)
     elif args.asnum is not None:
         target = TargetAS(args.asnum,
                           categories=args.categories,
@@ -469,6 +474,6 @@ def target_from_args(args):
         return TargetNmapPreScan(
             target,
             ports=args.nmap_prescan_ports,
-            nmap_opts=shlex.split(nmap_prescan_opts)
+            nmap_opts=nmap_prescan_opts
         )
     return target

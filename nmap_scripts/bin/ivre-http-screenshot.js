@@ -23,13 +23,12 @@
   Nmap script.
 
   Some values are hard-coded:
-    - timeout: 10s
     - format: JPEG
     - image quality: 90%
 
   Requires phantomjs.
 
-  Usage: screenshot.js URL FILENAME
+  Usage: ivre-http-screenshot.js URL FILENAME
  */
 
 var system = require('system');
@@ -47,4 +46,4 @@ function capture(url, fname) {
 }
 
 capture(system.args[1], system.args[2])
-setTimeout(phantom.exit, 10000);
+setTimeout(phantom.exit, (system.args[3] || 10) * 1000);

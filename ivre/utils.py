@@ -418,7 +418,8 @@ class FileOpener(object):
             # By default we try to use zcat / bzcat, since they seem to be
             # (a lot) faster
             self.proc = subprocess.Popen([cmd_opener, fname],
-                                         stdout=subprocess.PIPE)
+                                         stdout=subprocess.PIPE,
+                                         stderr=open(os.devnull, 'w'))
             self.fdesc = self.proc.stdout
             return
         except OSError as exc:
@@ -578,18 +579,41 @@ def screenwords(imgdata):
             return result
 
 if USE_PIL:
+    def _img_size(bbox):
+        """Returns the size of a given `bbox`"""
+        return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+    def _trim_image(img, tolerance, minborder):
+        """Returns the tiniest `bbox` to trim `img`"""
+        result = None
+        for pixel in [(0, 0), (img.size[0] - 1, 0), (0, img.size[1] - 1),
+                      (img.size[0] - 1, img.size[1] - 1)]:
+            if result is not None and result[0] < pixel[0] < result[2] - 1 \
+               and result[1] < pixel[1] < result[3] - 1:
+                # This pixel is already removed by current result
+                continue
+            bkg = PIL.Image.new(img.mode, img.size, img.getpixel(pixel))
+            diffbkg = PIL.ImageChops.difference(img, bkg)
+            if tolerance:
+                diffbkg = PIL.ImageChops.add(diffbkg, diffbkg, 2.0, -tolerance)
+            bbox = diffbkg.getbbox()
+            if not bbox:
+                # Image no longer exists after trim
+                return
+            if result is None:
+                result = bbox
+            elif _img_size(bbox) < _img_size(result):
+                result = bbox
+        return result
+
     def trim_image(imgdata, tolerance=1, minborder=10):
-        """Trims the image, `tolerancean` is an integer from 0 (not
+        """Trims the image, `tolerance` is an integer from 0 (not
         tolerant, trims region with the exact same color) to 255
         (too tolerant, will trim the whole image).
 
         """
         img = PIL.Image.open(StringIO(imgdata))
-        bkg = PIL.Image.new(img.mode, img.size, img.getpixel((0, 0)))
-        diffbkg = PIL.ImageChops.difference(img, bkg)
-        if tolerance:
-            diffbkg = PIL.ImageChops.add(diffbkg, diffbkg, 2.0, -tolerance)
-        bbox = diffbkg.getbbox()
+        bbox = _trim_image(img, tolerance, minborder)
         if bbox:
             newbbox = (max(bbox[0] - minborder, 0),
                        max(bbox[1] - minborder, 0),
@@ -603,7 +627,7 @@ if USE_PIL:
             else:
                 # Image does not need to be modified
                 return True
-        # Image no longer exist after trim
+        # Image no longer exists after trim
         return False
 else:
     def trim_image(imgdata, _tolerance=1, _minborder=10):
@@ -626,24 +650,9 @@ def _set_ports():
 
     """
     global _PORTS, _PORTS_POPULATED
-    fdesc = None
-    for path in ['/usr/share/nmap', '/usr/local/share/nmap']:
-        try:
-            fdesc = open(os.path.join(path, 'nmap-services'))
-        except IOError:
-            pass
-    if fdesc is not None:
-        for line in fdesc:
-            try:
-                _, port, freq = line.split('#', 1)[0].split(None, 3)
-                port, proto = port.split('/', 1)
-                port = int(port)
-                freq = float(freq)
-            except ValueError:
-                continue
-            _PORTS.setdefault(proto, {})[port] = freq
-        fdesc.close()
-    else:
+    try:
+        fdesc = open(os.path.join(config.NMAP_SHARE_PATH, 'nmap-services'))
+    except IOError, AttributeError:
         try:
             with open('/etc/services') as fdesc:
                 for line in fdesc:
@@ -656,6 +665,17 @@ def _set_ports():
                     _PORTS.setdefault(proto, {})[port] = 0.5
         except IOError:
             pass
+    else:
+        for line in fdesc:
+            try:
+                _, port, freq = line.split('#', 1)[0].split(None, 3)
+                port, proto = port.split('/', 1)
+                port = int(port)
+                freq = float(freq)
+            except ValueError:
+                continue
+            _PORTS.setdefault(proto, {})[port] = freq
+        fdesc.close()
     for proto, entry in config.KNOWN_PORTS.iteritems():
         for port, proba in entry.iteritems():
             _PORTS.setdefault(proto, {})[port] = proba
@@ -674,6 +694,101 @@ def guess_srv_port(port1, port2, proto="tcp"):
     if cmpval == 0:
         return cmp(port2, port1)
     return cmpval
+
+
+_NMAP_PROBES = {}
+_NMAP_PROBES_POPULATED = False
+
+
+def _read_nmap_probes():
+    global _NMAP_CUR_PROBE, _NMAP_PROBES_POPULATED
+    _NMAP_CUR_PROBE = None
+    def parse_line(line):
+        global _NMAP_PROBES, _NMAP_CUR_PROBE
+        if line.startswith('match '):
+            line = line[6:]
+            soft = False
+        elif line.startswith('softmacth '):
+            line = line[10:]
+            soft = True
+        elif line.startswith('Probe '):
+            _NMAP_CUR_PROBE = []
+            proto, name, probe = line[6:].split(' ', 2)
+            _NMAP_PROBES.setdefault(proto.lower(), {})[name] = {
+                "probe": probe, "fp": _NMAP_CUR_PROBE
+            }
+            return
+        else:
+            return
+        service, data = line.split(' ', 1)
+        info = {"soft": soft}
+        while data:
+            if data.startswith('cpe:'):
+                key = 'cpe'
+                data = data[4:]
+            else:
+                key = data[0]
+                data = data[1:]
+            sep = data[0]
+            data = data[1:]
+            index = data.index(sep)
+            value = data[:index]
+            data = data[index + 1:]
+            flag = ''
+            if data:
+                if ' ' in data:
+                    flag, data = data.split(' ', 1)
+                else:
+                    flag, data = data, ''
+            if key == 'm':
+                if value.endswith('\\r\\n'):
+                    value = value[:-4] + '(?:\\r\\n|$)'
+                elif value.endswith('\\\\n'):
+                    value = value[:3] + '(?:\\\\n|$)'
+                elif value.endswith('\\n'):
+                    value = value[:-2] + '(?:\\n|$)'
+                value = re.compile(
+                    value,
+                    flags=sum(getattr(re, f) if hasattr(re, f) else 0 for f in flag.upper()),
+                )
+                flag = ''
+            info[key] = (value, flag)
+        _NMAP_CUR_PROBE.append((service, info))
+    try:
+        with open(os.path.join(config.NMAP_SHARE_PATH, 'nmap-service-probes')) as fdesc:
+            for line in fdesc:
+                parse_line(line[:-1])
+    except (AttributeError, IOError) as exc:
+        sys.stderr.write('WARNING: cannot read Nmap service fingerprint file.')
+        sys.stderr.write(warn_exception(exc))
+    del _NMAP_CUR_PROBE
+    _NMAP_PROBES_POPULATED = True
+
+
+def get_nmap_svc_fp(proto="tcp", probe="NULL"):
+    global _NMAP_PROBES, _NMAP_PROBES_POPULATED
+    if not _NMAP_PROBES_POPULATED:
+        _read_nmap_probes()
+    return _NMAP_PROBES[proto][probe]
+
+
+def nmap_encode_data(data):
+    return "".join(
+        (d if " " <= d <= "~" else (repr(d)[1:-1] if d in '\r\n\t'
+                                    else ('\\x%02x' % ord(d))))
+        for d in data
+    )
+
+
+def nmap_svc_fp_format_data(data, match):
+    for i, value in enumerate(match.groups()):
+        if value is None:
+            if '$%d' % (i + 1) in data:
+                return
+            continue
+        data = data.replace('$%d' % (i + 1), nmap_encode_data(value))
+    return data
+
 
 def normalize_props(props):
     """Returns a normalized property list/dict so that (roughly):

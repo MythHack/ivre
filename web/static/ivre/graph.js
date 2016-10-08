@@ -136,14 +136,17 @@ var GraphTopValues = (function(_super) {
 		neg = false;
 	    if(field.substr(0, 9) === 'portlist:') {
 		prepareoutput = function(x) {
-		    return (x.length === 0) ? "None" : x.join(' / ');
+		    return (
+			x.length === 0) ? "None" :
+			x.map(function(x) {return x.join('/')}
+			     ).join(' / ');
 		};
 		if(field.substr(9) === 'open')
 		    preparefilter = function(x) {
 			if(x.length === 0)
 			    return 'setparam(FILTER, "countports", "0", true);';
 			else
-			    return 'setparam(FILTER, "open", "' + x + '", true, true); setparam(FILTER, "countports", "' + x.length + '", true);';
+			    return 'setparam(FILTER, "open", "' + x.map(function(x) {return x.join('/');}).join(',') + '", true, true); setparam(FILTER, "countports", "' + x.length + '", true);';
 		    };
 	    }
 	    else if(['cert.issuer', 'cert.subject'].indexOf(field) !== -1)
@@ -197,7 +200,7 @@ var GraphTopValues = (function(_super) {
 	    }
 	    else if(field === 'as') {
 		prepareoutput = function(x) {
-		    return x[1];
+		    return x[1] || ("AS" + x[0]);
 		};
 		preparetitle = function(x) {
 		    return x[0];
@@ -264,14 +267,22 @@ var GraphTopValues = (function(_super) {
 		    return 'setparam(FILTER, "script", "' + x + '");';
 		};
 	    }
+	    else if(field === 'port') {
+		prepareoutput = function(x) {
+		    return x.join(' / ');
+		};
+	    }
 	    else if(field.substr(0, 5) === 'port:') {
 		var info = field.substr(5);
+		prepareoutput = function(x) {
+		    return x.join(' / ');
+		};
 		switch(info) {
 		case "open":
 		case "filtered":
 		case "closed":
 		    preparefilter = function(x) {
-			return 'setparam(FILTER, "' + info + '", "' + x + '");';
+			return 'setparam(FILTER, "' + info + '", "' + x[0] + '/' + x[1] + '");';
 		    };
 		    break;
 		default:
@@ -303,7 +314,7 @@ var GraphTopValues = (function(_super) {
 		preparetitle = function(x) {
 		    return x[0];
 		};
-		if(field[7] === ':') {
+		if(field[7] === ':' && field.substr(8) % 1 === 0) {
 		    preparefilter = function(x) {
 			return 'setparam(FILTER, "product", "' + x[0] + ':' + x[1] + field.substr(7) + '");';
 		    };
@@ -321,7 +332,7 @@ var GraphTopValues = (function(_super) {
 		preparetitle = function(x) {
 		    return x[0];
 		};
-		if(field[7] === ':') {
+		if(field[7] === ':' && field.substr(8) % 1 === 0) {
 		    preparefilter = function(x) {
 			return 'setparam(FILTER, "version", "' + x[0] + ':' + x[1] + ':' + x[2] + field.substr(7) + '");';
 		    };
@@ -822,25 +833,31 @@ var GraphIpPort = (function(_super) {
 	},
 	draw: function(ips) {
 	    var chart = this.chart, graphobject = this,
-	    real_w = 500,
-	    real_h = 450,
-	    w = real_w - 100,
-	    h = real_h - 60,
-	    xmin = d3.min(ips, function(i) {return i[0];}),
-	    xmax = d3.max(ips, function(i) {return i[0];}),
-	    x = d3.scale.linear()
+		real_w = 500,
+		real_h = 450,
+		w = real_w - 100,
+		h = real_h - 60,
+		xmin = d3.min(ips, function(i) {return i[0];}),
+		xmax = d3.max(ips, function(i) {return i[0];}),
+		ymin = d3.min(ips, function(i) {
+		    return d3.min(i[1], function(j) {return j[0];});
+		}),
+		ymax = d3.max(ips, function(i) {
+		    return d3.max(i[1], function(j) {return j[0];});
+		}),
+		x = d3.scale.linear()
 		.domain(d3.extent(ips, function(i) {return i[0];}))
 		.range([0, w]),
-	    y = d3.scale.log()
-		.domain([1, 65535])
+		y = d3.scale.log()
+		.domain([ymin, ymax])
 		.range([h, 0]),
-	    ips_ports = ips.map(function(x) {
-		return x[1].map(function(t) {
-		    return [x[0], t[0], t[1]];
-		});
-	    }).reduce(function(x, y) {
-		return x.concat(y);
-	    }, []);
+		ips_ports = ips.map(function(x) {
+		    return x[1].map(function(t) {
+			return [x[0], t[0], t[1]];
+		    });
+		}).reduce(function(x, y) {
+		    return x.concat(y);
+		}, []);
 
 	    this.title.html("Ports status");
 
@@ -898,7 +915,7 @@ var GraphIpPort = (function(_super) {
 
 	    var yaxis = [];
 	    var ystep = Math.max(h / 10);
-	    for(i = 1; i <= h; i += ystep) {
+	    for(i = 0; i <= h; i += ystep) {
 		yaxis.push(i);
 	    }
 

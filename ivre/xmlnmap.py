@@ -19,7 +19,7 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
 
 This sub-module contains the parser for nmap's XML output files.
 
@@ -106,14 +106,19 @@ ALIASES_TABLE_ELEMS = {
     "supermicro-ipmi-conf": "vulns",
 }
 
-HTTP_SCREENSHOT_PATTERN = re.compile('^ *Saved to (.*)$', re.MULTILINE)
+SCREENSHOT_PATTERN = re.compile('^ *Saved to (.*)$', re.MULTILINE)
+RTSP_SCREENSHOT_PATTERN = re.compile('^ *Saved [^ ]* to (.*)$', re.MULTILINE)
 
-def http_screenshot_extract(script):
-    fname = HTTP_SCREENSHOT_PATTERN.search(script['output'])
+def screenshot_extract(script):
+    fname = (RTSP_SCREENSHOT_PATTERN if script['id'] == 'rtsp-screenshot'
+             else SCREENSHOT_PATTERN).search(script['output'])
     return None if fname is None else fname.groups()[0]
 
 SCREENSHOTS_SCRIPTS = {
-    "http-screenshot": http_screenshot_extract,
+    "http-screenshot": screenshot_extract,
+    "rtsp-screenshot": screenshot_extract,
+    "vnc-screenshot": screenshot_extract,
+    "x11-screenshot": screenshot_extract,
 }
 
 _MONGODB_DATABASES_CONVERTS = {"false": False, "true": True, "nil": None}
@@ -661,7 +666,8 @@ IGNORE_SCRIPTS = {
                        'SMB: ERROR: Server disconnected the connection']),
 }
 
-IGNORE_SCRIPTS_IDS = set(["http-screenshot"])
+IGNORE_SCRIPTS_IDS = set(["http-screenshot", "rtsp-screenshot",
+                          "vnc-screenshot", "x11-screenshot"])
 
 MSSQL_ERROR = re.compile('^ *(ERROR: )?('
                          'No login credentials|'
@@ -738,21 +744,64 @@ MASSCAN_SERVICES_NMAP_SCRIPTS = {
     "unknown": "banner",
     "ssh": "banner",
     "vnc": "banner",
+    "imap": "banner",
+    "pop": "banner",
+    "X509": "ssl-cert"
+}
+
+MASSCAN_NMAP_SCRIPT_NMAP_PROBES = {
+    "banner": ["NULL"],
+    "http-headers": ["GetRequest"],
+}
+
+NMAP_FINGERPRINT_IVRE_KEY = {
+    # TODO: cpe
+    'd': 'service_devicetype',
+    'h': 'service_hostname',
+    'i': 'service_extrainfo',
+    'o': 'service_ostype',
+    'p': 'service_product',
+    'v': 'service_version',
 }
 
 MASSCAN_SERVICES_NMAP_SERVICES = {
-    "ftp": "ftp", # masscan can confuse smtp (for example) for ftp
+    "ftp": "ftp",
     "http": "http",
     "ssh": "ssh",
     "vnc": "vnc",
+    "imap": "imap",
+    "pop": "pop3",
 }
 
 MASSCAN_ENCODING = re.compile(re.escape("\\x") + "([0-9a-f]{2})")
 
-def _masscan_decode(match):
+def _masscan_decode_print(match):
     char = match.groups()[0].decode('hex')
     return (char if (32 <= ord(char) <= 126 or char in "\t\r\n")
             else match.group())
+
+def _masscan_decode_raw(match):
+    return match.groups()[0].decode('hex')
+
+def masscan_x509(output):
+    """Produces an output similar to Nmap script ssl-cert from Masscan
+X509 "service" tag.
+
+    XXX WORK IN PROGRESS"""
+    certificate = output.decode('base64')
+    newout = []
+    for hashtype, hashname in [('md5', 'MD5:'), ('sha1', 'SHA-1:')]:
+        hashvalue = hashlib.new(hashtype, cert).hexdigest()
+        newout.append('%-7s%s\n' % (
+            hashname,
+            ' '.join(hashvalue[i:i + 4] for i in xrange(0, len(hashvalue), 4))),
+        )
+    b64cert = certificate.encode('base64')
+    newout.append('-----BEGIN CERTIFICATE-----\n')
+    newout.extend('%s\n' % b64cert[i:i + 64] for i in xrange(0, len(b64cert), 64))
+    newout.append('-----END CERTIFICATE-----\n')
+    return "".join(newout)
+
 
 def ignore_script(script):
     """Predicate that decides whether an Nmap script should be ignored
@@ -828,7 +877,7 @@ class NmapHandler(ContentHandler):
     """
 
     def __init__(self, fname, filehash, needports=False, needopenports=False,
-                 **_):
+                 masscan_probes=None, **_):
         ContentHandler.__init__(self)
         self._needports = needports
         self._needopenports = needopenports
@@ -846,6 +895,7 @@ class NmapHandler(ContentHandler):
         self._filehash = filehash
         self.scanner = "nmap"
         self.need_scan_doc = False
+        self.masscan_probes = [] if masscan_probes is None else masscan_probes
         if config.DEBUG:
             sys.stderr.write("READING %r (%r)\n" % (fname, self._filehash))
 
@@ -975,19 +1025,82 @@ class NmapHandler(ContentHandler):
                 # discard information from nmap-services
                 return
             if self.scanner == "masscan":
+                banner = attrs["banner"]
+                if attrs['name'] == 'vnc' and "=" in attrs["banner"]:
+                    # See also https://github.com/robertdavidgraham/masscan/pull/250
+                    banner = banner.split(' ')
+                    banner, vncinfo = '%s\\x0a' % ' '.join(banner[:2]), banner[2:]
+                    if vncinfo:
+                        output = []
+                        while vncinfo:
+                            info = vncinfo.pop(0)
+                            if info.startswith('ERROR='):
+                                info = 'ERROR: ' + ' '.join(vncinfo)
+                                vncinfo = []
+                            elif '=[' in info:
+                                while vncinfo and not info.endswith(']'):
+                                    info += ' ' + vncinfo.pop(0)
+                                info = info.replace('=[', ': ', 1)
+                                if info.endswith(']'):
+                                    info = info[:-1]
+                            else:
+                                info = info.replace('=', ': ', 1)
+                            output.append(info)
+                        self._curport.setdefault('scripts', []).append({
+                            'id': 'vnc-info', 'output': '\n'.join(output),
+                        })
                 # create fake scripts from masscan "service" tags
-                self._curport.setdefault('scripts', []).append({
-                    "id": MASSCAN_SERVICES_NMAP_SCRIPTS.get(attrs['name'],
-                                                            attrs['name']),
-                    "output": MASSCAN_ENCODING.sub(
-                        _masscan_decode,
-                        attrs["banner"],
-                    )
-                })
+                raw_output = MASSCAN_ENCODING.sub(_masscan_decode_raw,
+                                                  str(banner))
+                scriptid = MASSCAN_SERVICES_NMAP_SCRIPTS.get(attrs['name'],
+                                                             attrs['name'])
+                script = {
+                    "id": scriptid,
+                    "output": MASSCAN_ENCODING.sub(_masscan_decode_print,
+                                                   banner),
+                    "masscan": {
+                        "raw": self._to_binary(raw_output),
+                        "encoded": banner,
+                    },
+                }
+                self._curport.setdefault('scripts', []).append(script)
                 # get service name
-                service = MASSCAN_SERVICES_NMAP_SERVICES.get(attrs['name'])
-                if service is not None:
-                    self._curport['service_name'] = service
+                try:
+                    self._curport[
+                        'service_name'
+                    ] = MASSCAN_SERVICES_NMAP_SERVICES[attrs['name']]
+                except KeyError:
+                    pass
+                if attrs['name'] in ["ssl", "X509"]:
+                    self._curport['service_tunnel'] = "ssl"
+                self.masscan_post_script(script)
+                # attempt to use Nmap service fingerprints
+                probes = self.masscan_probes[:]
+                probes.extend(MASSCAN_NMAP_SCRIPT_NMAP_PROBES.get(scriptid, []))
+                softmatch = {}
+                for probe in probes:
+                    try:
+                        fingerprints = utils.get_nmap_svc_fp(
+                            proto=self._curport['protocol'],
+                            probe=probe,
+                        )['fp']
+                    except KeyError:
+                        pass
+                    else:
+                        for service, fingerprint in fingerprints:
+                            match = fingerprint['m'][0].search(raw_output)
+                            if match is not None:
+                                doc = softmatch if fingerprint['soft'] else self._curport
+                                doc['service_name'] = service
+                                for elt, key in NMAP_FINGERPRINT_IVRE_KEY.iteritems():
+                                    if elt in fingerprint:
+                                        doc[key] = utils.nmap_svc_fp_format_data(
+                                            fingerprint[elt][0], match
+                                        )
+                                if not fingerprint['soft']:
+                                    return
+                if softmatch:
+                    self._curport.update(softmatch)
                 return
             for attr in attrs.keys():
                 self._curport['service_%s' % attr] = attrs[attr]
@@ -1134,14 +1247,55 @@ class NmapHandler(ContentHandler):
             elif self._curhost is not None:
                 current = self._curhost
             else:
-                sys.stderr.write("WARNING, script element without port or "
-                                 "host\n")
+                # We do not want to handle script tags outside host or
+                # port tags (usually scripts running on prerule /
+                # postrule)
                 self._curscript = None
                 if self._curtablepath:
                     sys.stderr.write("WARNING, self._curtablepath should be "
                                      "empty, got [%r]\n" % self._curtablepath)
                 self._curtable = {}
                 return
+            if self._curscript['id'] in SCREENSHOTS_SCRIPTS:
+                fname = SCREENSHOTS_SCRIPTS[self._curscript['id']](
+                    self._curscript
+                )
+                if fname is not None:
+                    exceptions = []
+                    for full_fname in [fname,
+                                       os.path.join(
+                                           os.path.dirname(self._fname),
+                                           fname)]:
+                        try:
+                            with open(full_fname) as fdesc:
+                                data = fdesc.read()
+                                trim_result = utils.trim_image(data)
+                                if trim_result:
+                                    # When trim_result is False, the image no
+                                    # longer exists after trim
+                                    if trim_result is not True:
+                                        # Image has been trimmed
+                                        data = trim_result
+                                    current['screenshot'] = "field"
+                                    current['screendata'] = self._to_binary(
+                                        data
+                                    )
+                                    screenwords = utils.screenwords(data)
+                                    if screenwords is not None:
+                                        current['screenwords'] = screenwords
+                        except Exception as exc:
+                            exceptions.append((exc, full_fname))
+                        else:
+                            exceptions = []
+                            break
+                    for exc, full_fname in exceptions:
+                        sys.stderr.write(
+                            utils.warn_exception(
+                                exc,
+                                scanfile=self._fname,
+                                fname=full_fname,
+                            )
+                        )
             if ignore_script(self._curscript):
                 self._curscript = None
                 return
@@ -1171,45 +1325,6 @@ class NmapHandler(ContentHandler):
                     infos = infos(self._curscript)
                     if infos is not None:
                         self._curscript[infokey] = infos
-            if self._curscript['id'] in SCREENSHOTS_SCRIPTS:
-                fname = SCREENSHOTS_SCRIPTS[self._curscript['id']](
-                    self._curscript
-                )
-                if fname is not None:
-                    exceptions = []
-                    for full_fname in [fname,
-                                       os.path.join(
-                                           os.path.dirname(self._fname),
-                                           fname)]:
-                        try:
-                            with open(full_fname) as fdesc:
-                                data = fdesc.read()
-                                trim_result = utils.trim_image(data)
-                                if trim_result:
-                                    # When trim_result is False, the image no
-                                    # longer exists after trim
-                                    if trim_result is not True:
-                                        # Image has been trimmed
-                                        data = trim_result
-                                    current['screenshot'] = "field"
-                                    current['screendata'] = self._to_binary(
-                                        data
-                                    )
-                                    screenwords = utils.screenwords(data)
-                                    if screenwords is not None:
-                                        current['screenwords'] = screenwords
-                        except Exception as exc:
-                            exceptions.append(exc)
-                        else:
-                            break
-                    for exc in exceptions:
-                        sys.stderr.write(
-                            utils.warn_exception(
-                                exc,
-                                scanfile=self._fname,
-                                fname=full_fname,
-                            )
-                        )
             current.setdefault('scripts', []).append(self._curscript)
             self._curscript = None
         elif name in ['table', 'elem']:
@@ -1244,6 +1359,32 @@ class NmapHandler(ContentHandler):
             self._curtrace = None
         elif name == 'cpe':
             self._add_cpe_to_host()
+
+    def masscan_post_script(self, script):
+        try:
+            function = {
+                "http-headers": self.masscan_post_http,
+            }[script['id']]
+        except KeyError:
+            pass
+        else:
+            return function(script)
+
+    def masscan_post_http(self, script):
+        header = re.search(re.escape('\nServer:') + '[ \\\t]*([^\\\r\\\n]+)\\\r?(?:\\\n|$)',
+                           script['masscan']['raw'])
+        if header is None:
+            return
+        header = header.groups()[0]
+        self._curport.setdefault('scripts', []).append({
+            "id": "http-server-header",
+            "output": utils.nmap_encode_data(header),
+            "masscan": {
+                "raw": self._to_binary(header),
+            },
+        })
+        self._curport['service_product'] = utils.nmap_encode_data(header)
+
 
     def _add_cpe_to_host(self):
         """Adds the cpe in self._curdata to the host-wide cpe list, taking
@@ -1309,7 +1450,7 @@ class Nmap2Txt(NmapHandler):
         self._db.append(self._curhost)
 
 
-class Nmap2Mongo(NmapHandler):
+class Nmap2DB(NmapHandler):
 
     """Specific handler for MongoDB backend."""
 
@@ -1324,10 +1465,6 @@ class Nmap2Mongo(NmapHandler):
             self.categories = categories
         self._add_addr_infos = add_addr_infos
         self.source = source
-        # FIXME we should use self._db methods instead of that and
-        # rename this class as Nmap2DB
-        self._collection = self._db.nmap.db[self._db.nmap.colname_hosts]
-        self._scancollection = self._db.nmap.db[self._db.nmap.colname_scans]
         if gettoarchive is None:
             self._gettoarchive = lambda a, s: []
         else:
