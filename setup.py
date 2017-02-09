@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 
 Standard setup.py file. Run
 
@@ -28,8 +28,11 @@ $ python setup.py build
 
 from distutils.core import setup
 from distutils.command.install_data import install_data
+from distutils.command.install_lib import install_lib
 import os
 import sys
+
+VERSION = __import__('ivre').VERSION
 
 class smart_install_data(install_data):
     """Replacement for distutils.command.install_data to handle
@@ -66,9 +69,32 @@ class smart_install_data(install_data):
                     os.unlink(tmpfname)
         return result
 
+class smart_install_lib(install_lib):
+    """Replacement for distutils.command.install_lib to handle
+    version file.
+
+    """
+    def run(self):
+        result = install_lib.run(self)
+        fullfname = os.path.join(self.install_dir, 'ivre', '__init__.py')
+        tmpfname = "%s.tmp" % fullfname
+        stat = os.stat(fullfname)
+        os.rename(fullfname, tmpfname)
+        with open(fullfname, 'w') as newf:
+            with open(tmpfname) as oldf:
+                for line in oldf:
+                    if line.startswith('import '):
+                        newf.write('VERSION = %r\n' % VERSION)
+                        break
+                    newf.write(line)
+        os.chown(fullfname, stat.st_uid, stat.st_gid)
+        os.chmod(fullfname, stat.st_mode)
+        os.unlink(tmpfname)
+        return result
+
 setup(
     name='ivre',
-    version='0.9.3',
+    version=VERSION,
     author='Pierre LALET',
     author_email='pierre@droids-corp.org',
     url='https://ivre.rocks/',
@@ -111,7 +137,7 @@ specialized scripts.
     extras_require={
         'Flow':  ["py2neo>=3"],
     },
-    packages=['ivre', 'ivre/tools', 'ivre/db', 'ivre/parser'],
+    packages=['ivre', 'ivre/tools', 'ivre/db', 'ivre/parser', 'ivre/analyzer'],
     scripts=['bin/ivre'],
     data_files=[
         ('share/ivre/passiverecon',
@@ -122,8 +148,10 @@ specialized scripts.
           'bro/flow/dhcp_names.bro',
           'bro/flow/rpc.bro',
           'bro/flow/settings.bro']),
-        ('share/ivre/honeyd', ['honeyd/sshd']),
+        ('share/ivre/honeyd', []),
         ('share/ivre/geoip', []),
+        ('share/ivre/data', ['data/ike-vendor-ids']),
+        ('share/ivre/data/honeyd', ['data/honeyd/sshd']),
         ('share/ivre/docker', ['docker/Vagrantfile']),
         ('share/ivre/docker/agent', ['docker/agent/Dockerfile']),
         ('share/ivre/docker/base', ['docker/base/Dockerfile',
@@ -149,7 +177,8 @@ specialized scripts.
           'web/static/favicon.png',
           'web/static/loading.gif',
           'web/static/logo.png',
-          'web/static/droids.png',
+          'web/static/cea.png',
+          'web/static/cea-white.png',
           'web/static/world-110m.json']),
         ('share/ivre/web/static/templates',
          ['web/static/templates/filters.html',
@@ -222,7 +251,9 @@ specialized scripts.
         ('share/ivre/dokuwiki/doc',
          ['web/dokuwiki/doc/agent.txt',
           'web/dokuwiki/doc/docker.txt',
+          'web/dokuwiki/doc/faq.txt',
           'web/dokuwiki/doc/fast-install-and-first-run.txt',
+          'web/dokuwiki/doc/flow.txt',
           'web/dokuwiki/doc/install.txt',
           'web/dokuwiki/doc/license-external.txt',
           'web/dokuwiki/doc/license.txt',
@@ -242,17 +273,19 @@ specialized scripts.
           'web/cgi-bin/scanupload.py']),
         ('share/ivre/nmap_scripts',
          ['nmap_scripts/http-screenshot.nse',
+          'nmap_scripts/mainframe-banner.nse',
+          'nmap_scripts/mainframe-screenshot.nse',
           'nmap_scripts/rtsp-screenshot.nse',
           'nmap_scripts/vnc-screenshot.nse',
           'nmap_scripts/x11-screenshot.nse']),
-        ('bin',
-         ['nmap_scripts/bin/ivre-http-screenshot.js']),
         ('share/ivre/nmap_scripts/patches',
          ['nmap_scripts/patches/rtsp-url-brute.patch']),
         ('share/doc/ivre',
          ['doc/AGENT.md',
           'doc/DOCKER.md',
+          'doc/FAQ.md',
           'doc/FAST-INSTALL-AND-FIRST-RUN.md',
+          'doc/FLOW.md',
           'doc/INSTALL.md',
           'doc/LICENSE-EXTERNAL.md',
           'doc/LICENSE.md',
@@ -260,7 +293,21 @@ specialized scripts.
           'doc/SCREENSHOTS.md',
           'doc/TESTS.md',
           'doc/WEBUI.md']),
+        ('share/doc/ivre/screenshots',
+         ['doc/screenshots/webui-details-heatmapzoom.png',
+          'doc/screenshots/webui-flow-details-flow.png',
+          'doc/screenshots/webui-flow-details-host.png',
+          'doc/screenshots/webui-flow-dns-halo.png',
+          'doc/screenshots/webui-flow-flow-map.png',
+          'doc/screenshots/webui-home-heatmap.png',
+          'doc/screenshots/webui-screenshots-solar-world.png',
+          'doc/screenshots/webui-tooltip-topenipvendors.png',
+          'doc/screenshots/webui-topproducts-80.png']),
         ('etc/bash_completion.d', ['bash_completion/ivre']),
     ],
-    cmdclass={'install_data':smart_install_data},
+    package_data={
+        'ivre': ['VERSION'],
+    },
+    cmdclass={'install_data': smart_install_data,
+              'install_lib': smart_install_lib},
 )

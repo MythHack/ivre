@@ -467,6 +467,8 @@ class MongoDBNmap(MongoDB, DBNmap):
                   "ports.scripts.ls.volumes.files",
                   "ports.scripts.mongodb-databases.databases",
                   "ports.scripts.mongodb-databases.databases.shards",
+                  "ports.scripts.ike-info.transforms",
+                  "ports.scripts.ike-info.vendor_ids",
                   "ports.scripts.vulns",
                   "ports.scripts.vulns.check_results",
                   "ports.scripts.vulns.description",
@@ -1990,7 +1992,7 @@ have no effect if it is not expected)."""
           - devicetype / devicetype:<portnbr>
           - script:<scriptid> / script:<port>:<scriptid>
             / script:host:<scriptid>
-          - cert.* / smb.* / sshkey.*
+          - cert.* / smb.* / sshkey.* / ike.*
           - modbus.* / s7.* / enip.*
           - mongo.dbs.*
           - vulns.*
@@ -1998,6 +2000,7 @@ have no effect if it is not expected)."""
           - file.* / file.*:scriptid
           - hop
         """
+        null_if_empty = lambda val: val if val else None
         outputproc = None
         if flt is None:
             flt = self.flt_empty
@@ -2083,8 +2086,10 @@ have no effect if it is not expected)."""
             field = "as"
             outputproc = lambda x: {
                 'count': x['count'],
-                '_id': [int(y) if i == 0 else y for i, y in
-                        enumerate(x['_id'].split('###'))],
+                '_id': [None, None] if x['_id'] is None else [
+                    int(y) if i == 0 else y for i, y in
+                    enumerate(x['_id'].split('###'))
+                ],
             }
         elif field == "net" or field.startswith("net:"):
             field = "addr"
@@ -2491,6 +2496,62 @@ have no effect if it is not expected)."""
             flt = self.flt_and(flt, self.searchsshkey())
             subfield = field[7:]
             field = 'ports.scripts.ssh-hostkey.' + subfield
+        elif field == 'ike.vendor_ids':
+            flt = self.flt_and(flt, self.searchscript(name="ike-info"))
+            specialproj = {"ports.scripts.ike-info.vendor_ids.value": 1,
+                           "ports.scripts.ike-info.vendor_ids.name": 1}
+            specialflt = [{"$project": {
+                "_id": 0,
+                "ports.scripts.ike-info.vendor_ids": {
+                    "$concat": [
+                        "$ports.scripts.ike-info.vendor_ids.value",
+                        "###",
+                        {"$ifNull": ["$ports.scripts.ike-info.vendor_ids.name", ""]},
+                    ]}}}]
+            field = "ports.scripts.ike-info.vendor_ids"
+            outputproc = lambda x: {'count': x['count'],
+                                    '_id': map(null_if_empty,
+                                               x['_id'].split('###'))}
+        elif field == 'ike.transforms':
+            flt = self.flt_and(flt, self.searchscript(
+                name="ike-info",
+                values={"transforms": {"$exists": True}},
+            ))
+            specialproj = {"ports.scripts.ike-info.transforms.Authentication": 1,
+                           "ports.scripts.ike-info.transforms.Encryption": 1,
+                           "ports.scripts.ike-info.transforms.GroupDesc": 1,
+                           "ports.scripts.ike-info.transforms.Hash": 1,
+                           "ports.scripts.ike-info.transforms.LifeDuration": 1,
+                           "ports.scripts.ike-info.transforms.LifeType": 1}
+            specialflt = [{"$project": {
+                "_id": 0,
+                "ports.scripts.ike-info.transforms": {
+                    "$concat": [
+                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Authentication", ""]},
+                        "###",
+                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Encryption", ""]},
+                        "###",
+                        {"$ifNull": ["$ports.scripts.ike-info.transforms.GroupDesc", ""]},
+                        "###",
+                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Hash", ""]},
+                        "###",
+                        {"$toLower": "$ports.scripts.ike-info.transforms.LifeDuration"},
+                        "###",
+                        {"$ifNull": ["$ports.scripts.ike-info.transforms.LifeType", ""]},
+                    ]}}}]
+            field = "ports.scripts.ike-info.transforms"
+            outputproc = lambda x: {'count': x['count'],
+                                    '_id': map(null_if_empty,
+                                               x['_id'].split('###'))}
+        elif field == 'ike.notification':
+            flt = self.flt_and(flt, self.searchscript(
+                name="ike-info",
+                values={"notification_type": {"$exists": True}},
+            ))
+            field = "ports.scripts.ike-info.notification_type"
+        elif field.startswith('ike.'):
+            flt = self.flt_and(flt, self.searchscript(name="ike-info"))
+            field = "ports.scripts.ike-info." + field[4:]
         elif field.startswith('modbus.'):
             subfield = field[7:]
             field = 'ports.scripts.modbus-discover.' + subfield
@@ -2744,6 +2805,8 @@ have no effect if it is not expected)."""
                 utils.str2regexp(args.asname)))
         if args.source is not None:
             flt = self.flt_and(flt, self.searchsource(args.source))
+        if args.version is not None:
+            flt = self.flt_and(flt, self.searchversion(args.version))
         if args.timeago is not None:
             flt = self.flt_and(flt, self.searchtimeago(args.timeago))
         if args.id is not None:
@@ -3603,34 +3666,58 @@ class MongoDBAgent(MongoDB, DBAgent):
     def _add_scan(self, scan):
         return self.db[self.colname_scans].insert(scan)
 
-    def _get_scan(self, scanid):
-        return self.find_one(self.colname_scans, {"_id": scanid})
+    def get_scan(self, scanid):
+        scan = self.find_one(self.colname_scans, {"_id": scanid},
+                             fields={'target': 0})
+        if "target_info" not in scan:
+            target = self.get_scan_target(scanid)
+            if target is not None:
+                target_info = target.target.infos
+                self.db[self.colname_scans].update(
+                    {"_id": scanid},
+                    {"$set": {"target_info": target_info}},
+                )
+                scan["target_info"] = target_info
+        return scan
+
+    def _get_scan_target(self, scanid):
+        scan = self.find_one(self.colname_scans, {"_id": scanid}, fields={'target': 1, '_id': 0})
+        return None if scan is None else scan['target']
 
     def _lock_scan(self, scanid, oldlockid, newlockid):
         if oldlockid is not None:
             oldlockid = bson.Binary(oldlockid)
         if newlockid is not None:
             newlockid = bson.Binary(newlockid)
-        result = self.db[self.colname_scans].find_and_modify({
+        scan = self.db[self.colname_scans].find_and_modify({
             "_id": scanid,
             "lock": oldlockid,
         }, {
-            "$set": {"lock": newlockid}
-        }, full_response=True, new=True)['value']
-        if result is not None and result['lock'] is not None:
-            result['lock'] = str(result['lock'])
-        return result
+            "$set": {"lock": newlockid},
+        }, full_response=True, fields={'target': False}, new=True)['value']
+        if "target_info" not in scan:
+            target = self.get_scan_target(scanid)
+            if target is not None:
+                target_info = target.target.infos
+                self.db[self.colname_scans].update(
+                    {"_id": scanid},
+                    {"$set": {"target_info": target_info}},
+                )
+                scan["target_info"] = target_info
+        if scan is not None and scan['lock'] is not None:
+            scan['lock'] = str(scan['lock'])
+        return scan
 
     def _unlock_scan(self, scanid, lockid):
-        result = self.db[self.colname_scans].find_and_modify({
+        scan = self.db[self.colname_scans].find_and_modify({
             "_id": scanid,
             "lock": bson.Binary(lockid),
         }, {
             "$set": {"lock": None}
         }, full_response=True, new=True)['value']
-        if result is not None and result['lock'] is not None:
-            result['lock'] = str(result['lock'])
-        return result
+        if scan is not None and scan['lock'] is not None:
+            scan['lock'] = str(scan['lock'])
+        return scan
 
     def get_scans(self):
         return (x['_id'] for x in

@@ -58,6 +58,21 @@ It includes the European flag from [pull request
 These files are licensed under [MIT
 license](https://en.wikipedia.org/wiki/MIT_License).
 
+## ike-scan Vendor ID database ##
+
+The file `data/ike-vendor-ids` come from the
+[ike-scan](https://github.com/royhills/ike-scan) project.
+
+It includes new fingerprints discovered during Internet-wide ISAKMP
+scans. Those fingerprints are of course
+[contributed to ike-scan](https://github.com/royhills/ike-scan/pull/18),
+but have not been accepted by the project yet.
+
+This file is licensed under
+[GPL v3 license](https://www.gnu.org/licenses/gpl-3.0.en.html).
+
+See also
+[Use of ike-vendor-ids in other (open-source) softwares](https://github.com/royhills/ike-scan/issues/19).
 
 ## Natural Earth ##
 
@@ -67,14 +82,14 @@ and [World Atlas](https://github.com/mbostock/world-atlas.git) from
 data published by [Natural Eath](http://www.naturalearthdata.com/) in
 the public domain.
 
-## Droids Corporation Logo ##
+## CEA Logo ##
 
-The files `web/dokuwiki/media/logo.png` and `web/static/logo.png` are the
-work of Olivier MATZ (Droids Corporation) and are released under the
-[CC BY-NC-ND license](http://creativecommons.org/licenses/by-nc-nd/3.0/).
+The file `web/static/cea.png` and `web/static/cea-white.png` are the
+logo of the French Alternative Energies and Atomic Energy
+Commission. It is not covered by IVRE license.
 
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2015
+This file is part of IVRE. Copyright 2011 - 2016
 [Pierre LALET](mailto:pierre.lalet@cea.fr)
