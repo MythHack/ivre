@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,17 +19,19 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 
 This sub-module contains functions used for passive recon.
 """
 
-from ivre import utils, config
 
 import re
 import hashlib
 import subprocess
-import sys
+
+
+from ivre import utils
+
 
 # p0f specific
 
@@ -60,15 +62,15 @@ def parse_p0f_line(line, include_port=False, sensor=None, recontype=None):
     line = [line.split(' - ')[0]] + line.split(' - ')[1].split(' -> ')
     if line[1].startswith('UNKNOWN '):
         sig = line[1][line[1].index('UNKNOWN ') + 8:][1:-1].split(':')[:6]
-        OS, version, dist = '?', '?', -1
+        osname, version, dist = '?', '?', -1
     else:
         sig = line[1][line[1].index(' Signature: ') + 12:][
             1:-1].split(':')[:6]
         if ' (up: ' in line[1]:
-            OS = line[1][:line[1].index(' (up: ')]
+            osname = line[1][:line[1].index(' (up: ')]
         else:
-            OS = line[1][:line[1].index(' Signature: ')]
-        OS, version = OS.split(' ')[0], ' '.join(OS.split(' ')[1:])
+            osname = line[1][:line[1].index(' Signature: ')]
+        osname, version = osname.split(' ')[0], ' '.join(osname.split(' ')[1:])
         dist = int(P0F_DIST.search(line[2]).groups()[0])
     # We wildcard any window size which is not Sxxx or Tyyy
     if sig[0][0] not in ['S', 'T']:
@@ -77,7 +79,7 @@ def parse_p0f_line(line, include_port=False, sensor=None, recontype=None):
         'addr': utils.ip2int(line[0][line[0].index('> ')
                                      + 2:line[0].index(':')]),
         'distance': dist,
-        'value': OS,
+        'value': osname,
         'version': version,
         'signature': ":".join(map(str, sig)),
     }
@@ -115,10 +117,8 @@ def _split_digest_auth(data):
                 state = 0
             curdata.append(char)
     values.append(''.join(curdata).strip())
-    if state == 1 and config.DEBUG:
-        sys.stderr.write(
-            "IVRE: WARNING: could not parse Digest auth data [%r]" % data
-        )
+    if state == 1:
+        utils.LOGGER.debug("Could not parse Digest auth data [%r]", data)
     return values
 
 
@@ -150,9 +150,9 @@ def _prepare_rec(spec, ignorenets, neverignore):
         if authtype.lower() == 'digest':
             try:
                 # we only keep relevant info
-                v = filter(DIGEST_AUTH_INFOS.match,
-                           _split_digest_auth(spec['value'][6:].strip()))
-                spec['value'] = '%s %s' % (authtype, ','.join(v))
+                value = filter(DIGEST_AUTH_INFOS.match,
+                               _split_digest_auth(spec['value'][6:].strip()))
+                spec['value'] = '%s %s' % (authtype, ','.join(value))
             except:
                 pass
         elif authtype.lower() in ['negotiate', 'kerberos', 'oauth', 'ntlm']:
@@ -336,7 +336,7 @@ def getinfos(spec):
 
     """
     function = _GETINFOS_FUNCTIONS.get(spec.get('recontype'))
-    if type(function) is dict:
+    if isinstance(function, dict):
         function = function.get(spec.get('source'))
     if function is None:
         return {}

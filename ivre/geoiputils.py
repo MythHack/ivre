@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,21 +19,24 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 
 This sub-module contains the classes and functions to handle
 information about IP addresses (mostly from Maxmind GeoIP files).
 
 """
 
-from ivre import utils, config
 
 import zlib
 import zipfile
-import urllib
+import urllib2
 import os.path
 import sys
 import functools
+
+
+from ivre import utils, config
+
 
 URLS = {
     # 'GeoIPCountry.dat':
@@ -67,6 +70,7 @@ URLS = {
     # 'GeoIPASNumIPv6.csv':
     # 'http://download.maxmind.com/download/geoip/database/asnum/'
     # 'GeoIPASNum2v6.zip',
+    'iso3166.csv': 'http://dev.maxmind.com/static/csv/codes/iso3166.csv',
     # This one is not from maxmind -- see http://thyme.apnic.net/
     'BGP.raw': 'http://thyme.apnic.net/current/data-raw-table',
 }
@@ -140,6 +144,8 @@ PARSERS = [
 
 def download_all(verbose=False):
     utils.makedirs(config.GEOIP_PATH)
+    opener = urllib2.build_opener()
+    opener.addheaders = [('User-agent', 'IVRE/1.0 +https://ivre.rocks/')]
     for fname, url in URLS.iteritems():
         outfile = os.path.join(config.GEOIP_PATH, fname)
         if verbose:
@@ -150,7 +156,7 @@ def download_all(verbose=False):
         else:
             decode = lambda x: x
         with open(outfile, 'w') as wdesc:
-            udesc = urllib.urlopen(url)
+            udesc = opener.open(url)
             wdesc.write(decode(udesc.read()))
             if verbose:
                 sys.stdout.write("done.\n")
@@ -193,25 +199,25 @@ def parseline_country(line):
     line = line.strip('\n"').split('","')
     try:
         return int(line[2]), int(line[3]), line[4]
-    except Exception as exc:
-        print exc
-        print line
-        raise exc
+    except Exception:
+        utils.LOGGER.warning('Exception while reading line %r', line,
+                             exc_info=True)
+        raise
 
 
 def parseline_location(line):
     line = line.strip('\n"').split('","')
     try:
         return int(line[0]), int(line[1]), int(line[2])
-    except Exception as exc:
+    except Exception:
         if line[0].startswith('Copyright '):
             return None, None, None
         elif line[0].startswith('startIpNum,'):
             return None, None, None
         else:
-            print exc
-            print line
-            raise exc
+            utils.LOGGER.warning('Exception while reading line %r', line,
+                                 exc_info=True)
+            raise
 
 
 def parseline_asnum(line, withcomment=False):
@@ -227,10 +233,10 @@ def parseline_asnum(line, withcomment=False):
             asnum = int(asnum[2:])
         else:
             raise Exception('asnum %r should start with AS' % asnum)
-    except Exception as exc:
-        print exc
-        print line
-        raise exc
+    except Exception:
+        utils.LOGGER.warning('Exception while reading line %r', line,
+                             exc_info=True)
+        raise
     if withcomment:
         return int(line[0]), int(line[1]), asnum, ascomment
     return int(line[0]), int(line[1]), asnum
@@ -240,10 +246,10 @@ def parseline_routable(line):
     line = line.strip('\n"').split('","')
     try:
         return int(line[2]), int(line[3]), True
-    except Exception as exc:
-        print exc
-        print line
-        raise exc
+    except Exception:
+        utils.LOGGER.warning('Exception while reading line %r', line,
+                             exc_info=True)
+        raise
 
 
 class IPRanges(object):
@@ -425,8 +431,8 @@ def list_ips_by_data(datafile, parseline, data,
                      listall=True, listcidrs=False,
                      skip=0, maxnbr=None, multiple=False):
     if ((not listall) or listcidrs) and ((skip != 0) or (maxnbr is not None)):
-        sys.stderr.write('WARNING: skip and maxnbr parameters have no effect '
-                         'when listall == False or listcidrs == True.\n')
+        utils.LOGGER.warning('Skip and maxnbr parameters have no effect '
+                             'when listall == False or listcidrs == True.')
     if listcidrs:
         listall = False
     with open(datafile) as fdesc:

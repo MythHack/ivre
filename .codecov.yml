@@ -10,8 +10,8 @@ coverage:
     patch: yes
     changes: yes
 
-  ignore:
-    - tests/*
+ignore:
+  - "tests/tests.py"
 
 comment:
   layout: "header, diff, changes"

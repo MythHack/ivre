@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,45 +18,54 @@
 
 'Query the passive database to perform DNS resolutions (passive DNS).'
 
+
+from datetime import datetime
+import getopt
 import re
-import time
 import struct
 import sys
 reload(sys)
 sys.setdefaultencoding('utf-8')
-import datetime
-import getopt
+
 
 import ivre.utils
 from ivre.db import db
 
-ipaddr = re.compile('^\d+\.\d+\.\d+\.\d+$')
+IPADDR = re.compile('^\\d+\\.\\d+\\.\\d+\\.\\d+$')
 
 
 def convert_ip(addr):
     try:
         return ivre.utils.int2ip(addr)
-    except struct.error:
+    except (struct.error, TypeError):
         return addr
 
 
 def disp_rec(r):
-    if 'addr' in r:
+    firstseen = r['firstseen']
+    if not isinstance(firstseen, datetime):
+        firstseen = datetime.fromtimestamp(firstseen)
+    lastseen = r['lastseen']
+    if not isinstance(lastseen, datetime):
+        lastseen = datetime.fromtimestamp(lastseen)
+    if 'addr' in r and r['addr']:
         if r['source'].startswith('PTR-'):
             print '%s PTR %s (%s, %s time%s, %s - %s)' % (
                 convert_ip(r['addr']),
                 r['value'], r['source'][4:], r['count'],
                 r['count'] > 1 and 's' or '',
-                datetime.datetime.fromtimestamp(int(r['firstseen'])),
-                datetime.datetime.fromtimestamp(int(r['lastseen'])))
+                firstseen,
+                lastseen,
+            )
         elif r['source'].startswith('A-'):
             print '%s A %s (%s, %s time%s, %s - %s)' % (
                 r['value'],
                 convert_ip(r['addr']),
                 r['source'][2:], r['count'],
                 r['count'] > 1 and 's' or '',
-                datetime.datetime.fromtimestamp(int(r['firstseen'])),
-                datetime.datetime.fromtimestamp(int(r['lastseen'])))
+                firstseen,
+                lastseen,
+            )
         else:
             print 'WARNING', r
     else:
@@ -68,13 +77,14 @@ def disp_rec(r):
                 ':'.join(r['source'].split('-')[1:]),
                 r['count'],
                 r['count'] > 1 and 's' or '',
-                datetime.datetime.fromtimestamp(int(r['firstseen'])),
-                datetime.datetime.fromtimestamp(int(r['lastseen'])))
+                firstseen,
+                lastseen,
+            )
         else:
             print 'WARNING', r
 
 def main():
-    baseflt = {'recontype': 'DNS_ANSWER'}
+    baseflt = db.passive.searchrecontype('DNS_ANSWER')
     subdomains = False
     try:
         opts, args = getopt.getopt(sys.argv[1:],
@@ -111,7 +121,7 @@ def main():
             first = False
         else:
             print
-        if ipaddr.match(a) or a.isdigit():
+        if IPADDR.match(a) or a.isdigit():
             flts.append(db.passive.flt_and(baseflt, db.passive.searchhost(a)))
         else:
             flts += [

@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -16,18 +16,22 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
-from ivre.db import db
 
+import os
 import sys
 reload(sys)
 sys.setdefaultencoding('utf-8')
 
-import os
 
 try:
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
+
+
+from ivre.db import db
+from ivre import utils
+
 
 DESCRIPTION = 'Access and query the flows database. See doc/FLOW.md for more ' \
               'information.'
@@ -36,14 +40,12 @@ def main():
     try:
         import argparse
         parser = argparse.ArgumentParser(description=DESCRIPTION)
-        USING_ARGPARSE = True
     except ImportError:
         import optparse
         parser = optparse.OptionParser(description=DESCRIPTION)
         parser.parse_args_orig = parser.parse_args
         parser.parse_args = lambda: parser.parse_args_orig()[0]
         parser.add_argument = parser.add_option
-        USING_ARGPARSE = False
     parser.add_argument('--init', '--purgedb', action='store_true',
                         help='Purge or create and initialize the database.')
     parser.add_argument('--ensure-indexes', action='store_true',
@@ -62,7 +64,7 @@ def main():
                         help='Ouput at most LIMIT results.')
     parser.add_argument('--skip', type=int, default=0,
                         help='Skip first SKIP results.')
-    parser.add_argument('--orderby', '-o', 
+    parser.add_argument('--orderby', '-o',
                         help='Order of results ("src", "dst" or "flow")')
     parser.add_argument('--separator', '-s', help="Separator string.")
     parser.add_argument('--top', '-t', nargs="+",
@@ -88,7 +90,7 @@ def main():
     out = sys.stdout
 
     if args.plot and plt is None:
-        sys.stderr.write("Error: matplotlib is required for --plot\n")
+        utils.LOGGER.critical("Matplotlib is required for --plot")
         sys.exit(-1)
 
     if args.init:
@@ -141,7 +143,6 @@ def main():
             ))
 
     elif args.flow_daily:
-        cur_flow = None
         # FIXME? fully in-memory
         if args.plot:
             plot_data = {}
@@ -190,6 +191,6 @@ def main():
                 if args.timeline:
                     out.write(sep)
                     out.write(coma.join(
-                        map(str, sorted(res['flow']['data']['meta']['times'])))
-                    )
+                        map(str, sorted(res['flow']['data']['meta']['times']))
+                    ))
                 out.write('\n')

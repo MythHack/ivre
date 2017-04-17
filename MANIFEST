@@ -46,8 +46,6 @@ docker/web-apache/Dockerfile
 docker/web-apache/doku-conf-local.php
 ivre/VERSION
 ivre/__init__.py
-ivre/analyzer.py
-ivre/cliutils.py
 ivre/config.py
 ivre/geoiputils.py
 ivre/graphroute.py
@@ -66,6 +64,7 @@ ivre/analyzer/ike.py
 ivre/db/__init__.py
 ivre/db/mongo.py
 ivre/db/neo4j.py
+ivre/db/postgres.py
 ivre/parser/__init__.py
 ivre/parser/airodump.py
 ivre/parser/argus.py
@@ -73,7 +72,6 @@ ivre/parser/bro.py
 ivre/parser/netflow.py
 ivre/tools/__init__.py
 ivre/tools/airodump2db.py
-ivre/tools/analyzercli.py
 ivre/tools/arp2db.py
 ivre/tools/bro2db.py
 ivre/tools/flow2db.py

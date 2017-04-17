@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,12 +18,15 @@
 
 """Update the database from output of the Bro script 'passiverecon'"""
 
+
+import signal
+import functools
+
+
 import ivre.db
 import ivre.utils
 import ivre.passive
 
-import signal
-import functools
 
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -43,12 +46,14 @@ def main():
     parser.add_argument('--ignore-spec', '-i',
                         help='Filename containing ignore rules')
     parser.add_argument('--bulk', action='store_true',
-                        help='Use bulk inserts')
+                        help='Use bulk inserts (this is the default)')
+    parser.add_argument('--no-bulk', action='store_true',
+                        help='Do not use bulk inserts')
     args = parser.parse_args()
     ignore_rules = {}
     if args.ignore_spec is not None:
         execfile(args.ignore_spec, ignore_rules)
-    if args.bulk:
+    if (not args.no_bulk) or args.bulk:
         function = ivre.db.db.passive.insert_or_update_bulk
     else:
         function = functools.partial(

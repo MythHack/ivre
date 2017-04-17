@@ -26,3 +26,18 @@ def main():
     print "Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>"
     print "Version %s" % VERSION
     print
+    print "Dependencies:"
+    for module in ['Crypto', 'pymongo', 'py2neo', 'sqlalchemy', 'psycopg2',
+                   'krbV', 'PIL', 'MySQLdb', 'dbus', 'matplotlib']:
+        try:
+            version = __import__(module).__version__
+        except AttributeError:
+            try:
+                version = __import__(module).version
+            except AttributeError:
+                version = "[unknown version]"
+        except ImportError:
+            print "    Python module %s: missing" % (module,)
+            continue
+        print "    Python module %s: %s" % (module, version)
+    print

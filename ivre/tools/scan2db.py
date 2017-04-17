@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -16,12 +16,14 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
+
+import os
+
+
 import ivre.db
 import ivre.utils
 import ivre.xmlnmap
 
-import os
-import sys
 
 def recursive_filelisting(base_directories):
     "Iterator on filenames in base_directories"
@@ -119,6 +121,7 @@ def main():
                     merge=args.merge, masscan_probes=args.masscan_probes,
             ):
                 count += 1
-        except Exception as exc:
-            sys.stderr.write(ivre.utils.warn_exception(exc, fname=scan))
+        except Exception:
+            ivre.utils.LOGGER.warning("Exception (file %r)", scan,
+                                      exc_info=True)
     print "%d results imported." % count

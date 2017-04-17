@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2014 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -16,14 +16,17 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
-import ivre.target
-import ivre.utils
-import ivre.scanengine
 
 import os
 import shlex
 import subprocess
 import sys
+
+
+import ivre.target
+import ivre.utils
+import ivre.scanengine
+
 
 MAINDIR = "./agentsdata"
 
@@ -109,16 +112,16 @@ def main():
         try:
             camp.feedloop()
         except KeyboardInterrupt:
-            sys.stderr.write('Stop feeding.\n')
-            sys.stderr.write('Use "--state %s" to resume.\n' %
-                             ' '.join(map(str, camp.targiter.getstate())))
-        except Exception as e:
-            sys.stderr.write('ERROR: %r.\n' % e)
-            sys.stderr.write('Use "--state %s" to resume.\n' %
-                             ' '.join(map(str, camp.targiter.getstate())))
+            ivre.utils.LOGGER.info('Interrupted by user: stop feeding.')
+            ivre.utils.LOGGER.info('Use "--state %s" to resume.',
+                                   ' '.join(map(str, camp.targiter.getstate())))
+        except Exception:
+            ivre.utils.LOGGER.critical('Exception', exc_info=True)
+            ivre.utils.LOGGER.info('Use "--state %s" to resume.',
+                                   ' '.join(map(str, camp.targiter.getstate())))
         else:
-            sys.stderr.write('No more targets to feed.\n')
+            ivre.utils.LOGGER.info('No target left to scan.')
             if os.environ['TERM'] != 'screen':
-                sys.stderr.write('Press enter to exit.\n')
+                ivre.utils.LOGGER.info('Press enter to exit.')
                 raw_input()
         raw_input()

@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -29,8 +29,9 @@ moduli. A simple sed with 's# .*##' will do the trick."""
 import sys
 import getopt
 
-import ivre.keys
 import ivre.db
+import ivre.keys
+import ivre.utils
 
 def main():
     # FIXME: this will not work if .nmap and .passive have different
@@ -38,11 +39,9 @@ def main():
     flt = ivre.db.db.nmap.flt_empty
     bases = set()
     try:
-        opts, args = getopt.getopt(sys.argv[1:],
-                                   "p:f:h",
-                                   ['passive-ssl', 'active-ssl',
-                                    'active-ssh', 'help',
-                                    'filter='])
+        opts, _ = getopt.getopt(sys.argv[1:], "p:f:h",
+                                ['passive-ssl', 'active-ssl', 'active-ssh',
+                                 'help', 'filter='])
     except getopt.GetoptError as err:
         sys.stderr.write(str(err) + '\n')
         sys.exit(-1)
@@ -77,7 +76,7 @@ def main():
             ivre.keys.SSHRsaNmapKey,
         ]
     for base in bases:
-        for key in base():
+        for key in base(baseflt=flt):
             moduli.setdefault(key.key.n,
                               set()).add((key.ip, key.port, key.service))
     for mod in moduli:

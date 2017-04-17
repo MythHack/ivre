@@ -249,14 +249,6 @@ var GraphTopValues = (function(_super) {
 		    return 'setparam(FILTER, "category", "' + x + '");';
 		};
 	    }
-	    else if(field === 'label' || field.substr(0, 6) === 'label:') {
-		preparefilter = function(x) {
-		    return 'setparam(FILTER, "label", "' + x[0] + ':' + x[1] + '");';
-		};
-		prepareoutput = function(x) {
-		    return x.join(' / ');
-		};
-	    }
 	    else if(field === 'source') {
 		preparefilter = function(x) {
 		    return 'setparam(FILTER, "source", "' + x + '", true);';
@@ -297,22 +289,27 @@ var GraphTopValues = (function(_super) {
 		    return 'setparam(FILTER, "countports", "' + x + '");';
 		};
 	    }
-	    else if(field === 'service') {
-		preparefilter = function(x) {
-		    return 'setparam(FILTER, "service", "' + x + '");';
+	    else if(field.substr(0, 7) === 'service') {
+		prepareoutput = function(x) {
+		    return x || '[unknown]';
 		};
-	    }
-	    else if(field.substr(0, 8) === 'service:') {
-		preparefilter = function(x) {
-		    return 'setparam(FILTER, "service", "' + x + ':' + field.substr(8) + '");';
-		};
+		if(field[7] === ':') {
+		    preparefilter = function(x) {
+			return 'setparam(FILTER, "service", "' + x + ':' + field.substr(8) + '");';
+		    };
+		}
+		else {
+		    preparefilter = function(x) {
+			return 'setparam(FILTER, "service", "' + x + '");';
+		    };
+		}
 	    }
 	    else if(field.substr(0, 7) === 'product') {
 		prepareoutput = function(x) {
-		    return x[1];
+		    return x[1] || (x[0] ? x[0] + ' / ' : '') + '[unknown]';
 		};
 		preparetitle = function(x) {
-		    return x[0];
+		    return x[0] || '[unknown]';
 		};
 		if(field[7] === ':' && field.substr(8) % 1 === 0) {
 		    preparefilter = function(x) {
@@ -327,10 +324,12 @@ var GraphTopValues = (function(_super) {
 	    }
 	    else if(field.substr(0, 7) === 'version') {
 		prepareoutput = function(x) {
-		    return x[1] + " " + x[2];
+		    return x[2] ? x[1] + " " + x[2] : (
+			x[1] ? x[1] + " [unknown]" : (
+			    x[0] ? x[0] + ' / ' : '') + "[unknown]");
 		};
 		preparetitle = function(x) {
-		    return x[0];
+		    return x[0] || '[unknown]';
 		};
 		if(field[7] === ':' && field.substr(8) % 1 === 0) {
 		    preparefilter = function(x) {

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,21 +22,21 @@ This sub-module contains functions that might be usefull to any other
 sub-module or script.
 """
 
-import struct
-import socket
-import datetime
-import re
-import os
-import sys
-import shutil
-import errno
-import hashlib
-import gzip
-import bz2
-import subprocess
-import traceback
 import ast
+import bz2
 from cStringIO import StringIO
+import datetime
+import errno
+import gzip
+import hashlib
+import logging
+import math
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
 try:
     import PIL.Image
     import PIL.ImageChops
@@ -58,7 +58,11 @@ from ivre import config
 # seen, it seems that (1) is right.
 MAXVALLEN = 1000
 
+LOGGER = logging.getLogger("ivre")
 REGEXP_T = type(re.compile(''))
+
+
+logging.basicConfig()
 
 
 def ip2int(ipstr):
@@ -106,9 +110,9 @@ def net2range(network):
 def range2nets(rng):
     """Converts a (start, stop) tuple to a list of networks."""
     start, stop = rng
-    if type(start) is str:
+    if isinstance(start, basestring):
         start = ip2int(start)
-    if type(stop) is str:
+    if isinstance(stop, basestring):
         stop = ip2int(stop)
     if stop < start:
         raise ValueError()
@@ -160,7 +164,7 @@ def regexp2pattern(string):
     and value are regexp.
 
     """
-    if type(string) is REGEXP_T:
+    if isinstance(string, REGEXP_T):
         flags = string.flags
         string = string.pattern
         if string.startswith('^'):
@@ -198,6 +202,7 @@ _PYVALS = {
     "null": None,
     "none": None,
 }
+
 
 def str2pyval(string):
     """This function takes a string and returns a Python object"""
@@ -257,7 +262,7 @@ def makedirs(dirname):
         os.makedirs(dirname)
     except OSError as exception:
         if not (exception.errno == errno.EEXIST and os.path.isdir(dirname)):
-            raise exception
+            raise
 
 
 def cleandir(dirname):
@@ -269,7 +274,7 @@ def cleandir(dirname):
         shutil.rmtree(dirname)
     except OSError as exception:
         if exception.errno != errno.ENOENT:
-            raise exception
+            raise
 
 
 def isfinal(elt):
@@ -277,8 +282,8 @@ def isfinal(elt):
     that does not contain other elements)
 
     """
-    return type(elt) in [str, int, float, unicode,
-                         datetime.datetime, REGEXP_T]
+    return isinstance(elt, (basestring, int, long, float,
+                            datetime.datetime, REGEXP_T))
 
 
 def diff(doc1, doc2):
@@ -348,7 +353,7 @@ def doc2csv(doc, fields, nastr="NA"):
     for field, subfields in fields.iteritems():
         if subfields is True:
             value = doc.get(field)
-            if type(value) is list:
+            if isinstance(value, list):
                 lines = [line + [nastr if valelt is None else valelt]
                          for line in lines for valelt in value]
             else:
@@ -356,7 +361,7 @@ def doc2csv(doc, fields, nastr="NA"):
                          for line in lines]
         elif callable(subfields):
             value = doc.get(field)
-            if type(value) is list:
+            if isinstance(value, list):
                 lines = [line + [nastr if valelt is None
                                  else subfields(valelt)]
                          for line in lines for valelt in value]
@@ -365,7 +370,7 @@ def doc2csv(doc, fields, nastr="NA"):
                          for line in lines]
         elif isinstance(subfields, dict):
             subdoc = doc.get(field)
-            if type(subdoc) is list:
+            if isinstance(subdoc, list):
                 lines = [line + newline
                          for line in lines
                          for subdocelt in subdoc
@@ -403,9 +408,9 @@ class FileOpener(object):
         self.proc = None
         if not isinstance(fname, basestring):
             self.fdesc = fname
-            self.close = False
+            self.needsclose = False
             return
-        self.close = True
+        self.needsclose = True
         with open(fname) as fdesc:
             magic = fdesc.read(2)
         try:
@@ -445,7 +450,7 @@ class FileOpener(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.close:
+        if self.needsclose:
             self.fdesc.close()
         if self.proc is not None:
             self.proc.wait()
@@ -460,11 +465,13 @@ class FileOpener(object):
 def open_file(fname):
     return FileOpener(fname)
 
+
 _HASH_COMMANDS = {
     'md5': config.MD5_CMD,
     'sha1': config.SHA1_CMD,
     'sha256': config.SHA256_CMD,
 }
+
 
 def hash_file(fname, hashtype="sha1"):
     """Compute a hash of data from a given file"""
@@ -485,36 +492,51 @@ def hash_file(fname, hashtype="sha1"):
             result.update(data)
         return result.hexdigest()
 
+
 def serialize(obj):
     """Return a JSON-compatible representation for `obj`"""
-    if type(obj) is REGEXP_T:
+    if isinstance(obj, REGEXP_T):
         return '/%s/%s' % (
             obj.pattern,
             ''.join(x.lower() for x in 'ILMSXU'
                     if getattr(re, x) & obj.flags),
-            )
-    if type(obj) is datetime.datetime:
+        )
+    if isinstance(obj, datetime.datetime):
         return str(obj)
-    raise TypeError("Don't know what to do with %r (%r)" % (
-        obj, type(obj)))
+    raise TypeError("Don't know what to do with %r (%r)" % (obj, type(obj)))
 
 
-def warn_exception(exc, **kargs):
-    """This function returns a WARNING line based on the exception
-    `exc` and the optional extra information.
-
-    If config.DEBUG is True, the function will append to the result
-    the full stacktrace.
+class LogFilter(logging.Filter):
+    """A logging filter that prevents dupplicate warnings and only reports
+messages with level lower than INFO when config.DEBUG (or
+config.DEBUG_DB) is True.
 
     """
-    return "WARNING: %s [%r]%s\n%s" % (
-        exc, exc,
-        " [%s]" % ", ".join("%s=%s" % (key, value)
-                            for key, value in kargs.iteritems())
-        if kargs else "",
-        "\t%s\n" % "\n\t".join(traceback.format_exc().splitlines())
-        if config.DEBUG else "",
-    )
+    MAX_WARNINGS_STORED = 100
+    def __init__(self):
+        # Python 2.6: logging.Filter is an old-style class, super()
+        # cannot be used.
+        # super(LogFilter, self).__init__()
+        logging.Filter.__init__(self)
+        self.warnings = set()
+    def filter(self, record):
+        """Decides whether we should log a record"""
+        if record.levelno < logging.INFO:
+            if record.msg.startswith('DB:'):
+                return config.DEBUG_DB
+            return config.DEBUG
+        if record.levelno != logging.WARNING:
+            return True
+        if record.msg in self.warnings:
+            return False
+        if len(self.warnings) > self.MAX_WARNINGS_STORED:
+            self.warnings = set()
+        self.warnings.add(record.msg)
+        return True
+
+
+LOGGER.addFilter(LogFilter())
+LOGGER.setLevel(1 if config.DEBUG or config.DEBUG_DB else 20)
 
 
 class FakeArgparserParent(object):
@@ -546,6 +568,7 @@ COUNTRY_ALIASES = {
     ],
 }
 
+
 def country_unalias(country):
     """Takes either a country code (or an iterator of country codes)
     and returns either a country code or a list of country codes.
@@ -559,11 +582,16 @@ def country_unalias(country):
         of the European Union member states.
 
     """
-    if type(country) in [str, unicode]:
+    if isinstance(country, basestring):
         return COUNTRY_ALIASES.get(country, country)
     if hasattr(country, '__iter__'):
-        return [country_unalias(country_elt) for country_elt in country]
+        return reduce(
+            lambda x, y: x + (y if isinstance(y, list) else [y]),
+            (country_unalias(country_elt) for country_elt in country),
+            [],
+        )
     return country
+
 
 def screenwords(imgdata):
     """Takes an image and returns a list of the words seen by the OCR"""
@@ -600,7 +628,7 @@ if USE_PIL:
         """Returns the size of a given `bbox`"""
         return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
-    def _trim_image(img, tolerance, minborder):
+    def _trim_image(img, tolerance):
         """Returns the tiniest `bbox` to trim `img`"""
         result = None
         for pixel in [(0, 0), (img.size[0] - 1, 0), (0, img.size[1] - 1),
@@ -630,7 +658,7 @@ if USE_PIL:
 
         """
         img = PIL.Image.open(StringIO(imgdata))
-        bbox = _trim_image(img, tolerance, minborder)
+        bbox = _trim_image(img, tolerance)
         if bbox:
             newbbox = (max(bbox[0] - minborder, 0),
                        max(bbox[1] - minborder, 0),
@@ -641,17 +669,14 @@ if USE_PIL:
                 img.crop(newbbox).save(out, format='jpeg')
                 out.seek(0)
                 return out.read()
-            else:
-                # Image does not need to be modified
-                return True
+            # Image does not need to be modified
+            return True
         # Image no longer exists after trim
         return False
 else:
     def trim_image(imgdata, _tolerance=1, _minborder=10):
         """Stub function used when PIL cannot be found"""
-        if config.DEBUG:
-            sys.stdout.write('WARNING: Python PIL not found, '
-                             'screenshots will not be trimmed')
+        LOGGER.warning('Python PIL not found, screenshots will not be trimmed')
         return imgdata
 
 
@@ -669,7 +694,7 @@ def _set_ports():
     global _PORTS, _PORTS_POPULATED
     try:
         fdesc = open(os.path.join(config.NMAP_SHARE_PATH, 'nmap-services'))
-    except IOError, AttributeError:
+    except (IOError, AttributeError):
         try:
             with open('/etc/services') as fdesc:
                 for line in fdesc:
@@ -715,6 +740,7 @@ def guess_srv_port(port1, port2, proto="tcp"):
 
 _NMAP_PROBES = {}
 _NMAP_PROBES_POPULATED = False
+_NMAP_CUR_PROBE = None
 
 
 def _read_nmap_probes():
@@ -725,7 +751,7 @@ def _read_nmap_probes():
         if line.startswith('match '):
             line = line[6:]
             soft = False
-        elif line.startswith('softmacth '):
+        elif line.startswith('softmatch '):
             line = line[10:]
             soft = True
         elif line.startswith('Probe '):
@@ -766,7 +792,8 @@ def _read_nmap_probes():
                     value = value[:-2] + '(?:\\n|$)'
                 value = re.compile(
                     value,
-                    flags=sum(getattr(re, f) if hasattr(re, f) else 0 for f in flag.upper()),
+                    flags=sum(getattr(re, f) if hasattr(re, f) else 0
+                              for f in flag.upper()),
                 )
                 flag = ''
             info[key] = (value, flag)
@@ -775,9 +802,9 @@ def _read_nmap_probes():
         with open(os.path.join(config.NMAP_SHARE_PATH, 'nmap-service-probes')) as fdesc:
             for line in fdesc:
                 parse_line(line[:-1])
-    except (AttributeError, IOError) as exc:
-        sys.stderr.write('WARNING: cannot read Nmap service fingerprint file.')
-        sys.stderr.write(warn_exception(exc))
+    except (AttributeError, IOError):
+        LOGGER.warning('Cannot read Nmap service fingerprint file.',
+                       exc_info=True)
     del _NMAP_CUR_PROBE
     _NMAP_PROBES_POPULATED = True
 
@@ -802,15 +829,14 @@ def _read_ikescan_vendor_ids():
                 (line[0], re.compile(line[1].replace('[[:xdigit:]]',
                                                      '[0-9a-f]'), re.I))
                 for line in (
-                        sep.split(line, 1)
-                        for line in (line.strip().split('#', 1)[0]
-                                     for line in fdesc)
-                        if line
+                    sep.split(line, 1)
+                    for line in (line.strip().split('#', 1)[0]
+                                 for line in fdesc)
+                    if line
                 )
             ]
-    except (AttributeError, IOError) as exc:
-        sys.stderr.write('WARNING: cannot read ike-scan vendor IDs file.')
-        sys.stderr.write(warn_exception(exc))
+    except (AttributeError, IOError):
+        LOGGER.warning('Cannot read ike-scan vendor IDs file.', exc_info=True)
     _IKESCAN_VENDOR_IDS_POPULATED = True
 
 
@@ -860,5 +886,24 @@ def normalize_props(props):
     )
     return props
 
-def datetime2timestamp(dt):
-    return float(dt.strftime("%s.%f"))
+
+def datetime2timestamp(dtetme):
+    return float(dtetme.strftime("%s.%f"))
+
+
+_UNITS = ['']
+_UNITS.extend('kMGTPEZY')
+
+
+def num2readable(value):
+    idx = int(math.log(value, 1000))
+    try:
+        unit = _UNITS[idx]
+    except IndexError:
+        unit = 'Y'
+        idx = 1000 ** 8
+    else:
+        idx = 1000 ** idx
+    if isinstance(value, float):
+        return '%.3f%s' % (value / idx, unit)
+    return '%d%s' % (value / idx, unit)

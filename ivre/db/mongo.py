@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,20 +22,29 @@ databases.
 
 """
 
-from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent
-from ivre import utils, xmlnmap, config
 
 import datetime
-import bson
 import json
-import pymongo
 import re
-import sys
 try:
     from collections import OrderedDict
 except ImportError:
     # fallback to dict for Python 2.6
     OrderedDict = dict
+
+
+import bson
+import pymongo
+
+
+from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent
+from ivre import utils, xmlnmap, config
+
+
+class Nmap2Mongo(xmlnmap.Nmap2DB):
+    @staticmethod
+    def _to_binary(data):
+        return bson.Binary(data)
 
 
 class MongoDB(DB):
@@ -166,13 +175,12 @@ class MongoDB(DB):
                 self._find_one = _find_one
             return self._find_one
 
-    @staticmethod
-    def getid(record):
-        return record['_id']
+    def count(self, *args, **kargs):
+        return self.get(*args, **kargs).count()
 
     @staticmethod
     def serialize(obj):
-        if type(obj) is bson.ObjectId:
+        if isinstance(obj, bson.ObjectId):
             return obj.binary.encode('hex')
         return DB.serialize(obj)
 
@@ -200,23 +208,19 @@ class MongoDB(DB):
             updated = False
             new_version, migration_function = self.schema_migrations[
                 colname][version]
-            if config.DEBUG:
-                sys.stderr.write(
-                    "INFO: migrating column %s from version %r to %r\n" % (
-                        colname, version, new_version,
-                    )
-                )
+            utils.LOGGER.info(
+                "Migrating column %s from version %r to %r",
+                colname, version, new_version,
+            )
             # unlimited find()!
             for record in self.find(colname, self.searchversion(version)):
                 try:
                     update = migration_function(record)
                 except Exception as exc:
-                    if config.DEBUG:
-                        sys.stderr.write(
-                            "WARNING: cannot migrate host %s [%s: %s]\n" % (
-                                record['_id'], exc.__class__.__name__,
-                                exc.message)
-                        )
+                    utils.LOGGER.warning(
+                        "Cannot migrate host %s [%s: %s]", record['_id'],
+                        exc.__class__.__name__, exc.message,
+                    )
                     failed += 1
                 else:
                     if update is not None:
@@ -230,21 +234,17 @@ class MongoDB(DB):
                         try:
                             function(idx[0], **idx[1])
                         except pymongo.errors.OperationFailure as exc:
-                            sys.stderr.write(
-                                "WARNING: cannot %s index %s [%s: %s]\n" % (
-                                    action, idx, exc.__class__.__name__,
-                                    exc.message)
+                            utils.LOGGER.warning(
+                                "Cannot %s index %s [%s: %s]", action, idx,
+                                exc.__class__.__name__, exc.message,
                             )
+            utils.LOGGER.info(
+                "Migration of column %s from version %r to %r DONE",
+                colname, version, new_version,
+            )
             version = new_version
-            if config.DEBUG:
-                sys.stderr.write(
-                    "INFO: migration of column %s from version %r to %r DONE\n" % (
-                        colname, version, new_version,
-                    )
-                )
         if failed:
-            sys.stderr.write("WARNING: failed to migrate %d documents"
-                             "\n" % failed)
+            utils.LOGGER.info("Failed to migrate %d documents", failed)
 
     def cmp_schema_version(self, colname, document):
         """Returns 0 if the `document`'s schema version matches the
@@ -258,7 +258,7 @@ class MongoDB(DB):
             document.get("schema_version", 0),
         )
 
-    def _topvalues(self, field, flt=None, topnbr=10, sortby=None,
+    def _topvalues(self, field, flt=None, topnbr=10, sort=None,
                    limit=None, skip=None, least=False, aggrflt=None,
                    specialproj=None, specialflt=None, countfield=None):
         """This method makes use of the aggregation framework to
@@ -274,8 +274,8 @@ class MongoDB(DB):
         pipeline = []
         if flt:
             pipeline += [{"$match": flt}]
-        if sortby is not None and ((limit is not None) or (skip is not None)):
-            pipeline += [{"$sort": OrderedDict(sortby)}]
+        if sort is not None and ((limit is not None) or (skip is not None)):
+            pipeline += [{"$sort": OrderedDict(sort)}]
         if skip is not None:
             pipeline += [{"$skip": skip}]
         if limit is not None:
@@ -313,7 +313,7 @@ class MongoDB(DB):
             pipeline += [{"$limit": topnbr}]
         return pipeline
 
-    def _distinct(self, field, flt=None, sortby=None, limit=None, skip=None):
+    def _distinct(self, field, flt=None, sort=None, limit=None, skip=None):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
 
@@ -321,8 +321,8 @@ class MongoDB(DB):
         pipeline = []
         if flt:
             pipeline.append({'$match': flt})
-        if sortby:
-            pipeline.append({'$sort': OrderedDict(sortby)})
+        if sort:
+            pipeline.append({'$sort': OrderedDict(sort)})
         if skip is not None:
             pipeline += [{"$skip": skip}]
         if limit is not None:
@@ -347,6 +347,10 @@ class MongoDB(DB):
     @staticmethod
     def str2flt(string):
         return json.loads(string)
+
+    @staticmethod
+    def to_binary(data):
+        return bson.Binary(data)
 
     @staticmethod
     def flt2str(flt):
@@ -384,12 +388,23 @@ class MongoDB(DB):
         return {'$or': args} if len(args) > 1 else args[0]
 
     @staticmethod
-    def searchid(idval, neg=False):
-        """Filters (if `neg` == True, filters out) one particular
-        record, given its id.
+    def searchnonexistent():
+        return {'_id': 0}
+
+    @staticmethod
+    def searchobjectid(oid, neg=False):
+        """Filters records by their ObjectID.  `oid` can be a single or many
+        (as a list or any iterable) object ID(s), specified as strings
+        or an `ObjectID`s.
 
         """
-        return {"_id": {'$ne': idval} if neg else idval}
+        if isinstance(oid, (basestring, bson.objectid.ObjectId)):
+            oid = [bson.objectid.ObjectId(oid)]
+        else:
+            oid = [bson.objectid.ObjectId(elt) for elt in oid]
+        if len(oid) == 1:
+            return {'_id': {'$ne': oid[0]} if neg else oid[0]}
+        return {'_id': {'$nin' if neg else '$in': oid}}
 
     @staticmethod
     def searchversion(version):
@@ -459,8 +474,7 @@ class MongoDB(DB):
 
 class MongoDBNmap(MongoDB, DBNmap):
 
-    needunwind = ["categories", "labels", "labels.tags",
-                  "ports", "ports.scripts",
+    needunwind = ["categories", "ports", "ports.scripts",
                   "ports.scripts.ssh-hostkey",
                   "ports.scripts.smb-enum-shares.shares",
                   "ports.scripts.ls.volumes",
@@ -487,7 +501,7 @@ class MongoDBNmap(MongoDB, DBNmap):
                  **kargs):
         MongoDB.__init__(self, host, dbname, **kargs)
         DBNmap.__init__(self)
-        self.content_handler = xmlnmap.Nmap2DB
+        self.content_handler = Nmap2Mongo
         self.output_function = None
         self.colname_scans = colname_scans
         self.colname_hosts = colname_hosts
@@ -502,11 +516,6 @@ class MongoDBNmap(MongoDB, DBNmap):
                 ([('endtime', pymongo.ASCENDING)], {}),
                 ([('source', pymongo.ASCENDING)], {}),
                 ([('categories', pymongo.ASCENDING)], {}),
-                ([
-                    ('labels.group', pymongo.ASCENDING),
-                    ('labels.tags', pymongo.ASCENDING),
-                ],
-                 {"sparse": True}),
                 ([('hostnames.domains', pymongo.ASCENDING)], {}),
                 ([('traces.hops.domains', pymongo.ASCENDING)], {}),
                 ([('openports.count', pymongo.ASCENDING)], {}),
@@ -652,6 +661,17 @@ creates the default indexes."""
 
         """
         return self.cmp_schema_version(self.colname_scans, scan)
+
+    def migrate_schema(self, archive, version):
+        """Process to schema migrations in column `colname_hosts` or
+        `colname_oldhosts` depending on `archive`archive value,
+        starting from `version`.
+
+        """
+        MongoDB.migrate_schema(
+            self, self.colname_oldhosts if archive else self.colname_hosts,
+            version,
+        )
 
     def migrate_schema_hosts_0_1(self, doc):
         """Converts a record from version 0 (no "schema_version" key
@@ -892,67 +912,11 @@ have no effect if it is not expected)."""
             return scanids
         return [scanids]
 
-    def getscan(self, scanid, archive=False, **kargs):
+    def getscan(self, scanid, archive=False):
         return self.find_one(
             self.colname_oldscans if archive else self.colname_scans,
             {'_id': scanid},
-            **kargs
         )
-
-    @staticmethod
-    def getscreenshot(port):
-        """Returns the content of a port's screenshot."""
-        url = port.get('screenshot')
-        if url is None:
-            return None
-        if url == "field":
-            return port.get('screendata')
-
-    def set_label(self, flt, group, label, archive=False):
-        """Adds `label` in `group` to every host matching `flt`"""
-        colname = self.colname_oldhosts if archive else self.colname_hosts
-        for host in self.get(flt, archive=archive):
-            labels = host.get('labels', [])
-            try:
-                g_label = (lab for lab in labels
-                           if lab['group'] == group).next()
-            except StopIteration:
-                # group did not exist.
-                g_label = {'group': group, 'tags': [label]}
-                labels.append(g_label)
-            else:
-                if label in g_label['tags']:
-                    continue
-                g_label['tags'].append(label)
-            self.db[colname].update({"_id": host['_id']},
-                                    {"$set": {'labels': labels}})
-
-    def remove_label(self, flt, group=None, label=None, archive=False):
-        """Removes `label` of session `group` from every host matching `flt`.
-
-        If `label` is None, removes the entire `group`. If both
-        `group` and `label` are None, remove all the labels.
-
-        """
-        colname = self.colname_oldhosts if archive else self.colname_hosts
-        flt = self.flt_and(flt, self.searchlabel(group=group, label=label))
-        if group is None and label is None:
-            self.db[colname].update(flt, {"$unset": {'labels': True}},
-                                    multi=True)
-        else:
-            for host in self.get(flt, archive=archive):
-                labels = host['labels']
-                if label is not None:
-                    g_label = (lab for lab in labels
-                               if lab['group'] == group).next()
-                    g_label['tags'].remove(label)
-                if label is None or not g_label['tags']:
-                    labels = [lab for lab in host['labels']
-                              if lab['group'] != group]
-                self.db[colname].update({"_id": host['_id']},
-                                        {"$set": {'labels': labels}}
-                                        if labels else
-                                        {"$unset": {'labels': True}})
 
     def setscreenshot(self, host, port, data, protocol='tcp',
                       archive=False, overwrite=False):
@@ -1053,18 +1017,12 @@ have no effect if it is not expected)."""
 
     def store_host(self, host):
         ident = self.db[self.colname_hosts].insert(host)
-        if config.DEBUG:
-            sys.stderr.write(
-                "HOST STORED: %r in %r\n" % (ident, self.colname_hosts)
-            )
+        utils.LOGGER.debug("HOST STORED: %r in %r", ident, self.colname_hosts)
         return ident
 
     def store_scan_doc(self, scan):
         ident = self.db[self.colname_scans].insert(scan)
-        if config.DEBUG:
-            sys.stderr.write(
-                "SCAN STORED: %r in %r\n" % (ident, self.colname_scans)
-            )
+        utils.LOGGER.debug("SCAN STORED: %r in %r", ident, self.colname_scans)
         return ident
 
     def merge_host_docs(self, rec1, rec2):
@@ -1188,6 +1146,12 @@ have no effect if it is not expected)."""
             if self.find_one(colname_hosts, {'scanid': scanid}) is None:
                 self.db[colname_scans].remove(spec_or_id=scanid)
 
+    def store_or_merge_host(self, host, gettoarchive, merge=False):
+        if merge and self.merge_host(host):
+            return
+        self.archive_from_func(host, gettoarchive)
+        self.store_host(host)
+
     def archive(self, host, unarchive=False):
         """Archives (when `unarchive` is True, unarchives) a given
         host record. Also (un)archives the corresponding scan and
@@ -1204,31 +1168,20 @@ have no effect if it is not expected)."""
              self.colname_oldhosts, self.colname_oldscans)
         )
         if self.find_one(col_from_hosts, {"_id": host['_id']}) is None:
-            if config.DEBUG:
-                sys.stderr.write(
-                    "WARNING: cannot %sarchive: host %s does not exist"
-                    " in %r\n" % ("un" if unarchive else "",
-                                  host['_id'], col_from_hosts)
-                )
+            utils.LOGGER.warning(
+                "Cannot %sarchive: host %s does not exist in %r",
+                "un" if unarchive else "", host['_id'], col_from_hosts
+            )
         # store the host in the archive hosts collection
         self.db[col_to_hosts].insert(host)
-        if config.DEBUG:
-            sys.stderr.write(
-                "HOST %sARCHIVED: %s in %r\n" % (
-                    "UN" if unarchive else "",
-                    host['_id'],
-                    col_to_hosts,
-                )
-            )
+        utils.LOGGER.debug(
+            "HOST %sARCHIVED: %s in %r", "UN" if unarchive else "",
+            host['_id'], col_to_hosts,
+        )
         # remove the host from the (not archived) hosts collection
         self.db[col_from_hosts].remove(spec_or_id=host['_id'])
-        if config.DEBUG:
-            sys.stderr.write(
-                "HOST REMOVED: %s from %r\n" % (
-                    host['_id'],
-                    col_from_hosts,
-                )
-            )
+        utils.LOGGER.debug("HOST REMOVED: %s from %r", host['_id'],
+                           col_from_hosts)
         for scanid in self.getscanids(host):
             scan = self.find_one(col_from_scans, {'_id': scanid})
             if scan is not None:
@@ -1237,27 +1190,19 @@ have no effect if it is not expected)."""
                 if self.find_one(col_to_scans,
                                  {'_id': scanid}) is None:
                     self.db[col_to_scans].insert(scan)
-                    if config.DEBUG:
-                        sys.stderr.write(
-                            "SCAN %sARCHIVED: %s in %r\n" % (
-                                "UN" if unarchive else "",
-                                scanid,
-                                col_to_scans,
-                            )
-                        )
+                    utils.LOGGER.debug(
+                        "SCAN %sARCHIVED: %s in %r\n",
+                        "UN" if unarchive else "", scanid, col_to_scans,
+                    )
                 # remove the scan from the (not archived) scans
                 # collection if there is no more hosts related to this
                 # scan in the hosts collection
                 if self.find_one(col_from_hosts,
                                  {'scanid': scanid}) is None:
                     self.db[col_from_scans].remove(spec_or_id=scanid)
-                    if config.DEBUG:
-                        sys.stderr.write(
-                            "SCAN REMOVED: %s in %r" % (
-                                scanid,
-                                col_from_scans,
-                            )
-                        )
+                    utils.LOGGER.debug(
+                        "SCAN REMOVED: %s in %r", scanid, col_from_scans,
+                    )
 
     def archive_from_func(self, host, gettoarchive):
         if gettoarchive is None:
@@ -1370,14 +1315,14 @@ have no effect if it is not expected)."""
     @staticmethod
     def searchdomain(name, neg=False):
         if neg:
-            if type(name) is utils.REGEXP_T:
+            if isinstance(name, utils.REGEXP_T):
                 return {"hostnames.domains": {"$not": name}}
             return {"hostnames.domains": {"$ne": name}}
         return {"hostnames.domains": name}
 
     def searchhostname(self, name, neg=False):
         if neg:
-            if type(name) is utils.REGEXP_T:
+            if isinstance(name, utils.REGEXP_T):
                 return {"hostnames.name": {"$not": name}}
             return {"hostnames.name": {"$ne": name}}
         return self.flt_and(
@@ -1394,7 +1339,7 @@ have no effect if it is not expected)."""
         (records may have zero, one or more categories).
         """
         if neg:
-            if type(cat) is utils.REGEXP_T:
+            if isinstance(cat, utils.REGEXP_T):
                 return {'categories': {'$not': cat}}
             if isinstance(cat, list):
                 if len(cat) == 1:
@@ -1408,30 +1353,6 @@ have no effect if it is not expected)."""
             else:
                 return {'categories': {'$in': cat}}
         return {'categories': cat}
-
-    def searchlabel(self, group=None, label=None, neg=False):
-        """Filters (if `neg` == True, filters out) hosts with
-        `label` in `group`.
-        If `label` is None, filters hosts having a group `group`.
-
-        """
-        if label is None:
-            if group is None:
-                return {'labels.group': {'$exists': not neg}}
-            if type(group) is utils.REGEXP_T:
-                return {'labels.group': {'$not': group} if neg else group}
-            return {'labels.group': {'$ne': group} if neg else group}
-        if neg:
-            return self.flt_or(
-                self.searchlabel(group=group, neg=True),
-                {'labels': {'$elemMatch': {
-                    'group': group,
-                    'tags': ({'$not': label}
-                             if type(label) is utils.REGEXP_T
-                             else {'$ne': label})
-                }}},
-            )
-        return {'labels': {'$elemMatch': {'group': group, 'tags': label}}}
 
     @staticmethod
     def searchcountry(country, neg=False):
@@ -1456,7 +1377,7 @@ have no effect if it is not expected)."""
         Filters (if `neg` == True, filters out) one particular city.
         """
         if neg:
-            if type(city) is utils.REGEXP_T:
+            if isinstance(city, utils.REGEXP_T):
                 return {'infos.city': {'$not': city}}
             return {'infos.city': {'$ne': city}}
         return {'infos.city': city}
@@ -1467,7 +1388,7 @@ have no effect if it is not expected)."""
         particular AS number(s).
 
         """
-        if type(asnum) not in [str, unicode] and hasattr(asnum, '__iter__'):
+        if not isinstance(asnum, basestring) and hasattr(asnum, '__iter__'):
             return {'infos.as_num':
                     {'$nin' if neg else '$in': map(int, asnum)}}
         asnum = int(asnum)
@@ -1480,7 +1401,7 @@ have no effect if it is not expected)."""
 
         """
         if neg:
-            if type(asname) is utils.REGEXP_T:
+            if isinstance(asname, utils.REGEXP_T):
                 return {'infos.as_name': {'$not': asname}}
             else:
                 return {'infos.as_name': {'$ne': asname}}
@@ -1493,7 +1414,7 @@ have no effect if it is not expected)."""
 
         """
         if neg:
-            if type(src) is utils.REGEXP_T:
+            if isinstance(src, utils.REGEXP_T):
                 return {'source': {'$not': src}}
             return {'source': {'$ne': src}}
         return {'source': src}
@@ -1554,19 +1475,6 @@ have no effect if it is not expected)."""
             self.searchport(port, protocol=protocol,
                             state=state, neg=neg)['ports']
             for port in ports]}}
-
-    @staticmethod
-    def searchobjectid(oid, neg=False):
-        """Filters records by their ObjectID.
-        `oid` can be a single or many (as a list or any iterable) object ID(s),
-        specified as strings or an `ObjectID`s."""
-        if isinstance(oid, (basestring, bson.objectid.ObjectId)):
-            oid = [bson.objectid.ObjectId(oid)]
-        else:
-            oid = [bson.objectid.ObjectId(elt) for elt in oid]
-        if len(oid) == 1:
-            return {'_id': {'$ne': oid[0]} if neg else oid[0]}
-        return {'_id': {'$nin' if neg else '$in': oid}}
 
     @staticmethod
     def searchcountopenports(minn=None, maxn=None, neg=False):
@@ -1671,22 +1579,6 @@ have no effect if it is not expected)."""
                 'service_extrainfo': {'$ne': 'access denied'}
             }}}
 
-    @staticmethod
-    def searchsmb(**args):
-        # key aliases
-        if 'dnsdomain' in args:
-            args['domain_dns'] = args.pop('dnsdomain')
-        if 'forest' in args:
-            args['forest_dns'] = args.pop('forest')
-        # Build the query. Do *not* iterate here since we are
-        # modifying the dictionary
-        for key in args.keys():
-            args['smb-os-discovery.%s' % key] = args.pop(key)
-        args['id'] = 'smb-os-discovery'
-        return {
-            'ports.scripts': {'$elemMatch': args}
-        }
-
     def searchfile(self, fname=None, scripts=None):
         """Search shared files from a file name (either a string or a
         regexp), only from scripts using the "ls" NSE module.
@@ -1744,39 +1636,6 @@ have no effect if it is not expected)."""
             name={'$in': ['http-title', 'html-title']},
             output=title,
         )
-
-    @staticmethod
-    def searchservicescript(srv, port=None):
-        if port is None:
-            return {
-                'ports': {
-                    '$elemMatch': {
-                        'state_state': 'open',
-                        '$or': [
-                            {'service_name': srv},
-                            {'service_product': srv},
-                            {'service_version': srv},
-                            {'service_extrainfo': srv},
-                            {'service_hostname': srv},
-                            {'scripts.id': srv},
-                            {'scripts.output': srv}
-                        ]
-                    }}}
-        return {
-            'ports': {
-                '$elemMatch': {
-                    'state_state': 'open',
-                    'port': port,
-                    '$or': [
-                        {'service_name': srv},
-                        {'service_product': srv},
-                        {'service_version': srv},
-                        {'service_extrainfo': srv},
-                        {'service_hostname': srv},
-                        {'scripts.id': srv},
-                        {'scripts.output': srv}
-                    ]
-                }}}
 
     @staticmethod
     def searchos(txt):
@@ -1897,14 +1756,14 @@ have no effect if it is not expected)."""
     @staticmethod
     def searchhopdomain(hop, neg=False):
         if neg:
-            if type(hop) is utils.REGEXP_T:
+            if isinstance(hop, utils.REGEXP_T):
                 return {'traces.hops.domains': {'$not': hop}}
             return {'traces.hops.domains': {'$ne': hop}}
         return {'traces.hops.domains': hop}
 
     def searchhopname(self, hop, neg=False):
         if neg:
-            if type(hop) is utils.REGEXP_T:
+            if isinstance(hop, utils.REGEXP_T):
                 return {'traces.hops.host': {'$not': hop}}
             return {'traces.hops.host': {'$ne': hop}}
         return self.flt_and(
@@ -1936,9 +1795,9 @@ have no effect if it is not expected)."""
             result['ports']['$elemMatch']['screenshot'] = {'$exists': True}
             if isinstance(words, list):
                 words = {'$ne' if neg else '$all': words}
-            elif type(words) is utils.REGEXP_T:
+            elif isinstance(words, utils.REGEXP_T):
                 words = {'$not': words} if neg else words
-            elif type(words) is bool:
+            elif isinstance(words, bool):
                 words = {"$exists": words}
             else:
                 words = {'$ne': words} if neg else words
@@ -1975,13 +1834,13 @@ have no effect if it is not expected)."""
         else:
             return {"cpes": {"$elemMatch": flt}}
 
-    def topvalues(self, field, flt=None, topnbr=10, sortby=None,
+    def topvalues(self, field, flt=None, topnbr=10, sort=None,
                   limit=None, skip=None, least=False, archive=False,
                   aggrflt=None, specialproj=None, specialflt=None):
         """
         This method makes use of the aggregation framework to produce
         top values for a given field or pseudo-field. Pseudo-fields are:
-          - category / label / asnum / country / net[:mask]
+          - category / asnum / country / net[:mask]
           - port
           - port:open / :closed / :filtered / :<servicename>
           - portlist:open / :closed / :filtered
@@ -2011,47 +1870,16 @@ have no effect if it is not expected)."""
         # pseudo-fields
         if field == "category":
             field = "categories"
-        elif field == "label" or field.startswith("label:"):
-            subfield = field[6:]
-            field = "labels.tags"
-            group, tag = ((None, None)
-                          if not subfield else
-                          map(utils.str2regexp, subfield.split(':', 1))
-                          if ':' in subfield else
-                          (utils.str2regexp(subfield), None))
-            flt = self.flt_and(flt, self.searchlabel(group=group, label=tag))
-            specialproj = {"_id": 0, "labels.group": 1, "labels.tags": 1}
-            # We need a second filter for hosts containing both label
-            # we want to match and label we don't want to match (the
-            # first filter, `flt`, is needed for performance while the
-            # second, added in `specialflt`, is needed for
-            # correctness).
-            if group is not None:
-                flt2 = {"labels.group": group}
-                if tag is not None:
-                    flt2["labels.tags"] = tag
-                specialflt.append({"$match": flt2})
-            # This projection needs to happen after the $unwind and
-            # after the second filter
-            specialflt.append({"$project": {
-                "_id": 0,
-                "labels.tags": {"$concat": [
-                    "$labels.group",
-                    "###",
-                    "$labels.tags",
-                ]}
-            }})
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###', 1)}
         elif field == "country":
             flt = self.flt_and(flt, {"infos.country_code": {"$exists": True}})
             field = "infos.country_code"
             outputproc = lambda x: {
                 'count': x['count'],
-                '_id': [
+                '_id': (
                     x['_id'],
                     self.globaldb.data.country_name_by_code(x['_id']),
-                ]}
+                ),
+            }
         elif field == "city":
             flt = self.flt_and(
                 flt,
@@ -2066,7 +1894,7 @@ have no effect if it is not expected)."""
                            ]}}
             field = "city"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###', 1)}
+                                    '_id': tuple(x['_id'].split('###', 1))}
         elif field == "asnum":
             flt = self.flt_and(flt, {"infos.as_num": {"$exists": True}})
             field = "infos.as_num"
@@ -2086,10 +1914,10 @@ have no effect if it is not expected)."""
             field = "as"
             outputproc = lambda x: {
                 'count': x['count'],
-                '_id': [None, None] if x['_id'] is None else [
+                '_id': (None, None) if x['_id'] is None else tuple(
                     int(y) if i == 0 else y for i, y in
                     enumerate(x['_id'].split('###'))
-                ],
+                ),
             }
         elif field == "net" or field.startswith("net:"):
             field = "addr"
@@ -2143,8 +1971,8 @@ have no effect if it is not expected)."""
             ]
             outputproc = lambda x: {
                 'count': x['count'],
-                '_id': [int(y) if i == 1 else y for i, y in
-                        enumerate(x['_id'].split('###'))],
+                '_id': tuple(int(y) if i == 1 else y for i, y in
+                             enumerate(x['_id'].split('###'))),
             }
         elif field.startswith("portlist:"):
             specialproj = {"ports.port": 1, "ports.protocol": 1,
@@ -2178,7 +2006,7 @@ have no effect if it is not expected)."""
             field = "portlist"
             outputproc = lambda x: {
                 'count': x['count'],
-                '_id': [[y['protocol'], y['port']] for y in x['_id']],
+                '_id': [(y['protocol'], y['port']) for y in x['_id']],
             }
 
         elif field.startswith('countports:'):
@@ -2206,64 +2034,68 @@ have no effect if it is not expected)."""
                 ]
                 field = "countports"
         elif field == "service":
-            flt = self.flt_and(flt, self.searchservice({'$exists': True}))
+            flt = self.flt_and(flt, self.searchopenport())
+            specialproj = {
+                "_id": 0,
+                "ports.state_state": 1,
+                "ports.service_name": 1,
+            }
+            specialflt = [
+                {"$match": {"ports.state_state": "open"}},
+                {"$project":
+                 {"ports.service_name":
+                  {"$ifNull": ["$ports.service_name", ""]},
+                 }},
+            ]
             field = "ports.service_name"
+            outputproc = lambda x: {'count': x['count'],
+                                    '_id': x['_id'] if x['_id'] else None}
         elif field.startswith("service:"):
             port = int(field.split(':', 1)[1])
-            flt = self.flt_and(
-                flt,
-                self.searchservice({'$exists': True}, port=port),
-            )
+            flt = self.flt_and(flt, self.searchport(port))
             specialproj = {"_id": 0, "ports.port": 1, "ports.service_name": 1}
             specialflt = [
                 {"$match": {"ports.port": port}},
-                {"$project": {"ports.service_name": 1}}
+                {"$project":
+                 {"ports.service_name":
+                  {"$ifNull": ["$ports.service_name", ""]},
+                 }},
             ]
             field = "ports.service_name"
         elif field == 'product':
-            flt = self.flt_and(flt, self.searchproduct(
-                {'$exists': True},
-                service={'$exists': True},
-            ))
+            flt = self.flt_and(flt, self.searchopenport())
             specialproj = {
                 "_id": 0,
+                "ports.state_state": 1,
                 "ports.service_name": 1,
                 "ports.service_product": 1,
             }
             specialflt = [
-                {"$match": {"ports.service_product": {"$exists": True}}},
+                {"$match": {"ports.state_state": "open"}},
                 {"$project":
                  {"ports.service_product":
                   {"$concat": [
-                      "$ports.service_name",
+                      {"$ifNull": ["$ports.service_name", ""]},
                       "###",
-                      "$ports.service_product",
+                      {"$ifNull": ["$ports.service_product", ""]},
                   ]}}}
             ]
             field = "ports.service_product"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###')}
+                                    '_id': tuple(elt if elt else None for elt in
+                                                 x['_id'].split('###'))}
         elif field.startswith('product:'):
             service = field.split(':', 1)[1]
             if service.isdigit():
                 port = int(service)
-                flt = self.flt_and(flt, self.searchproduct(
-                    {'$exists': True},
-                    service={'$exists': True},
-                    port=port,
-                ))
+                flt = self.flt_and(flt, self.searchport(port))
                 specialflt = [
-                    {"$match": {"ports.port": port,
-                                "ports.service_product": {"$exists": True}}},
+                    {"$match": {"ports.port": port}},
                 ]
             else:
-                flt = self.flt_and(flt, self.searchproduct(
-                    {'$exists': True},
-                    service=service,
-                ))
+                flt = self.flt_and(flt, self.searchservice(service))
                 specialflt = [
-                    {"$match": {"ports.service_name": service,
-                                "ports.service_product": {"$exists": True}}},
+                    {"$match": {"ports.service_name": service}},
                 ]
             specialproj = {
                 "_id": 0,
@@ -2275,79 +2107,62 @@ have no effect if it is not expected)."""
                 {"$project":
                  {"ports.service_product":
                   {"$concat": [
-                      "$ports.service_name",
+                      {"$ifNull": ["$ports.service_name", ""]},
                       "###",
-                      "$ports.service_product",
+                      {"$ifNull": ["$ports.service_product", ""]},
                   ]}}}
             )
             field = "ports.service_product"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###')}
+                                    '_id': tuple(elt if elt else None for elt in
+                                                 x['_id'].split('###'))}
         elif field == 'version':
-            flt = self.flt_and(flt, self.searchproduct(
-                {'$exists': True},
-                service={'$exists': True},
-                version={'$exists': True},
-            ))
+            flt = self.flt_and(flt, self.searchopenport())
             specialproj = {
                 "_id": 0,
+                "ports.state_state": 1,
                 "ports.service_name": 1,
                 "ports.service_product": 1,
                 "ports.service_version": 1,
             }
             specialflt = [
-                {"$match": {"ports.service_product": {"$exists": True},
-                            "ports.service_version": {"$exists": True}}},
+                {"$match": {"ports.state_state": "open"}},
                 {"$project":
                  {"ports.service_product":
                   {"$concat": [
-                      "$ports.service_name",
+                      {"$ifNull": ["$ports.service_name", ""]},
                       "###",
-                      "$ports.service_product",
+                      {"$ifNull": ["$ports.service_product", ""]},
                       "###",
-                      "$ports.service_version",
+                      {"$ifNull": ["$ports.service_version", ""]},
                   ]}}}
             ]
             field = "ports.service_product"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###')}
+                                    '_id': tuple(elt if elt else None for elt in
+                                                 x['_id'].split('###'))}
         elif field.startswith('version:'):
             service = field.split(':', 1)[1]
             if service.isdigit():
                 port = int(service)
-                flt = self.flt_and(flt, self.searchproduct(
-                    {'$exists': True},
-                    service={'$exists': True},
-                    version={'$exists': True},
-                    port=port,
-                ))
+                flt = self.flt_and(flt, self.searchport(port))
                 specialflt = [
-                    {"$match": {"ports.port": port,
-                                "ports.service_product": {"$exists": True},
-                                "ports.service_version": {"$exists": True}}},
+                    {"$match": {"ports.port": port}},
                 ]
             elif ":" in service:
                 service, product = service.split(':', 1)
                 flt = self.flt_and(flt, self.searchproduct(
                     product,
                     service=service,
-                    version={'$exists': True},
                 ))
                 specialflt = [
                     {"$match": {"ports.service_name": service,
-                                "ports.service_product": product,
-                                "ports.service_version": {"$exists": True}}},
+                                "ports.service_product": product}},
                 ]
             else:
-                flt = self.flt_and(flt, self.searchproduct(
-                    {'$exists': True},
-                    service=service,
-                    version={'$exists': True},
-                ))
+                flt = self.flt_and(flt, self.searchservice(service))
                 specialflt = [
-                    {"$match": {"ports.service_name": service,
-                                "ports.service_product": {"$exists": True},
-                                "ports.service_version": {"$exists": True}}},
+                    {"$match": {"ports.service_name": service}},
                 ]
             specialproj = {
                 "_id": 0,
@@ -2360,16 +2175,17 @@ have no effect if it is not expected)."""
                 {"$project":
                  {"ports.service_product":
                   {"$concat": [
-                      "$ports.service_name",
+                      {"$ifNull": ["$ports.service_name", ""]},
                       "###",
-                      "$ports.service_product",
+                      {"$ifNull": ["$ports.service_product", ""]},
                       "###",
-                      "$ports.service_version",
+                      {"$ifNull": ["$ports.service_version", ""]},
                   ]}}}
             )
             field = "ports.service_product"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###')}
+                                    '_id': tuple(elt if elt else None for elt in
+                                                 x['_id'].split('###'))}
         elif field.startswith("cpe"):
             try:
                 field, cpeflt = field.split(":", 1)
@@ -2415,7 +2231,7 @@ have no effect if it is not expected)."""
                 {"$project": {"cpes.%s" % field: {"$concat": concat}}})
             field = "cpes.%s" % field
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split(':', 3)}
+                                    '_id': tuple(x['_id'].split(':', 3))}
         elif field == 'devicetype':
             field = "ports.service_devicetype"
         elif field.startswith('devicetype:'):
@@ -2491,7 +2307,7 @@ have no effect if it is not expected)."""
                     ]}}}]
             field = "ports.scripts.ssh-hostkey.bits"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'].split('###')}
+                                    '_id': tuple(x['_id'].split('###'))}
         elif field.startswith('sshkey.'):
             flt = self.flt_and(flt, self.searchsshkey())
             subfield = field[7:]
@@ -2510,8 +2326,8 @@ have no effect if it is not expected)."""
                     ]}}}]
             field = "ports.scripts.ike-info.vendor_ids"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': map(null_if_empty,
-                                               x['_id'].split('###'))}
+                                    '_id': tuple(map(null_if_empty,
+                                                     x['_id'].split('###')))}
         elif field == 'ike.transforms':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
@@ -2541,8 +2357,8 @@ have no effect if it is not expected)."""
                     ]}}}]
             field = "ports.scripts.ike-info.transforms"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': map(null_if_empty,
-                                               x['_id'].split('###'))}
+                                    '_id': tuple(map(null_if_empty,
+                                                     x['_id'].split('###')))}
         elif field == 'ike.notification':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
@@ -2553,12 +2369,15 @@ have no effect if it is not expected)."""
             flt = self.flt_and(flt, self.searchscript(name="ike-info"))
             field = "ports.scripts.ike-info." + field[4:]
         elif field.startswith('modbus.'):
+            flt = self.flt_and(flt, self.searchscript(name="modbus-discover"))
             subfield = field[7:]
             field = 'ports.scripts.modbus-discover.' + subfield
         elif field.startswith('s7.'):
+            flt = self.flt_and(flt, self.searchscript(name="s7-info"))
             subfield = field[3:]
             field = 'ports.scripts.s7-info.' + subfield
         elif field.startswith('enip.'):
+            flt = self.flt_and(flt, self.searchscript(name="enip-info"))
             subfield = field[5:]
             subfield = {
                 "vendor": "Vendor",
@@ -2592,17 +2411,20 @@ have no effect if it is not expected)."""
                                                 "$" + field,
                                             ]}}}]
                 outputproc = lambda x: {'count': x['count'],
-                                        '_id': x['_id'].split('###', 1)}
-        elif (field == 'file' or field.startswith('file:')
-              or field.startswith('file.')):
-            if ":" in field:
-                field, scripts = field.split(':', 1)
+                                        '_id': tuple(x['_id'].split('###', 1))}
+        elif field == 'file' or (field.startswith('file') and field[4] in '.:'):
+            if field.startswith('file:'):
+                scripts = field[5:]
+                if '.' in scripts:
+                    scripts, field = scripts.split('.', 1)
+                else:
+                    field = 'filename'
                 scripts = scripts.split(',')
             else:
+                field = field[5:] or 'filename'
                 scripts = None
             flt = self.flt_and(flt, self.searchfile(scripts=scripts))
-            field = 'ports.scripts.ls.volumes.files.%s' % (field[5:]
-                                                           or 'filename')
+            field = 'ports.scripts.ls.volumes.files.%s' % field
             if scripts is not None:
                 specialproj = {"_id": 0, field: 1, 'ports.scripts.id': 1}
                 # We need two different filters here (see `cpeflt`
@@ -2610,8 +2432,15 @@ have no effect if it is not expected)."""
                 specialflt = [
                     {"$match": {"ports.scripts.id":
                                 flt['ports.scripts']['$elemMatch']['id']}},
+                    {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
                     #{"$project": {field: 1}},
                 ]
+            else:
+                specialflt = [
+                    {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
+                ]
+            outputproc = lambda x: {'count': x['count'],
+                                    '_id': x['_id'] if x['_id'] else None}
         elif field == 'screenwords':
             field = 'ports.screenwords'
             flt = self.flt_and(flt, self.searchscreenshot(words=True))
@@ -2636,7 +2465,7 @@ have no effect if it is not expected)."""
             outputproc = lambda x: {'count': x['count'],
                                     '_id': utils.int2ip(x['_id'])}
         pipeline = self._topvalues(
-            field, flt=flt, topnbr=topnbr, sortby=sortby, limit=limit,
+            field, flt=flt, topnbr=topnbr, sort=sort, limit=limit,
             skip=skip, least=least, aggrflt=aggrflt,
             specialproj=specialproj, specialflt=specialflt,
         )
@@ -2649,7 +2478,7 @@ have no effect if it is not expected)."""
             return (outputproc(res) for res in cursor)
         return cursor
 
-    def distinct(self, field, flt=None, sortby=None, limit=None, skip=None,
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None,
                  archive=False):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
@@ -2659,7 +2488,7 @@ have no effect if it is not expected)."""
             self.db[self.colname_oldhosts
                     if archive else
                     self.colname_hosts].aggregate(
-                        self._distinct(field, flt=flt, sortby=sortby,
+                        self._distinct(field, flt=flt, sort=sort,
                                        limit=limit, skip=skip),
                         cursor={},
                     )
@@ -2668,11 +2497,8 @@ have no effect if it is not expected)."""
 
     def diff_categories(self, category1, category2, flt=None,
                         archive=False, include_both_open=True):
-        """`category1` and `category2` can be categories (provided as
-        str or unicode objects) or labels (provided as dicts with two
-        keys, "group" and "tags", or as a two-element tuple, (group,
-        tags)). They *must* be of the same type: both categories or
-        both labels.
+        """`category1` and `category2` must be categories (provided as str or
+        unicode objects)
 
         Returns a generator of tuples:
         ({'addr': address, 'proto': protocol, 'port': port}, value)
@@ -2690,49 +2516,20 @@ have no effect if it is not expected)."""
         against the same targets.
 
         """
-        project = {"_id": 0, "addr": 1, "ports.protocol": 1, "ports.port": 1}
-        if isinstance(category1, basestring):
-            category_filter = self.searchcategory([category1, category2])
-            category_field = "categories"
-            unwind_match = [
-                {"$unwind": "$categories"},
-                {"$match": category_filter},
-            ]
-            project["categories"] = 1
-        else:
-            if isinstance(category1, (tuple, list)):
-                category1 = {"group": category1[0], "tags": category1[1]}
-            if isinstance(category2, (tuple, list)):
-                category2 = {"group": category2[0], "tags": category2[1]}
-            groups = (category1["group"]
-                      if category1["group"] == category2["group"] else
-                      {"$in": [cat["group"] for cat in [category1,
-                                                        category2]]})
-            labels = (category1["tags"]
-                      if category1["tags"] == category2["tags"] else
-                      {"$in": [cat["tags"] for cat in [category1, category2]]})
-            category_filter = self.searchlabel(group=groups, label=labels)
-            category_field = "labels"
-            unwind_match = [
-                {"$unwind": "$labels"},
-                {"$unwind": "$labels.tags"},
-                {"$match": {"labels.group": groups, "labels.tags": labels}},
-            ]
-            project["labels.group"] = 1
-            project["labels.tags"] = 1
+        category_filter = self.searchcategory([category1, category2])
         pipeline = [
             {"$match": (category_filter if flt is None else
                         self.flt_and(flt, category_filter))},
-        ]
-        pipeline.extend(unwind_match)
-        pipeline.extend([
+            {"$unwind": "$categories"},
+            {"$match": category_filter},
             {"$unwind": "$ports"},
             {"$match": {"ports.state_state": "open"}},
-            {"$project": project},
+            {"$project": {"_id": 0, "addr": 1, "ports.protocol": 1,
+                          "ports.port": 1, "categories": 1}},
             {"$group": {"_id": {"addr": "$addr", "proto": "$ports.protocol",
                                 "port": "$ports.port"},
-                        "categories": {"$push": "$%s" % category_field}}},
-        ])
+                        "categories": {"$push": "$categories"}}},
+        ]
         cursor = self.db[self.colname_oldhosts if archive else
                          self.colname_hosts].aggregate(pipeline, cursor={})
         def categories_to_val(categories):
@@ -2787,146 +2584,6 @@ have no effect if it is not expected)."""
                 {'$set': updatespec},
                 multi=True,
             )
-
-    def parse_args(self, args, flt=None):
-        if flt is None:
-            flt = self.flt_empty
-        if args.category is not None:
-            flt = self.flt_and(flt, self.searchcategory(
-                utils.str2list(args.category)))
-        if args.country is not None:
-            flt = self.flt_and(flt, self.searchcountry(
-                utils.str2list(args.country)))
-        if args.asnum is not None:
-            flt = self.flt_and(flt, self.searchasnum(
-                utils.str2list(args.asnum)))
-        if args.asname is not None:
-            flt = self.flt_and(flt, self.searchasname(
-                utils.str2regexp(args.asname)))
-        if args.source is not None:
-            flt = self.flt_and(flt, self.searchsource(args.source))
-        if args.version is not None:
-            flt = self.flt_and(flt, self.searchversion(args.version))
-        if args.timeago is not None:
-            flt = self.flt_and(flt, self.searchtimeago(args.timeago))
-        if args.id is not None:
-            flt = self.flt_and(flt, self.searchobjectid(args.id))
-        if args.no_id is not None:
-            flt = self.flt_and(flt, self.searchobjectid(args.no_id, neg=True))
-        if args.host is not None:
-            flt = self.flt_and(flt, self.searchhost(args.host))
-        if args.hostname is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchhostname(utils.str2regexp(args.hostname))
-            )
-        if args.domain is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchdomain(utils.str2regexp(args.domain))
-            )
-        if args.net is not None:
-            flt = self.flt_and(flt, self.searchnet(args.net))
-        if args.range is not None:
-            flt = self.flt_and(flt, self.searchrange(*args.range))
-        if args.hop is not None:
-            flt = self.flt_and(flt, self.searchhop(args.hop))
-        if args.port is not None:
-            port = args.port.replace('_', '/')
-            if '/' in port:
-                proto, port = port.split('/', 1)
-            else:
-                proto = 'tcp'
-            port = int(port)
-            flt = self.flt_and(
-                flt,
-                self.searchport(port=port, protocol=proto))
-        if args.not_port is not None:
-            not_port = args.not_port.replace('_', '/')
-            if '/' in not_port:
-                not_proto, not_port = not_port.split('/', 1)
-            else:
-                not_proto = 'tcp'
-            not_port = int(not_port)
-            flt = self.flt_and(
-                flt,
-                self.searchport(port=not_port, protocol=not_proto,
-                                neg=True))
-        if args.openport:
-            flt = self.flt_and(flt, self.searchopenport())
-        if args.no_openport:
-            flt = self.flt_and(flt, self.searchopenport(neg=True))
-        if args.countports:
-            minn, maxn = int(args.countports[0]), int(args.countports[1])
-            flt = self.flt_and(flt,
-                               self.searchcountopenports(minn=minn,
-                                                         maxn=maxn))
-        if args.no_countports:
-            minn, maxn = int(args.no_countports[0]), int(args.no_countports[1])
-            flt = self.flt_and(flt,
-                               self.searchcountopenports(minn=minn,
-                                                         maxn=maxn,
-                                                         neg=True))
-        if args.service is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchservicescript(utils.str2regexp(args.service)))
-        if args.label is not None:
-            if ':' in args.label:
-                group, lab = map(utils.str2regexp, args.label.split(':', 1))
-            else:
-                group, lab = utils.str2regexp(args.label), None
-            flt = self.flt_and(flt, self.searchlabel(group=group,
-                                                     label=lab, neg=False))
-        if args.no_label is not None:
-            if ':' in args.no_label:
-                group, lab = map(utils.str2regexp, args.no_label.split(':', 1))
-            else:
-                group, lab = utils.str2regexp(args.no_label), None
-            flt = self.flt_and(flt, self.searchlabel(group=group,
-                                                     label=lab, neg=True))
-        if args.script is not None:
-            if ':' in args.script:
-                name, output = (utils.str2regexp(string) for
-                                string in args.script.split(':', 1))
-            else:
-                name, output = utils.str2regexp(args.script), None
-            flt = self.flt_and(flt, self.searchscript(name=name,
-                                                      output=output))
-        if args.svchostname is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchsvchostname(utils.str2regexp(args.svchostname)))
-        if args.os is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchos(utils.str2regexp(args.os)))
-        if args.anonftp:
-            flt = self.flt_and(flt, self.searchftpanon())
-        if args.anonldap:
-            flt = self.flt_and(flt, self.searchldapanon())
-        if args.authhttp:
-            flt = self.flt_and(flt, self.searchhttpauth())
-        if args.authbypassvnc:
-            flt = self.flt_and(flt, self.searchvncauthbypass())
-        if args.ypserv:
-            flt = self.flt_and(flt, self.searchypserv())
-        if args.nfs:
-            flt = self.flt_and(flt, self.searchnfs())
-        if args.x11:
-            flt = self.flt_and(flt, self.searchx11access())
-        if args.xp445:
-            flt = self.flt_and(flt, self.searchxp445())
-        if args.owa:
-            flt = self.flt_and(flt, self.searchowa())
-        if args.vuln_boa:
-            flt = self.flt_and(flt, self.searchvulnintersil())
-        if args.torcert:
-            flt = self.flt_and(flt, self.searchtorcert())
-        if args.sshkey is not None:
-            flt = self.flt_and(flt, self.searchsshkey(
-                fingerprint=utils.str2regexp(args.sshkey)))
-        return flt
 
 
 class MongoDBPassive(MongoDB, DBPassive):
@@ -3066,12 +2723,12 @@ setting values according to the keyword arguments.
             )
 
     def insert_or_update_bulk(self, specs, getinfos=None):
-        """Like `.insert_or_update()`, but `specs` parameter has to be
-        an iterable of (timestamp, spec) values. This will perform
-        bulk MongoDB inserts with the major drawback that the
-        `getinfos` parameter will be called (if it is not `None`) for
-        each spec, the spec already exists in the database and the
-        call was hence unnecessary.
+        """Like `.insert_or_update()`, but `specs` parameter has to be an
+        iterable of (timestamp, spec) values. This will perform bulk
+        MongoDB inserts with the major drawback that the `getinfos`
+        parameter will be called (if it is not `None`) for each spec,
+        even when the spec already exists in the database and the call
+        was hence unnecessary.
 
         It's up to you to decide whether having bulk insert is worth
         it or if you want to go with the regular `.insert_or_update()`
@@ -3095,10 +2752,7 @@ setting values according to the keyword arguments.
                     bulk.find(spec).upsert().update(updatespec)
                     count += 1
                     if count >= config.BULK_UPSERTS_MAXSIZE:
-                        if config.DEBUG:
-                            sys.stderr.write(
-                                "MongoDB bulk upsert: %d\n" % count
-                            )
+                        utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", count)
                         bulk.execute()
                         bulk = self.db[self.colname_passive]\
                                    .initialize_unordered_bulk_op()
@@ -3106,8 +2760,7 @@ setting values according to the keyword arguments.
         except IOError:
             pass
         if count > 0:
-            if config.DEBUG:
-                sys.stderr.write("MongoDB bulk upsert: %d (final)\n" % count)
+            utils.LOGGER.debug("DB:MongoDB bulk upsert: %d (final)", count)
             bulk.execute()
 
     def insert_or_update_mix(self, spec, getinfos=None):
@@ -3177,14 +2830,14 @@ setting values according to the keyword arguments.
             self.db[self.colname_passive].aggregate(pipeline, cursor={})
         )
 
-    def distinct(self, field, flt=None, sortby=None, limit=None, skip=None):
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
 
         """
         cursor = self.set_limits(
             self.db[self.colname_passive].aggregate(
-                self._distinct(field, flt=flt, sortby=sortby,
+                self._distinct(field, flt=flt, sort=sort,
                                limit=limit, skip=skip),
                 cursor={},
             )
@@ -3192,9 +2845,13 @@ setting values according to the keyword arguments.
         return (res['_id'] for res in cursor)
 
     @staticmethod
+    def searchrecontype(rectype):
+        return {'recontype': rectype}
+
+    @staticmethod
     def searchsensor(sensor, neg=False):
         if neg:
-            if type(sensor) is utils.REGEXP_T:
+            if isinstance(sensor, utils.REGEXP_T):
                 return {'sensor': {'$not': sensor}}
             return {'sensor': {'$ne': sensor}}
         return {'sensor': sensor}
@@ -3239,7 +2896,7 @@ setting values according to the keyword arguments.
                                   'HTTP_CLIENT_HEADER_SERVER']},
             'source': {'$in': ['AUTHORIZATION',
                                'PROXY-AUTHORIZATION']},
-            'value': re.compile('^Basic'),
+            'value': re.compile('^Basic', re.I),
         }
 
     @staticmethod
@@ -3282,7 +2939,7 @@ setting values according to the keyword arguments.
         )).distinct('addr')
 
     def knownip_byas(self, asnum):
-        if type(asnum) is str:
+        if isinstance(asnum, basestring):
             if asnum.startswith('AS'):
                 asnum = asnum[2:]
             asnum = int(asnum)
@@ -3424,6 +3081,13 @@ class MongoDBData(MongoDB, DBData):
         self.db[self.colname_city_locations].drop()
         self.create_indexes()
 
+    def feed_country_codes(self, *_, **__):
+        """GeoIP Country database is used with MongoDB instead of a country
+code / name table
+
+        """
+        pass
+
     def feed_geoip_country(self, fname, feedipdata=None,
                            createipdata=False):
         self.country_codes = {}
@@ -3520,17 +3184,6 @@ class MongoDBData(MongoDB, DBData):
         if locid:
             return self.location_byid(locid.get('location_id'))
 
-    def infos_byip(self, addr):
-        infos = {}
-        for infos_byip in [self.country_byip,
-                           self.as_byip,
-                           self.location_byip]:
-            newinfos = infos_byip(addr)
-            if newinfos is not None:
-                infos.update(newinfos)
-        if infos:
-            return infos
-
     def ipranges_bycountry(self, code):
         return [
             (x['start'], x['stop']) for x in
@@ -3541,7 +3194,7 @@ class MongoDBData(MongoDB, DBData):
         ]
 
     def ipranges_byas(self, asnum):
-        if type(asnum) is str:
+        if isinstance(asnum, basestring):
             if asnum.startswith('AS'):
                 asnum = asnum[2:]
             asnum = int(asnum)
