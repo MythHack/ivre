@@ -17,9 +17,15 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
+
 """This sub-module is responsible for generating Nmap options."""
 
+
+import pipes
+
+
 from ivre import config
+
 
 try:
     import argparse
@@ -42,12 +48,13 @@ NMAP_OPT_PORTS = {
     'all': ['-p', '-'],
 }
 
+
 class Scan(object):
     def __init__(self, nmap="nmap", pings='SE', scans='SV', osdetect=True,
                  traceroute=True, resolve=1, verbosity=2, ports=None,
-                 host_timeout=None, scripts_categories=None,
-                 scripts_exclude=None, scripts_force=None,
-                 extra_options=None):
+                 host_timeout=None, script_timeout=None,
+                 scripts_categories=None, scripts_exclude=None,
+                 scripts_force=None, extra_options=None):
         self.nmap = nmap
         self.pings = set(pings)
         self.scans = set(scans)
@@ -57,6 +64,7 @@ class Scan(object):
         self.verbosity = verbosity
         self.ports = ports
         self.host_timeout = host_timeout
+        self.script_timeout = script_timeout
         if scripts_categories is None:
             self.scripts_categories = []
         else:
@@ -70,6 +78,7 @@ class Scan(object):
         else:
             self.scripts_force = scripts_force
         self.extra_options = extra_options
+
     @property
     def options(self):
         options = [self.nmap]
@@ -121,11 +130,20 @@ class Scan(object):
         options.extend(NMAP_OPT_PORTS.get(self.ports, ['-p', self.ports]))
         if self.host_timeout is not None:
             options.extend(['--host-timeout', self.host_timeout])
+        if self.script_timeout is not None:
+            options.extend(['--script-timeout', self.script_timeout])
         if scripts:
             options.extend(['--script', scripts])
         if self.extra_options:
             options.extend(self.extra_options)
         return options
 
-def build_nmap_options(args):
-    return Scan(**config.NMAP_SCAN_TEMPLATES[args.nmap_template]).options
+
+def build_nmap_options(template="default"):
+    return Scan(**config.NMAP_SCAN_TEMPLATES[template]).options
+
+
+def build_nmap_commandline(template="default"):
+    return ' '.join(
+        pipes.quote(elt) for elt in build_nmap_options(template=template)
+    )

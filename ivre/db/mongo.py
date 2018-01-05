@@ -25,7 +25,9 @@ databases.
 
 import datetime
 import json
+import os
 import re
+import uuid
 try:
     from collections import OrderedDict
 except ImportError:
@@ -33,11 +35,14 @@ except ImportError:
     OrderedDict = dict
 
 
+from builtins import bytes, range
+from future.utils import viewitems, viewvalues
+from past.builtins import basestring
 import bson
 import pymongo
 
 
-from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent
+from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent, LockError
 from ivre import utils, xmlnmap, config
 
 
@@ -86,7 +91,7 @@ class MongoDB(DB):
         suitable to be passed to Cursor.hint().
 
         """
-        for fieldname, hint in self.hint_indexes.iteritems():
+        for fieldname, hint in viewitems(self.hint_indexes):
             if fieldname in spec:
                 return hint
 
@@ -181,7 +186,7 @@ class MongoDB(DB):
     @staticmethod
     def serialize(obj):
         if isinstance(obj, bson.ObjectId):
-            return obj.binary.encode('hex')
+            return utils.encode_hex(obj.binary)
         return DB.serialize(obj)
 
     def explain(self, cursor, indent=None):
@@ -189,12 +194,12 @@ class MongoDB(DB):
                           default=self.serialize)
 
     def create_indexes(self):
-        for colname, indexes in self.indexes.iteritems():
+        for colname, indexes in viewitems(self.indexes):
             for index in indexes:
                 self.db[colname].create_index(index[0], **index[1])
 
     def ensure_indexes(self):
-        for colname, indexes in self.indexes.iteritems():
+        for colname, indexes in viewitems(self.indexes):
             for index in indexes:
                 self.db[colname].ensure_index(index[0], **index[1])
 
@@ -227,8 +232,11 @@ class MongoDB(DB):
                         updated = True
                         self.db[colname].update({"_id": record["_id"]}, update)
             if updated:
-                for action, indexes in self.schema_migrations_indexes[
-                        colname].get(new_version, {}).iteritems():
+                for action, indexes in viewitems(
+                        self.schema_migrations_indexes[colname].get(
+                            new_version, {}
+                        )
+                ):
                     function = getattr(self.db[colname], "%s_index" % action)
                     for idx in indexes:
                         try:
@@ -253,10 +261,9 @@ class MongoDB(DB):
         .migrate_schema()).
 
         """
-        return cmp(
-            self.schema_latest_versions.get(colname, 0),
-            document.get("schema_version", 0),
-        )
+        val1 = self.schema_latest_versions.get(colname, 0)
+        val2 = document.get("schema_version", 0)
+        return (val1 > val2) - (val1 < val2)
 
     def _topvalues(self, field, flt=None, topnbr=10, sort=None,
                    limit=None, skip=None, least=False, aggrflt=None,
@@ -287,7 +294,7 @@ class MongoDB(DB):
         # hack to allow nested values as field
         # see <http://stackoverflow.com/questions/13708857/
         # mongodb-aggregation-framework-nested-arrays-subtract-expression>
-        for i in xrange(field.count('.'), -1, -1):
+        for i in range(field.count('.'), -1, -1):
             subfield = field.rsplit('.', i)[0]
             if subfield in self.needunwind:
                 pipeline += [{"$unwind": "$" + subfield}]
@@ -330,7 +337,7 @@ class MongoDB(DB):
         # hack to allow nested values as field
         # see <http://stackoverflow.com/questions/13708857/
         # mongodb-aggregation-framework-nested-arrays-subtract-expression>
-        for i in xrange(field.count('.'), -1, -1):
+        for i in range(field.count('.'), -1, -1):
             subfield = field.rsplit('.', i)[0]
             if subfield in self.needunwind:
                 pipeline += [{"$unwind": "$" + subfield}]
@@ -362,8 +369,8 @@ class MongoDB(DB):
         they are accepted by both cond1 and cond2.
 
         """
-        cond1k = set(cond1.keys())
-        cond2k = set(cond2.keys())
+        cond1k = set(cond1)
+        cond2k = set(cond2)
         cond = {}
         if '$and' in cond1:
             cond1k.remove('$and')
@@ -696,7 +703,7 @@ creates the default indexes."""
                 if screenwords is not None:
                     port['screenwords'] = screenwords
                     updated_ports = True
-        for proto in openports.keys():
+        for proto in list(openports):
             count = len(openports[proto]["ports"])
             openports[proto]["count"] = count
             openports["count"] = openports.get("count", 0) + count
@@ -720,7 +727,7 @@ creates the default indexes."""
         for port in doc.get("ports", []):
             if port.get("service_method") == "table":
                 update_ports = True
-                for key in port.keys():
+                for key in list(port):
                     if key.startswith('service_'):
                         del port[key]
         if update_ports:
@@ -802,7 +809,8 @@ creates the default indexes."""
                 updated_ports = True
         if updated_ports:
             update["$set"]["ports"] = doc['ports']
-        for state, (total, counts) in doc.get('extraports', {}).items():
+        for state, (total, counts) in list(viewitems(doc.get('extraports',
+                                                             {}))):
             doc['extraports'][state] = {"total": total, "reasons": counts}
             updated_extraports = True
         if updated_extraports:
@@ -819,7 +827,7 @@ creates the default indexes."""
         update = {"$set": {"schema_version": 6}}
         updated = False
         migrate_scripts = set(script for script, alias
-                              in xmlnmap.ALIASES_TABLE_ELEMS.iteritems()
+                              in viewitems(xmlnmap.ALIASES_TABLE_ELEMS)
                               if alias == 'vulns')
         for port in doc.get('ports', []):
             for script in port.get('scripts', []):
@@ -880,7 +888,7 @@ creates the default indexes."""
                     else:
                         script['vulns'] = [dict(tab, id=vulnid)
                                            for vulnid, tab in
-                                           script['vulns'].iteritems()]
+                                           viewitems(script['vulns'])]
                     updated = True
         if updated:
             update["$set"]["ports"] = doc['ports']
@@ -1076,7 +1084,7 @@ have no effect if it is not expected)."""
                          for h in (rec1.get("hostnames", [])
                                    + rec2.get("hostnames", [])))
         rec["hostnames"] = [{"type": h[0], "name": h[1], "domains": d}
-                            for h, d in hostnames.iteritems()]
+                            for h, d in viewitems(hostnames)]
         ports = dict(((port.get("protocol"), port["port"]), port.copy())
                      for port in rec2.get("ports", []))
         for port in rec1.get("ports", []):
@@ -1100,7 +1108,7 @@ have no effect if it is not expected)."""
                             curport[key] = port[key]
             else:
                 ports[(port.get('protocol'), port['port'])] = port
-        rec["ports"] = ports.values()
+        rec["ports"] = list(viewvalues(ports))
         rec["openports"] = {}
         for record in [rec1, rec2]:
             for proto in record.get('openports', {}):
@@ -1111,7 +1119,7 @@ have no effect if it is not expected)."""
                         'ports', set()).update(
                             record['openports'][proto]['ports'])
         if rec['openports']:
-            for proto in rec['openports'].keys():
+            for proto in list(rec['openports']):
                 count = len(rec['openports'][proto]['ports'])
                 rec['openports'][proto]['count'] = count
                 rec['openports']['count'] = rec['openports'].get(
@@ -1303,12 +1311,12 @@ have no effect if it is not expected)."""
         for port in host.get('ports', []):
             if 'screendata' in port:
                 port['screendata'] = bson.Binary(
-                    port['screendata'].decode('base64')
+                    utils.decode_b64(port['screendata'].encode())
                 )
             for script in port.get('scripts', []):
                 if 'masscan' in script and 'raw' in script['masscan']:
                     script['masscan']['raw'] = bson.Binary(
-                        script['masscan']['raw'].decode('base64')
+                        utils.decode_b64(script['masscan']['raw'].encode())
                     )
         return host
 
@@ -1390,7 +1398,7 @@ have no effect if it is not expected)."""
         """
         if not isinstance(asnum, basestring) and hasattr(asnum, '__iter__'):
             return {'infos.as_num':
-                    {'$nin' if neg else '$in': map(int, asnum)}}
+                    {'$nin' if neg else '$in': [int(val) for val in asnum]}}
         asnum = int(asnum)
         return {'infos.as_num': {'$ne': asnum} if neg else asnum}
 
@@ -1492,7 +1500,7 @@ have no effect if it is not expected)."""
         if neg:
             return {'$or': [{'openports.count': cond} for cond in flt]}
         # return {'openports.count':
-        #         dict(item for cond in flt for item in cond.iteritems())}
+        #         dict(item for cond in flt for item in viewitems(cond))}
         return {'openports.count': {'$lte':maxn, '$gte':minn}}
 
     @staticmethod
@@ -1547,13 +1555,13 @@ have no effect if it is not expected)."""
             if name is None:
                 raise TypeError(".searchscript() needs a `name` arg "
                                 "when using a `values` arg")
-            for field, value in values.iteritems():
+            for field, value in viewitems(values):
                 req["%s.%s" % (xmlnmap.ALIASES_TABLE_ELEMS.get(name, name),
                                field)] = value
         if not req:
             return {"ports.scripts": {"$exists": True}}
         if len(req) == 1:
-            field, value = req.items()[0]
+            field, value = next(iter(viewitems(req)))
             return {"ports.scripts.%s" % field: value}
         return {"ports.scripts": {"$elemMatch": req}}
 
@@ -2326,8 +2334,8 @@ have no effect if it is not expected)."""
                     ]}}}]
             field = "ports.scripts.ike-info.vendor_ids"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(map(null_if_empty,
-                                                     x['_id'].split('###')))}
+                                    '_id': tuple(null_if_empty(val) for val in
+                                                 x['_id'].split('###'))}
         elif field == 'ike.transforms':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
@@ -2357,8 +2365,8 @@ have no effect if it is not expected)."""
                     ]}}}]
             field = "ports.scripts.ike-info.transforms"
             outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(map(null_if_empty,
-                                                     x['_id'].split('###')))}
+                                    '_id': tuple(null_if_empty(val) for val in
+                                                 x['_id'].split('###'))}
         elif field == 'ike.notification':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
@@ -2533,9 +2541,9 @@ have no effect if it is not expected)."""
         cursor = self.db[self.colname_oldhosts if archive else
                          self.colname_hosts].aggregate(pipeline, cursor={})
         def categories_to_val(categories):
-            states = [category1 in categories, category2 in categories]
+            state1, state2 = category1 in categories, category2 in categories
             # assert any(states)
-            return -cmp(*states)
+            return (state2 > state1) - (state2 < state1)
         cursor = (dict(x['_id'], value=categories_to_val(x['categories']))
                   for x in cursor)
         if include_both_open:
@@ -2557,7 +2565,7 @@ have no effect if it is not expected)."""
     def update_city(self, start, stop, locid, create=False):
         """Update city/location info on existing Nmap scan result documents"""
         updatespec = dict(("infos.%s" % key, value) for key, value in
-                          self.globaldb.data.location_byid(locid).iteritems())
+                          viewitems(self.globaldb.data.location_byid(locid)))
         if "infos.country_code" in updatespec:
             updatespec[
                 "infos.country_name"
@@ -3081,31 +3089,35 @@ class MongoDBData(MongoDB, DBData):
         self.db[self.colname_city_locations].drop()
         self.create_indexes()
 
-    def feed_country_codes(self, *_, **__):
-        """GeoIP Country database is used with MongoDB instead of a country
-code / name table
+    def parse_line_country_codes(self, line):
+        data = super(MongoDBData, self).parse_line_country_codes(line)
+        if 'code' in data:
+            data['country_code'] = data.pop('code')
+        return data
 
-        """
-        pass
+    def feed_country_codes(self, fname):
+        with open(fname, "rb") as fdesc:
+            self.db[self.colname_country_codes].insert(
+                self.parse_line_country_codes(line)
+                for line in fdesc
+            )
+        # Missing from iso3166.csv file but used in GeoIPCity-Location.csv
+        self.db[self.colname_country_codes].insert(
+            {'country_code': "AN", 'name': "Netherlands Antilles"}
+        )
 
     def feed_geoip_country(self, fname, feedipdata=None,
                            createipdata=False):
-        self.country_codes = {}
-        with open(fname) as fdesc:
+        with open(fname, "rb") as fdesc:
             self.db[self.colname_geoip_country].insert(
                 self.parse_line_country(line, feedipdata=feedipdata,
                                         createipdata=createipdata)
                 for line in fdesc
             )
-        self.db[self.colname_country_codes].insert(
-            {'country_code': code, 'name': name}
-            for code, name in self.country_codes.iteritems()
-        )
-        self.country_codes = None
 
     def feed_geoip_city(self, fname, feedipdata=None,
                         createipdata=False):
-        with open(fname) as fdesc:
+        with open(fname, "rb") as fdesc:
             # Skip the two first lines
             fdesc.readline()
             fdesc.readline()
@@ -3116,7 +3128,7 @@ code / name table
             )
 
     def feed_city_location(self, fname):
-        with open(fname) as fdesc:
+        with open(fname, "rb") as fdesc:
             # Skip the two first lines
             fdesc.readline()
             fdesc.readline()
@@ -3127,7 +3139,7 @@ code / name table
 
     def feed_geoip_asnum(self, fname, feedipdata=None,
                          createipdata=False):
-        with open(fname) as fdesc:
+        with open(fname, "rb") as fdesc:
             self.db[self.colname_geoip_as].insert(
                 self.parse_line_asnum(line, feedipdata=feedipdata,
                                       createipdata=createipdata)
@@ -3177,6 +3189,14 @@ code / name table
                             {'location_id': locid})
         if rec:
             del rec['_id'], rec['location_id']
+            if 'loc' in rec:
+                if 'coordinates' in rec['loc']:
+                    rec['coordinates'] = tuple(rec['loc']['coordinates'][::-1])
+                del rec['loc']
+            if 'country_code' in rec:
+                name = self.country_name_by_code(rec['country_code'])
+                if name:
+                    rec['country_name'] = name
         return rec
 
     def location_byip(self, addr):
@@ -3322,6 +3342,8 @@ class MongoDBAgent(MongoDB, DBAgent):
     def get_scan(self, scanid):
         scan = self.find_one(self.colname_scans, {"_id": scanid},
                              fields={'target': 0})
+        if scan.get('lock') is not None:
+            scan['lock'] = uuid.UUID(bytes=scan['lock'])
         if "target_info" not in scan:
             target = self.get_scan_target(scanid)
             if target is not None:
@@ -3338,6 +3360,10 @@ class MongoDBAgent(MongoDB, DBAgent):
         return None if scan is None else scan['target']
 
     def _lock_scan(self, scanid, oldlockid, newlockid):
+        """Change lock for scanid from oldlockid to newlockid. Returns the new
+scan object on success, and raises a LockError on failure.
+
+        """
         if oldlockid is not None:
             oldlockid = bson.Binary(oldlockid)
         if newlockid is not None:
@@ -3346,8 +3372,15 @@ class MongoDBAgent(MongoDB, DBAgent):
             "_id": scanid,
             "lock": oldlockid,
         }, {
-            "$set": {"lock": newlockid},
+            "$set": {"lock": newlockid, "pid": os.getpid()},
         }, full_response=True, fields={'target': False}, new=True)['value']
+        if scan is None:
+            if oldlockid is None:
+                raise LockError('Cannot acquire lock for %r' % scanid)
+            if newlockid is None:
+                raise LockError('Cannot release lock for %r' % scanid)
+            raise LockError('Cannot change lock for %r from '
+                            '%r to %r' % (scanid, oldlockid, newlockid))
         if "target_info" not in scan:
             target = self.get_scan_target(scanid)
             if target is not None:
@@ -3357,19 +3390,8 @@ class MongoDBAgent(MongoDB, DBAgent):
                     {"$set": {"target_info": target_info}},
                 )
                 scan["target_info"] = target_info
-        if scan is not None and scan['lock'] is not None:
-            scan['lock'] = str(scan['lock'])
-        return scan
-
-    def _unlock_scan(self, scanid, lockid):
-        scan = self.db[self.colname_scans].find_and_modify({
-            "_id": scanid,
-            "lock": bson.Binary(lockid),
-        }, {
-            "$set": {"lock": None}
-        }, full_response=True, new=True)['value']
-        if scan is not None and scan['lock'] is not None:
-            scan['lock'] = str(scan['lock'])
+        if scan['lock'] is not None:
+            scan['lock'] = bytes(scan['lock'])
         return scan
 
     def get_scans(self):

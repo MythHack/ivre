@@ -27,62 +27,32 @@ information about IP addresses (mostly from Maxmind GeoIP files).
 """
 
 
-import zlib
-import zipfile
-import urllib2
+from __future__ import print_function
+import functools
 import os.path
 import sys
-import functools
+try:
+    from urllib.request import build_opener
+except ImportError:
+    from urllib2 import build_opener
+import zipfile
+import zlib
+
+
+from builtins import range
+from future.utils import viewitems
 
 
 from ivre import utils, config
 
 
-URLS = {
-    # 'GeoIPCountry.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCountry/'
-    # 'GeoIP.dat.gz',
-    'GeoIPCountryCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/GeoIPCountryCSV.zip',
-    # 'GeoIPCity.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity.dat.gz',
-    'GeoIPCityCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity_CSV/'
-    'GeoLiteCity-latest.zip',
-    # 'GeoIPASNum.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNum.dat.gz',
-    'GeoIPASNumCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/asnum/GeoIPASNum2.zip',
-    # 'GeoIPCountryIPv6.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.dat.gz',
-    # 'GeoIPCountryIPv6.csv':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.csv.gz',
-    # 'GeoIPCityIPv6.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
-    # 'GeoLiteCityv6.dat.gz',
-    # 'GeoIPCityIPv6.csv':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
-    # 'GeoLiteCityv6.csv.gz',
-    # 'GeoIPASNumIPv6.dat':
-    # 'http://download.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNumv6.dat.gz',
-    # 'GeoIPASNumIPv6.csv':
-    # 'http://download.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNum2v6.zip',
-    'iso3166.csv': 'http://dev.maxmind.com/static/csv/codes/iso3166.csv',
-    # This one is not from maxmind -- see http://thyme.apnic.net/
-    'BGP.raw': 'http://thyme.apnic.net/current/data-raw-table',
-}
-
-
 def bgp_raw_to_csv(fname, out):
-    out = open(os.path.join(config.GEOIP_PATH, out), 'w')
+    out = open(os.path.join(config.GEOIP_PATH, out), 'wb')
     cur = []
-    with open(os.path.join(config.GEOIP_PATH, fname)) as fdesc:
+    with open(os.path.join(config.GEOIP_PATH, fname), 'rb') as fdesc:
         for line in fdesc:
-            start, stop = map(utils.ip2int,
-                              utils.net2range(line[:-1].split()[0]))
+            start, stop = (utils.ip2int(elt) for elt in
+                           utils.net2range(line[:-1].split()[0]))
             if cur:
                 if start >= cur[0] and stop <= cur[1]:
                     continue
@@ -101,18 +71,14 @@ def bgp_raw_to_csv(fname, out):
                 if stop == cur[0] + 1:
                     cur = [start, cur[1]]
                     continue
-                out.write('"%s","%s","%d","%d"\n' % (
-                    utils.int2ip(cur[0]),
-                    utils.int2ip(cur[1]),
-                    cur[0], cur[1]
-                ))
+                out.write(('"%s","%s","%d","%d"\n' % (
+                    utils.int2ip(cur[0]), utils.int2ip(cur[1]), cur[0], cur[1],
+                )).encode())
             cur = [start, stop]
     if cur:
-        out.write('"%s","%s","%d","%d"\n' % (
-            utils.int2ip(cur[0]),
-            utils.int2ip(cur[1]),
-            cur[0], cur[1]
-        ))
+        out.write(('"%s","%s","%d","%d"\n' % (
+            utils.int2ip(cur[0]), utils.int2ip(cur[1]), cur[0], cur[1],
+        )).encode())
 
 
 def unzip_all(fname):
@@ -122,7 +88,7 @@ def unzip_all(fname):
             continue
         with open(os.path.join(config.GEOIP_PATH,
                                os.path.basename(filedesc.filename)),
-                  'w') as wdesc:
+                  'wb') as wdesc:
             wdesc.write(zdesc.read(filedesc))
 
 
@@ -144,9 +110,9 @@ PARSERS = [
 
 def download_all(verbose=False):
     utils.makedirs(config.GEOIP_PATH)
-    opener = urllib2.build_opener()
+    opener = build_opener()
     opener.addheaders = [('User-agent', 'IVRE/1.0 +https://ivre.rocks/')]
-    for fname, url in URLS.iteritems():
+    for fname, url in viewitems(config.IPDATA_URLS):
         outfile = os.path.join(config.GEOIP_PATH, fname)
         if verbose:
             sys.stdout.write("Downloading %s to %s: " % (url, outfile))
@@ -155,7 +121,7 @@ def download_all(verbose=False):
             decode = zlib.decompress
         else:
             decode = lambda x: x
-        with open(outfile, 'w') as wdesc:
+        with open(outfile, 'wb') as wdesc:
             udesc = opener.open(url)
             wdesc.write(decode(udesc.read()))
             if verbose:
@@ -171,34 +137,34 @@ def download_all(verbose=False):
 
 def locids_by_city(country_code, city_name):
     with open(os.path.join(config.GEOIP_PATH,
-                           'GeoIPCity-Location.csv')) as fdesc:
-        for _ in xrange(2):
+                           'GeoIPCity-Location.csv'), 'rb') as fdesc:
+        for _ in range(2):
             fdesc.readline()
         for line in fdesc:
-            locid, country, _, city, _ = line[:-1].split(',', 4)
-            country = country.strip('"')
-            city = city.strip('"')
+            locid, country, _, city, _ = line[:-1].split(b',', 4)
+            country = country.strip(b'"').decode()
+            city = city.strip(b'"').decode('latin-1')
             if (country, city) == (country_code, city_name):
                 yield int(locid)
 
 
 def locids_by_region(country_code, region_code):
     with open(os.path.join(config.GEOIP_PATH,
-                           'GeoIPCity-Location.csv')) as fdesc:
-        for _ in xrange(2):
+                           'GeoIPCity-Location.csv'), 'rb') as fdesc:
+        for _ in range(2):
             fdesc.readline()
         for line in fdesc:
-            locid, country, region, _ = line[:-1].split(',', 3)
-            country = country.strip('"')
-            region = region.strip('"')
+            locid, country, region, _ = line[:-1].split(b',', 3)
+            country = country.strip(b'"').decode()
+            region = region.strip(b'"').decode()
             if (country, region) == (country_code, region_code):
                 yield int(locid)
 
 
 def parseline_country(line):
-    line = line.strip('\n"').split('","')
+    line = line.strip(b'\n"').split(b'","')
     try:
-        return int(line[2]), int(line[3]), line[4]
+        return int(line[2]), int(line[3]), line[4].decode()
     except Exception:
         utils.LOGGER.warning('Exception while reading line %r', line,
                              exc_info=True)
@@ -206,13 +172,13 @@ def parseline_country(line):
 
 
 def parseline_location(line):
-    line = line.strip('\n"').split('","')
+    line = line.strip(b'\n"').split(b'","')
     try:
         return int(line[0]), int(line[1]), int(line[2])
     except Exception:
-        if line[0].startswith('Copyright '):
+        if line[0].startswith(b'Copyright '):
             return None, None, None
-        elif line[0].startswith('startIpNum,'):
+        elif line[0].startswith(b'startIpNum,'):
             return None, None, None
         else:
             utils.LOGGER.warning('Exception while reading line %r', line,
@@ -221,15 +187,14 @@ def parseline_location(line):
 
 
 def parseline_asnum(line, withcomment=False):
-    line = line.strip('\n').split(',', 2)
+    line = line.strip(b'\n').split(b',', 2)
     try:
-        if line[2][0] == '"' and line[2][-1] == '"':
-            asnum = line[2][1:line[2].index(' ')]
-            ascomment = line[2][line[2].index(' ') + 1:-1]
+        if line[2][:1] == b'"' and line[2][-1:] == b'"':
+            asnum, ascomment = line[2][1:-1].split(b' ', 1)
         else:
             asnum = line[2]
             ascomment = None
-        if asnum.startswith('AS'):
+        if asnum.startswith(b'AS'):
             asnum = int(asnum[2:])
         else:
             raise Exception('asnum %r should start with AS' % asnum)
@@ -243,7 +208,7 @@ def parseline_asnum(line, withcomment=False):
 
 
 def parseline_routable(line):
-    line = line.strip('\n"').split('","')
+    line = line.strip(b'\n"').split(b'","')
     try:
         return int(line[2]), int(line[3]), True
     except Exception:
@@ -284,7 +249,7 @@ class IPRanges(object):
 
 def get_ranges_by_data(datafile, parseline, data, multiple=False):
     rnge = IPRanges()
-    with open(datafile) as fdesc:
+    with open(datafile, 'rb') as fdesc:
         for line in fdesc:
             start, stop, curdata = parseline(line)
             if (multiple and curdata in data) or curdata == data:
@@ -328,11 +293,11 @@ get_routable_ranges = functools.partial(
 def get_ips_by_data(datafile, parseline, data, skip=0, maxnbr=None,
                     multiple=False):
     res = []
-    with open(datafile) as fdesc:
+    with open(datafile, 'rb') as fdesc:
         for line in fdesc:
             start, stop, curdata = parseline(line)
             if (multiple and curdata in data) or curdata == data:
-                curaddrs = map(utils.int2ip, xrange(start, stop + 1))
+                curaddrs = [utils.int2ip(addr) for addr in range(start, stop + 1)]
                 if skip > 0:
                     skip -= len(curaddrs)
                     if skip <= 0:
@@ -386,7 +351,7 @@ get_routable_ips = functools.partial(
 
 def count_ips_by_data(datafile, parseline, data, multiple=False):
     res = 0
-    with open(datafile) as fdesc:
+    with open(datafile, 'rb') as fdesc:
         for line in fdesc:
             start, stop, curdata = parseline(line)
             if (multiple and curdata in data) or curdata == data:
@@ -435,12 +400,12 @@ def list_ips_by_data(datafile, parseline, data,
                              'when listall == False or listcidrs == True.')
     if listcidrs:
         listall = False
-    with open(datafile) as fdesc:
+    with open(datafile, 'rb') as fdesc:
         for line in fdesc:
             start, stop, curdata = parseline(line)
             if (multiple and curdata in data) or curdata == data:
                 if listall:
-                    curaddrs = map(utils.int2ip, xrange(start, stop + 1))
+                    curaddrs = [utils.int2ip(addr) for addr in range(start, stop + 1)]
                     if skip > 0:
                         skip -= len(curaddrs)
                         if skip <= 0:
@@ -452,15 +417,15 @@ def list_ips_by_data(datafile, parseline, data,
                         if maxnbr < 0:
                             curaddrs = curaddrs[:maxnbr]
                     for addr in curaddrs:
-                        print addr
+                        print(addr)
                     if maxnbr is not None and maxnbr <= 0:
                         return
                 elif listcidrs:
                     for net in utils.range2nets((start, stop)):
-                        print net
+                        print(net)
                 else:
-                    print "%s - %s" % (utils.int2ip(start),
-                                       utils.int2ip(stop))
+                    print("%s - %s" % (utils.int2ip(start), utils.int2ip(stop)))
+
 
 list_ips_by_country = functools.partial(
     list_ips_by_data,

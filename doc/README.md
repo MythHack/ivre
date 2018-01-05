@@ -30,8 +30,11 @@ environment, and what you want to do.
 
 IVRE relies on:
 
-  * [Python](http://www.python.org/) 2, version 2.6 minimum
-    * the [Crypto](http://www.pycrypto.org/) module
+  * [Python](http://www.python.org/) 2 (version 2.6 minimum), or 3
+    (version 3.3 minimum). Python 2.6 compatibility is important to
+    make sure IVRE works with RHEL and CentOS version 6.
+
+    * the [Crypto](http://www.pycrypto.org/) module.
     * the [pymongo](http://api.mongodb.org/python/) module,
       version 2.7.2 minimum.
     * optionally [PIL](http://www.pythonware.com/products/pil/), to
@@ -68,6 +71,9 @@ IVRE relies on:
     serving static files and run a Python-based CGI), although a test
     web server is now distributed with IVRE (`ivre httpd`).
 
+  * [Dokuwiki](https://www.dokuwiki.org/) or another Wiki to use as a
+    notepad. Dokuwiki can also be used to display the documentation.
+
   * a web browser (successfully tested with recent versions of
     [Firefox](https://www.mozilla.org/firefox/) and
     [Chromium](http://www.chromium.org/)).
@@ -76,13 +82,7 @@ IVRE relies on:
     free databases.
 
   * optionally [Tesseract](https://github.com/tesseract-ocr/tesseract),
-    if you plan to add screenshots to your Nmap scan results
-
-  * optionally [neo4j](https://neo4j.com/) (version >= 2) & [py2neo](http://py2neo.org)
-    (version >= 3) for ivre flow related tools
-
-  * optionally [argus](http://qosient.com/argus/index.shtml) and/or
-    [nfdump](http://nfdump.sourceforge.net/) for ivre flow2db
+    if you plan to add screenshots to your Nmap scan results.
 
   * optionally [Docker](http://www.docker.com/) &
     [Vagrant](https://www.vagrantup.com/) (version 1.6 minimum)
@@ -207,8 +207,8 @@ database).
 
 There is an alternative to installing IVRE on the scanning machine
 that allows to use several agents from one master. See the
-[AGENT](AGENT.md) file, the program `ivre runscansagent` for the
-master and the `agent/` directory in the source tree.
+[AGENT](AGENT.md) file, and the commands `ivre
+{runscansagent|runscansagentdb}` for the master.
 
 ## Using the results ##
 

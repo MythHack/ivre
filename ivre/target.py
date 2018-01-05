@@ -26,12 +26,18 @@ lists.
 """
 
 
+from functools import reduce
 import os
 import random
 import re
 import shlex
 import subprocess
 import tempfile
+
+
+from builtins import object
+from future.utils import viewvalues
+from past.builtins import basestring
 
 
 from ivre import utils, geoiputils, mathutils
@@ -101,7 +107,7 @@ class IterTarget(object):
     def getstate(self):
         return (self.previous, self.lcg_c, self.lcg_a, self.nextcount)
 
-    def next(self):
+    def __next__(self):
         if self.nextcount >= self.target.maxnbr:
             raise StopIteration
         self.nextcount += 1
@@ -262,7 +268,7 @@ class TargetFile(Target):
         except utils.socket.error:
             pass
 
-    def __init__(self, filename, categories=None, maxnbr=None):
+    def __init__(self, filename, categories=None, maxnbr=None, state=None):
         self.filename = filename
         if categories is None:
             categories = ['FILE-%s' % filename.replace('/', '_')]
@@ -280,9 +286,10 @@ class TargetFile(Target):
             self.maxnbr = self.targetscount
         else:
             self.maxnbr = maxnbr
+        self.state = state
 
     def __iter__(self):
-        return IterTargetFile(self, open(self.filename))
+        return IterTargetFile(self, open(self.filename), state=self.state)
 
     def close(self):
         pass
@@ -294,10 +301,20 @@ class IterTargetFile(object):
     def __iter__(self):
         return self
 
-    def __init__(self, target, fdesc):
+    def __init__(self, target, fdesc, state=None):
         self.target = target
         self.nextcount = 0
         self.fdesc = fdesc
+        if state is not None:
+            opened, seekval = state[:2]
+            if opened:
+                self.fdesc.seek(seekval)
+            else:
+                self.fdesc.closed()
+
+    def getstate(self):
+        opened = not self.fdesc.closed
+        return (int(opened), self.fdesc.tell() if opened else 0, 0, 0)
 
     def __readline__(self):
         line = self.fdesc.readline()
@@ -307,7 +324,7 @@ class IterTargetFile(object):
             raise StopIteration
         return self.target.__getaddr__(line)
 
-    def next(self):
+    def __next__(self):
         while True:
             addr = self.__readline__()
             if addr is not None:
@@ -331,7 +348,7 @@ class TargetZMapPreScan(TargetFile):
         self.infos['zmap_pre_scan'] = zmap_opts[:]
         zmap_opts = [zmap] + zmap_opts + ['-o', '-']
         self.tmpfile = tempfile.NamedTemporaryFile(delete=False)
-        for start, count in target.targets.ranges.itervalues():
+        for start, count in viewvalues(target.targets.ranges):
             for net in utils.range2nets((start, start + count - 1)):
                 self.tmpfile.write("%s\n" % net)
         self.tmpfile.close()
@@ -377,7 +394,7 @@ class TargetNmapPreScan(TargetZMapPreScan):
         # using a temporary file
         self.tmpfile = tempfile.NamedTemporaryFile(delete=False)
         nmap_opts = [nmap, '-iL', self.tmpfile.name, '-oG', '-'] + nmap_opts
-        for start, count in target.targets.ranges.itervalues():
+        for start, count in viewvalues(target.targets.ranges):
             for net in utils.range2nets((start, start + count - 1)):
                 self.tmpfile.write("%s\n" % net)
         self.tmpfile.close()
@@ -459,7 +476,8 @@ def target_from_args(args):
                                 state=args.state)
     elif args.file is not None:
         target = TargetFile(args.file,
-                            categories=args.categories)
+                            categories=args.categories,
+                            state=args.state)
     elif args.test is not None:
         target = TargetTest(args.test,
                             categories=args.categories,

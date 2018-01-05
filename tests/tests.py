@@ -17,38 +17,52 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 
+from __future__ import print_function
+
+
+from ast import literal_eval
 from contextlib import contextmanager
-from cStringIO import StringIO
 from distutils.spawn import find_executable as which
 import errno
+from functools import reduce
+from glob import glob
+from io import BytesIO
 import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
-import urllib2
+try:
+    from urllib.request import urlopen, Request
+except ImportError:
+    from urllib2 import Request, urlopen
 
+
+from builtins import int, range
+from future.utils import viewvalues
+from past.builtins import basestring
 if sys.version_info[:2] < (2, 7):
     import unittest2 as unittest
 else:
     import unittest
 
+
 HTTPD_PORT = 18080
-try:
-    HTTPD_HOSTNAME = socket.gethostbyaddr('127.0.0.1')[0]
-except:
-    sys.stderr.write('Cannot guess domain name - using localhost')
-    HTTPD_HOSTNAME = 'localhost'
+HTTPD_HOSTNAME = socket.gethostname()
+
 
 # http://schinckel.net/2013/04/15/capture-and-test-sys.stdout-sys.stderr-in-unittest.testcase/
 @contextmanager
 def capture(function, *args, **kwargs):
-    out, sys.stdout = sys.stdout, StringIO()
-    err, sys.stderr = sys.stderr, StringIO()
+    out, sys.stdout = sys.stdout, BytesIO()
+    err, sys.stderr = sys.stderr, BytesIO()
     result = function(*args, **kwargs)
     sys.stdout.seek(0)
     sys.stderr.seek(0)
@@ -79,10 +93,11 @@ def coverage_init():
     cov.erase()
 
 def coverage_run(cmd, stdin=None):
-    return run_cmd(cmd, interp=COVERAGE + ["run", "--parallel-mode"], stdin=stdin)
+    return run_cmd(cmd, interp=COVERAGE + ["run", "--parallel-mode"],
+                   stdin=stdin)
 
 def coverage_run_iter(cmd, stdin=None, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE):
+                      stderr=subprocess.PIPE):
     return run_iter(cmd, interp=COVERAGE + ["run", "--parallel-mode"],
                     stdin=stdin, stdout=stdout, stderr=stderr)
 
@@ -92,13 +107,114 @@ def coverage_report():
     cov.save()
 
 
+class AgentScanner(object):
+    """This builds an agent, runs it in the background, runs a feed
+process (also in the background) and provides an object that can be
+used to .scan() targets.
+
+Example:
+
+    with AgentScanner(self, nmap_template="http") as agent:
+        agent.scan(['--net', '192.168.0.0/24'])
+
+    """
+
+    def __init__(self, test, nmap_template="default"):
+        self.test = test
+        self.pid_agent = self.pid_feed = None
+        self._build_agent(nmap_template)
+        self._start_agent()
+        self._start_feed()
+
+    def __enter__(self):
+        return self
+
+    def __delete__(self):
+        self.stop()
+
+    def __exit__(self, *_):
+        self.wait()
+        self.stop()
+
+    def _build_agent(self, nmap_template):
+        res, out, _ = RUN(["ivre", "runscans", "--output", "Agent",
+                           "--nmap-template", nmap_template])
+        self.test.assertEqual(res, 0)
+        with tempfile.NamedTemporaryFile(delete=False) as fdesc:
+            fdesc.write(out)
+        os.chmod(fdesc.name, 0o0755)
+        self.agent = fdesc.name
+
+    def _start_agent(self):
+        self.agent_dir = tempfile.mkdtemp()
+        self.pid_agent = subprocess.Popen([self.agent],
+                                          preexec_fn=os.setsid,
+                                          cwd=self.agent_dir).pid
+
+    def _start_feed(self):
+        feed_cmd = ["runscansagent", "--sync", self.agent_dir]
+        if USE_COVERAGE:
+            feed_cmd = COVERAGE + ["run", "--parallel-mode",
+                                   which("ivre")] + feed_cmd
+        else:
+            feed_cmd = ["ivre"] + feed_cmd
+        self.pid_feed = subprocess.Popen(feed_cmd).pid
+
+    def stop(self):
+        """Kills the process backgrounded processes, moves the results to
+"output", and removes the temporary files and directories.
+
+        """
+        if self.pid_agent is not None:
+            os.kill(self.pid_agent, signal.SIGTERM)
+            os.waitpid(self.pid_agent, 0)
+            self.pid_agent = None
+        if self.pid_feed is not None:
+            os.kill(self.pid_feed, signal.SIGTERM)
+            os.waitpid(self.pid_feed, 0)
+            self.pid_feed = None
+        os.rename(os.path.join('agentsdata', 'output'), 'output')
+        for dirname in [self.agent_dir, 'agentsdata']:
+            if dirname is not None:
+                try:
+                    shutil.rmtree(dirname)
+                except OSError as exc:
+                    if exc.errno != errno.ENOENT:
+                        raise
+
+    def wait(self):
+        """Waits for current and scheduled scans to terminate.
+
+        """
+        dirnames = [
+            dirname for subdir in ['input', 'remoteinput', 'remotecur',
+                                   'remoteoutput', 'remotedata']
+            for dirname in glob(os.path.join("agentsdata", "*", subdir))
+        ]
+        dirnames.extend(os.path.join(self.agent_dir, subdir)
+                        for subdir in ['input', 'cur', 'output'])
+        while any(walk[2] for dirname in dirnames
+                  for walk in os.walk(dirname)):
+            print(u"Waiting for runscans sync & agent")
+            time.sleep(2)
+
+    def scan(self, target_options):
+        """Runs a scan. `target_options` should be a list of arguments to be
+passed to `ivre runscansagent --feed`.
+
+        """
+        res = RUN(["ivre", "runscansagent", "--feed"] + target_options +
+                  [self.agent_dir], stdin=open(os.devnull, 'wb'))[0]
+        self.test.assertEqual(res, 0)
+
+
 class IvreTests(unittest.TestCase):
 
     def setUp(self):
         try:
             with open(os.path.join(SAMPLES, "results")) as fdesc:
                 self.results = dict([l[:l.index(' = ')],
-                                     eval(l[l.index(' = ') + 3:-1])]
+                                     literal_eval(l[l.index(' = ') + 3:-1])]
                                     for l in fdesc if ' = ' in l)
         except IOError as exc:
             if exc.errno != errno.ENOENT:
@@ -137,13 +253,14 @@ class IvreTests(unittest.TestCase):
         res, out, err = RUN(cmd)
         self.assertTrue(errok or not err)
         self.assertEqual(res, 0)
-        self.check_value(name, out)
+        self.check_value(name, out.decode())
 
     def check_lines_value_cmd(self, name, cmd, errok=False):
         res, out, err = RUN(cmd)
         self.assertTrue(errok or not err)
         self.assertEqual(res, 0)
-        self.check_value(name, [line for line in out.split('\n') if line],
+        self.check_value(name, [line for line in out.decode().split('\n')
+                                if line],
                          check=self.assertItemsEqual)
 
     def check_int_value_cmd(self, name, cmd, errok=False):
@@ -160,7 +277,7 @@ class IvreTests(unittest.TestCase):
             self.children.append(pid)
             time.sleep(2)
         else:
-            def terminate(signum, stack_frame):
+            def terminate(signum, _):
                 try:
                     proc.send_signal(signum)
                     proc.wait()
@@ -170,7 +287,8 @@ class IvreTests(unittest.TestCase):
                     pass
             for sig in [signal.SIGINT, signal.SIGTERM]:
                 signal.signal(sig, terminate)
-            proc = RUN_ITER(["ivre", "httpd", "-p", str(HTTPD_PORT)],
+            proc = RUN_ITER(["ivre", "httpd", "-p", str(HTTPD_PORT),
+                             "-b", HTTPD_HOSTNAME],
                             stdout=open(os.devnull, 'w'),
                             stderr=subprocess.STDOUT)
             proc.wait()
@@ -198,17 +316,17 @@ class IvreTests(unittest.TestCase):
                              str(count)])
         self.assertTrue(not err)
         self.assertEqual(res, 0)
-        self.check_value(name, [line for line in out.split('\n') if line],
+        self.check_value(name, [line for line in out.decode().split('\n')
+                                if line],
                          check=self.assertItemsEqual)
 
     def _check_top_value_cgi(self, name, field, count):
-        req = urllib2.Request('http://%s:%d/cgi-bin/'
-                              'scanjson.py?action='
-                              'topvalues:%s:%d' % (HTTPD_HOSTNAME, HTTPD_PORT,
-                                                   field, count))
+        req = Request('http://%s:%d/cgi-bin/scanjson.py?action='
+                      'topvalues:%s:%d' % (HTTPD_HOSTNAME, HTTPD_PORT,
+                                           field, count))
         req.add_header('Referer',
                        'http://%s:%d/' % (HTTPD_HOSTNAME, HTTPD_PORT))
-        self.check_value(name, json.loads(urllib2.urlopen(req).read()),
+        self.check_value(name, json.loads(urlopen(req).read().decode()),
                          check=self.assertItemsEqual)
 
     def check_top_value(self, name, field, count=10):
@@ -239,31 +357,34 @@ class IvreTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.stop_children()
 
+    def init_nmap_db(self):
+        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], b"0\n")
+        self.assertEqual(RUN(["ivre", "scancli", "--init"],
+                             stdin=open(os.devnull))[0], 0)
+        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], b"0\n")
+
     def test_nmap(self):
 
         # Start a Web server to test CGI
         self.start_web_server()
 
         # Init DB
-        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], "0\n")
-        self.assertEqual(RUN(["ivre", "scancli", "--init"],
-                              stdin=open(os.devnull))[0], 0)
-        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], "0\n")
+        self.init_nmap_db()
 
         # Insertion / "test" insertion (JSON output)
         host_counter = 0
         scan_counter = 0
         host_counter_test = 0
         scan_warning = 0
-        host_stored = re.compile("^DEBUG:ivre:HOST STORED: ", re.M)
-        scan_stored = re.compile("^DEBUG:ivre:SCAN STORED: ", re.M)
+        host_stored = re.compile(b"^DEBUG:ivre:HOST STORED: ", re.M)
+        scan_stored = re.compile(b"^DEBUG:ivre:SCAN STORED: ", re.M)
         def host_stored_test(line):
             try:
-                return len(json.loads(line))
+                return len(json.loads(line.decode()))
             except ValueError:
                 return 0
-        scan_duplicate = re.compile("^DEBUG:ivre:Scan already present in "
-                                    "Database", re.M)
+        scan_duplicate = re.compile(b"^DEBUG:ivre:Scan already present in "
+                                    b"Database", re.M)
         for fname in self.nmap_files:
             # Insertion in DB
             options = ["ivre", "scan2db", "--port", "-c", "TEST",
@@ -288,6 +409,89 @@ class IvreTests(unittest.TestCase):
             scan_warning += sum(
                 1 for _ in scan_duplicate.finditer(err)
             )
+
+        # Specific test cases
+        ##
+        samples = [
+            ## Ignored script with a named table element, followed by
+            ## a script with an unamed table element
+            b"""<nmaprun scanner="nmap">
+<host>
+<script id="fcrdns" output="FAIL (No PTR record)">
+<table key="&lt;none&gt;">
+<elem key="status">fail</elem>
+<elem key="reason">No PTR record</elem>
+</table>
+</script>
+<script id="fake" output="Test output for fake script">
+<elem>fake</elem>
+</script>
+</host>
+</nmaprun>
+""",
+            ## Masscan with an HTTP banner
+            b"""<nmaprun scanner="masscan">
+<host>
+<ports>
+<port protocol="tcp" portid="80">
+<state state="open"/>
+<service name="http" banner="HTTP/1.1 403 Forbidden\\x0d\\x0aServer: test/1.0\\x0d\\x0a\\x0d\\x0a">
+</service>
+</port>
+</ports>
+</host>
+</nmaprun>
+""",
+        ]
+        for sample in samples:
+            fdesc = tempfile.NamedTemporaryFile(delete=False)
+            fdesc.write(sample)
+            fdesc.close()
+            res, out, _ = RUN(["ivre", "scan2db", "--test", fdesc.name])
+            self.assertEqual(res, 0)
+            self.assertEqual(sum(host_stored_test(line)
+                                 for line in out.splitlines()), 1)
+            os.unlink(fdesc.name)
+        ##
+        ## Screenshots: this tests the http-screenshot script
+        ## (including phantomjs) and IVRE's ability to read
+        ## screenshots (including extracting words with tesseract)
+        ipaddr = socket.gethostbyname('ivre.rocks')
+        with AgentScanner(self, nmap_template="http") as agent:
+            agent.scan(['--net', '%s/32' % ipaddr])
+        data_files, up_files = (
+            glob("%s.%s*" % (os.path.join('output', 'MISC', subdir,
+                                         '*', *ipaddr.split('.')), ext))
+            for subdir, ext in [('data', 'tar'), ('up', 'xml')]
+        )
+        self.assertEqual(len(data_files), 1)
+        self.assertTrue(os.path.exists(data_files[0]))
+        self.assertEqual(len(up_files), 1)
+        self.assertTrue(os.path.exists(up_files[0]))
+        # TarFile object does not implement __exit__ on Python 2.6,
+        # cannot use `with`
+        data_archive = tarfile.open(data_files[0])
+        data_archive.extractall()
+        data_archive.close()
+        self.assertTrue(os.path.exists('screenshot-%s-80.jpg' % ipaddr))
+        res, out, _ = RUN(["ivre", "scan2db", "--test"] + up_files)
+        self.assertEqual(res, 0)
+        def _json_loads(data, deflt=None):
+            try:
+                return json.loads(data.decode())
+            except ValueError:
+                return deflt
+        screenshots_count = sum(bool(port.get('screendata'))
+                                for line in out.splitlines()
+                                for host in _json_loads(line, [])
+                                for port in host.get('ports', []))
+        self.assertEqual(screenshots_count, 1)
+        screenwords = set(word for line in out.splitlines()
+                          for host in _json_loads(line, [])
+                          for port in host.get('ports', [])
+                          for word in port.get('screenwords', []))
+        self.assertTrue('IVRE' in screenwords)
+        shutil.rmtree('output')
 
         RUN(["ivre", "scancli", "--update-schema"])
         RUN(["ivre", "scancli", "--update-schema", "--archives"])
@@ -317,10 +521,10 @@ class IvreTests(unittest.TestCase):
         # Object ID
         res, out, _ = RUN(["ivre", "scancli", "--json", "--limit", "1"])
         self.assertEqual(res, 0)
-        oid = str(ivre.db.db.nmap.get(
-            ivre.db.db.nmap.searchhost(json.loads(out)['addr']),
+        oid = str(next(ivre.db.db.nmap.get(
+            ivre.db.db.nmap.searchhost(json.loads(out.decode())['addr']),
             limit=1, fields=["_id"],
-        ).next()['_id'])
+        ))['_id'])
         res, out, _ = RUN(["ivre", "scancli", "--count", "--id", oid])
         self.assertEqual(res, 0)
         self.assertEqual(int(out), 1)
@@ -359,16 +563,16 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(portsnb_10_100 + portsnb_not_10_100, host_counter)
 
         # Filters
-        addr = ivre.db.db.nmap.get(
+        addr = next(ivre.db.db.nmap.get(
             ivre.db.db.nmap.flt_empty, fields=["addr"]
-        ).next()['addr']
+        ))['addr']
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchhost(addr)
         )
         self.assertEqual(count, 1)
-        result = ivre.db.db.nmap.get(
+        result = next(ivre.db.db.nmap.get(
             ivre.db.db.nmap.searchhost(addr)
-        ).next()
+        ))
         self.assertEqual(result['addr'], addr)
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.flt_and(
             ivre.db.db.nmap.searchhost(addr),
@@ -376,9 +580,9 @@ class IvreTests(unittest.TestCase):
         ))
         self.assertEqual(count, 1)
         # Remove
-        result = ivre.db.db.nmap.get(
+        result = next(ivre.db.db.nmap.get(
             ivre.db.db.nmap.searchhost(addr)
-        ).next()
+        ))
         ivre.db.db.nmap.remove(result)
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchhost(addr)
@@ -386,7 +590,7 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(count, 0)
         hosts_count -= 1
         recid = ivre.db.db.nmap.getid(
-            ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty).next()
+            next(ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty))
         )
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchid(recid)
@@ -395,7 +599,7 @@ class IvreTests(unittest.TestCase):
         self.assertIsNotNone(
             ivre.db.db.nmap.getscan(
                 ivre.db.db.nmap.getscanids(
-                    ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty).next()
+                    next(ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty))
                 )[0]
             )
         )
@@ -406,8 +610,8 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
         generator = ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty)
-        addrrange = sorted((x['addr'] for x in [generator.next(),
-                                                generator.next()]),
+        addrrange = sorted((x['addr'] for x in [next(generator),
+                                                next(generator)]),
                            key=lambda x: (ivre.utils.ip2int(x)
                                           if isinstance(x, basestring) else x))
         addr_range_count = ivre.db.db.nmap.count(
@@ -437,8 +641,8 @@ class IvreTests(unittest.TestCase):
         count = sum(
             ivre.db.db.nmap.count(ivre.db.db.nmap.searchnet(net))
             for net in ivre.utils.range2nets(
-                    [x if isinstance(x, basestring) else ivre.utils.int2ip(x)
-                     for x in addrrange]
+                [x if isinstance(x, basestring) else ivre.utils.int2ip(x)
+                 for x in addrrange]
             )
         )
         self.assertEqual(count, addr_range_count)
@@ -450,7 +654,7 @@ class IvreTests(unittest.TestCase):
                  for x in addrrange]
             )
             for addr in ivre.db.db.nmap.distinct(
-                    "addr", flt=ivre.db.db.nmap.searchnet(net),
+                "addr", flt=ivre.db.db.nmap.searchnet(net),
             )
         )
         self.assertTrue(len(addrs) <= addr_range_count)
@@ -466,11 +670,11 @@ class IvreTests(unittest.TestCase):
 
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchtimerange(
-                0, ivre.db.db.nmap.get(
+                0, next(ivre.db.db.nmap.get(
                     ivre.db.db.nmap.flt_empty,
                     fields=['endtime'],
                     sort=[['endtime', -1]]
-                ).next()['endtime']
+                ))['endtime']
             )
         )
         self.assertEqual(count, hosts_count)
@@ -481,8 +685,8 @@ class IvreTests(unittest.TestCase):
             count += ivre.db.db.nmap.count(
                 ivre.db.db.nmap.searchnet(net)
             )
-            start, stop = map(ivre.utils.ip2int,
-                              ivre.utils.net2range(net))
+            start, stop = (ivre.utils.ip2int(addr) for addr in
+                           ivre.utils.net2range(net))
             for addr in ivre.db.db.nmap.distinct(
                     "addr",
                     flt=ivre.db.db.nmap.searchnet(net),
@@ -519,7 +723,7 @@ class IvreTests(unittest.TestCase):
         result = ivre.db.db.nmap.get(
             ivre.db.db.nmap.searchscript(name="http-robots.txt")
         )
-        addr = result.next()['addr']
+        addr = next(result)['addr']
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.flt_and(
             ivre.db.db.nmap.searchscript(name="http-robots.txt"),
             ivre.db.db.nmap.searchhost(addr),
@@ -550,7 +754,7 @@ class IvreTests(unittest.TestCase):
         hop = random.choice([
             hop for hop in
             reduce(lambda x, y: x['hops'] + y['hops'],
-                   result.next()['traces'],
+                   next(result)['traces'],
                    {'hops': []})
             if 'domains' in hop and hop['domains']
         ])
@@ -564,9 +768,9 @@ class IvreTests(unittest.TestCase):
         self.assertGreaterEqual(count, 1)
 
         # Indexes
-        addr = ivre.db.db.nmap.get(
+        addr = next(ivre.db.db.nmap.get(
             ivre.db.db.nmap.flt_empty
-        ).next()['addr']
+        ))['addr']
         if not isinstance(addr, basestring):
             addr = ivre.utils.int2ip(addr)
         queries = [
@@ -638,9 +842,9 @@ class IvreTests(unittest.TestCase):
                                          neg=True)
         )
         self.check_value("nmap_not_domain_com_or_net_count", count)
-        name = ivre.db.db.nmap.get(ivre.db.db.nmap.searchdomain(
+        name = next(ivre.db.db.nmap.get(ivre.db.db.nmap.searchdomain(
             'com'
-        )).next()['hostnames'][0]['name']
+        )))['hostnames'][0]['name']
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchhostname(name))
         self.assertGreater(count, 0)
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchcategory("TEST"))
@@ -747,53 +951,53 @@ class IvreTests(unittest.TestCase):
                              ["ivre", "scancli", "--top", "version:http:Apache httpd"])
 
         categories = ivre.db.db.nmap.topvalues("category")
-        category = categories.next()
+        category = next(categories)
         self.assertEqual(category["_id"], "TEST")
         self.assertEqual(category["count"], hosts_count)
         with self.assertRaises(StopIteration):
-            categories.next()
+            next(categories)
         topgen = ivre.db.db.nmap.topvalues("service")
-        topval = topgen.next()['_id']
+        topval = next(topgen)['_id']
         while topval is None:
-            topval = topgen.next()['_id']
+            topval = next(topgen)['_id']
         self.check_value("nmap_topsrv", topval)
         topgen = ivre.db.db.nmap.topvalues("service:80")
-        topval = topgen.next()['_id']
+        topval = next(topgen)['_id']
         while topval is None:
-            topval = topgen.next()['_id']
+            topval = next(topgen)['_id']
         self.check_value("nmap_topsrv_80", topval)
         topgen = ivre.db.db.nmap.topvalues("product")
-        topval = topgen.next()['_id']
+        topval = next(topgen)['_id']
         while topval[1] is None:
-            topval = list(topgen.next()['_id'])
+            topval = list(next(topgen)['_id'])
         self.check_value("nmap_topprod", topval)
         topgen = ivre.db.db.nmap.topvalues("product:80")
-        topval = list(topgen.next()['_id'])
+        topval = list(next(topgen)['_id'])
         while topval[1] is None:
-            topval = list(topgen.next()['_id'])
+            topval = list(next(topgen)['_id'])
         self.check_value("nmap_topprod_80", topval)
         topgen = ivre.db.db.nmap.topvalues("devicetype")
-        topval = topgen.next()['_id']
+        topval = next(topgen)['_id']
         while topval is None:
-            topval = topgen.next()['_id']
+            topval = next(topgen)['_id']
         self.check_value("nmap_topdevtype", topval)
         topgen = ivre.db.db.nmap.topvalues("devicetype:80")
-        topval = topgen.next()['_id']
+        topval = next(topgen)['_id']
         while topval is None:
-            topval = topgen.next()['_id']
+            topval = next(topgen)['_id']
         self.check_value("nmap_topdevtype_80", topval)
         self.check_value(
             "nmap_topdomain",
-            ivre.db.db.nmap.topvalues("domains").next()['_id'])
+            next(ivre.db.db.nmap.topvalues("domains"))['_id'])
         self.check_value(
             "nmap_topdomains_1",
-            ivre.db.db.nmap.topvalues("domains:1").next()['_id'])
+            next(ivre.db.db.nmap.topvalues("domains:1"))['_id'])
         self.check_value(
             "nmap_tophop",
-            ivre.db.db.nmap.topvalues("hop").next()['_id'])
+            next(ivre.db.db.nmap.topvalues("hop"))['_id'])
         self.check_value(
             "nmap_tophop_10+",
-            ivre.db.db.nmap.topvalues("hop>10").next()['_id'])
+            next(ivre.db.db.nmap.topvalues("hop>10"))['_id'])
 
         if DATABASE != "postgres":
             # FIXME: for some reason, this does not terminate
@@ -803,34 +1007,22 @@ class IvreTests(unittest.TestCase):
     def test_passive(self):
 
         # Init DB
-        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], b"0\n")
         self.assertEqual(RUN(["ivre", "ipinfo", "--init"],
                              stdin=open(os.devnull))[0], 0)
-        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], "0\n")
+        self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], b"0\n")
 
         # p0f & Bro insertion
         ivre.utils.makedirs("logs")
         broenv = os.environ.copy()
         broenv["LOG_ROTATE"] = "60"
-        broenv["LOG_PATH"] = "logs/passiverecon"
+        broenv["LOG_PATH"] = "logs/TEST"
 
         for fname in self.pcap_files:
-            for mode in ivre.passive.P0F_MODES.values():
-                p0fprocess = subprocess.Popen(
-                    ['p0f', '-q', '-l', '-S', '-ttt', '-s',
-                     fname] + mode['options'] + [mode['filter']],
-                    stdout=subprocess.PIPE, stderr=open(os.devnull, 'w')
-                )
-                for line in p0fprocess.stdout:
-                    timestamp, spec = ivre.passive.parse_p0f_line(
-                        line,
-                        include_port=(mode['name'] == 'SYN+ACK')
-                    )
-                    spec['sensor'] = "TEST"
-                    spec['recontype'] = 'P0F2-%s' % mode['name']
-                    self.assertIsNone(
-                        ivre.db.db.passive.insert_or_update(
-                            timestamp, spec))
+            for mode in ivre.passive.P0F_MODES:
+                res = RUN(["ivre", "p0f2db", "-s", "TEST", "-m", mode,
+                           fname])[0]
+                self.assertEqual(res, 0)
             broprocess = subprocess.Popen(
                 ['bro', '-b', '-r', fname,
                  os.path.join(
@@ -840,20 +1032,27 @@ class IvreTests(unittest.TestCase):
             broprocess.wait()
 
         time.sleep(1) # Hack for Travis CI
-        for root, _, files in os.walk("logs"):
-            for fname in files:
-                with open(os.path.join(root, fname)) as fdesc:
-                    for line in fdesc:
-                        if not line or line.startswith('#'):
-                            continue
-                        line.rstrip('\n')
-                        timestamp, spec = ivre.passive.handle_rec(
-                            "TEST", {}, {}, *line.split('\t'))
-                        if spec is not None:
-                            ivre.db.db.passive.insert_or_update(
-                                timestamp, spec,
-                                getinfos=ivre.passive.getinfos
-                            )
+        pid = os.fork()
+        if pid < 0:
+            raise Exception("Cannot fork")
+        elif pid:
+            # Wait for child process to handle every file in "logs"
+            while any(walk[2] for walk in os.walk("logs")):
+                print(u"Waiting for passivereconworker")
+                time.sleep(2)
+            os.kill(pid, signal.SIGINT)
+            os.waitpid(pid, 0)
+        elif USE_COVERAGE:
+            os.execvp(
+                sys.executable,
+                COVERAGE + [
+                    "run", "--parallel-mode", which("ivre"),
+                    "passivereconworker", "--directory", "logs",
+                ],
+            )
+        else:
+            os.execlp("ivre", "ivre", "passivereconworker", "--directory",
+                      "logs")
 
         # Counting
         total_count = ivre.db.db.passive.count(
@@ -883,7 +1082,7 @@ class IvreTests(unittest.TestCase):
         ])
         self.assertEqual(ret, 0)
         self.assertTrue(not err)
-        self.assertGreater(out.count('\n'), result)
+        self.assertGreater(out.count(b'\n'), result)
 
         result = ivre.db.db.passive.count(
             ivre.db.db.passive.searchhost("127.12.34.56")
@@ -892,7 +1091,7 @@ class IvreTests(unittest.TestCase):
 
         addrrange = sorted(
             (x for x in ivre.db.db.passive.distinct('addr')
-             if isinstance(x, (int, long, basestring)) and x),
+             if isinstance(x, (int, basestring)) and x),
             key=lambda x: (ivre.utils.ip2int(x)
                            if isinstance(x, basestring) else x),
         )
@@ -952,8 +1151,8 @@ class IvreTests(unittest.TestCase):
                 ivre.db.db.passive.searchnet(net)
             )
             count += result
-            start, stop = map(ivre.utils.ip2int,
-                              ivre.utils.net2range(net))
+            start, stop = (ivre.utils.ip2int(addr) for addr in
+                           ivre.utils.net2range(net))
             for addr in ivre.db.db.passive.distinct(
                     "addr",
                     flt=ivre.db.db.passive.searchnet(net),
@@ -1019,9 +1218,9 @@ class IvreTests(unittest.TestCase):
 
         # Top values
         for distinct in [True, False]:
-            values = ivre.db.db.passive.topvalues(field="addr",
-                                                  distinct=distinct,
-                                                  topnbr=1).next()
+            values = next(ivre.db.db.passive.topvalues(field="addr",
+                                                       distinct=distinct,
+                                                       topnbr=1))
             self.check_value(
                 "passive_top_addr_%sdistinct" % ("" if distinct else "not_"),
                 ivre.utils.ip2int(values["_id"])
@@ -1045,8 +1244,190 @@ class IvreTests(unittest.TestCase):
         )
         self.assertEqual(count + new_count, total_count)
 
+        ret, out, _ = RUN(["ivre", "ipinfo", "--short"])
+        self.assertEqual(ret, 0)
+        count = sum(1 for _ in out.splitlines())
+        self.check_value("passive_ipinfo_short_count", count)
+
+        ret, out, _ = RUN(["ivre", "iphost", "/./"])
+        self.assertEqual(ret, 0)
+        count = sum(1 for _ in out.splitlines())
+        self.check_value("passive_iphost_count", count)
+
+        ret, out, _ = RUN(["ivre", "iphost", "--sub", "com"])
+        self.assertEqual(ret, 0)
+        count = sum(1 for _ in out.splitlines())
+        self.check_value("passive_iphost_count_com", count)
+
         self.assertEqual(RUN(["ivre", "ipinfo", "--init"],
-                              stdin=open(os.devnull))[0], 0)
+                             stdin=open(os.devnull))[0], 0)
+        # Clean
+        shutil.rmtree("logs")
+
+
+    def test_data(self):
+        """ipdata (Maxmind, thyme.apnic.net) functions"""
+
+        # Init DB
+        res, out, _ = RUN(["ivre", "ipdata", "8.8.8.8"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b"8.8.8.8\n")
+        res = RUN(["ivre", "ipdata", "--init"], stdin=open(os.devnull))[0]
+        self.assertEqual(res, 0)
+        res, out, _ = RUN(["ivre", "ipdata", "8.8.8.8"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b"8.8.8.8\n")
+
+        # Download
+        res = RUN(["ivre", "ipdata", "--download"])[0]
+        self.assertEqual(res, 0)
+
+        # Insert
+        res = RUN(["ivre", "ipdata", "--import-all",
+                   "--no-update-passive-db"])[0]
+        self.assertEqual(res, 0)
+
+        res, out, _ = RUN(["ivre", "ipdata", "8.8.8.8"])
+        self.assertEqual(res, 0)
+        # The order may differ, depending on the backend.  We need to
+        # replace float representations because it differs between
+        # Python 2.6 and other supported Python version; see
+        # <https://docs.python.org/2/whatsnew/2.7.html#python-3-1-features>.
+        out = sorted(
+            b'    coordinates (37.751, -97.822)' if
+            x == b'    coordinates (37.750999999999998, -97.822000000000003)'
+            else x for x in out.splitlines()
+        )
+        self.assertEqual(out, sorted(b'''8.8.8.8
+    as_num 15169
+    as_name Google Inc.
+    coordinates (37.751, -97.822)
+    country_code US
+    country_name United States
+'''.splitlines()))
+
+        res, out, _ = RUN(["ivre", "runscans", "--output", "Count", "--asnum", "15169"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b'AS15169 has 2685951 IPs.\n')
+        res, out, _ = RUN(["ivre", "runscans", "--output", "Count", "--country", "US"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b'US has 1595080627 IPs.\n')
+        res, out, _ = RUN(["ivre", "runscans", "--output", "List", "--country", "A2"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b'''5.145.149.142 - 5.145.149.142
+57.72.6.0 - 57.72.6.255
+62.56.206.0 - 62.56.206.255
+62.128.160.0 - 62.128.160.255
+62.128.167.0 - 62.128.167.255
+62.145.35.0 - 62.145.35.255
+77.220.0.0 - 77.220.7.255
+78.41.29.0 - 78.41.29.255
+78.41.227.0 - 78.41.227.255
+80.78.16.152 - 80.78.16.167
+80.78.16.192 - 80.78.16.207
+80.78.16.224 - 80.78.16.224
+80.78.19.57 - 80.78.19.63
+80.78.19.233 - 80.78.19.239
+80.231.5.0 - 80.231.5.255
+82.206.239.0 - 82.206.239.255
+83.229.22.0 - 83.229.22.255
+84.22.67.0 - 84.22.67.255
+86.62.5.0 - 86.62.5.255
+86.62.30.0 - 86.62.30.255
+87.234.247.0 - 87.234.247.255
+93.93.101.96 - 93.93.101.127
+93.93.102.96 - 93.93.102.127
+111.90.150.0 - 111.90.150.255
+185.38.108.0 - 185.38.108.255
+196.15.8.0 - 196.15.8.255
+196.15.10.0 - 196.15.11.255
+196.47.77.0 - 196.47.78.255
+196.201.132.0 - 196.201.132.255
+196.201.135.0 - 196.201.135.255
+196.201.148.0 - 196.201.148.255
+199.190.44.0 - 199.190.47.255
+213.193.49.0 - 213.193.49.255
+216.147.155.0 - 216.147.155.255
+217.30.26.0 - 217.30.26.255
+217.175.75.0 - 217.175.75.255
+''')
+        res, out, _ = RUN(["ivre", "runscans", "--output", "ListCIDRs", "--country", "A1"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out, b'''31.14.133.39/32
+37.221.172.0/23
+46.19.137.0/24
+46.19.143.0/24
+50.7.78.88/31
+62.73.8.0/23
+63.235.155.210/32
+64.12.118.23/32
+64.12.118.88/32
+67.43.156.0/24
+69.10.139.0/24
+70.232.245.0/24
+74.82.9.224/32
+80.254.74.0/23
+93.115.82.0/23
+93.115.84.0/23
+96.47.226.20/32
+147.203.120.0/24
+176.9.75.43/32
+185.36.100.145/32
+192.238.21.0/24
+193.107.17.71/32
+193.200.150.0/24
+198.144.105.88/32
+199.114.223.0/24
+199.188.236.0/23
+200.200.200.200/32
+206.71.162.0/24
+206.196.103.0/24
+208.43.225.52/32
+209.216.198.0/24
+213.234.249.115/32
+216.151.180.0/24
+''')
+        # ListAll and ListAllRand use different mechanisms
+        res, out1, _ = RUN(["ivre", "runscans", "--output", "ListAll",
+                            "--country", "A1"])
+        self.assertEqual(res, 0)
+        res, out2, _ = RUN(["ivre", "runscans", "--output", "ListAllRand",
+                            "--country", "A1"])
+        self.assertEqual(res, 0)
+        out1, out2 = out1.split(b'\n'), out2.split(b'\n')
+        self.assertGreater(len(out1), 0)
+        self.assertItemsEqual(out1, out2)
+        res, out1, _ = RUN(["ivre", "runscans", "--output", "ListAll",
+                            "--region", "GP", "R5"])
+        self.assertEqual(res, 0)
+        res, out2, _ = RUN(["ivre", "runscans", "--output", "ListAllRand",
+                            "--region", "GP", "R5"])
+        self.assertEqual(res, 0)
+        out1, out2 = out1.split(b'\n'), out2.split(b'\n')
+        self.assertGreater(len(out1), 0)
+        self.assertItemsEqual(out1, out2)
+        res, out1, _ = RUN(["ivre", "runscans", "--output", "ListAll",
+                            "--city", "FR", "Carcassonne"])
+        self.assertEqual(res, 0)
+        res, out2, _ = RUN(["ivre", "runscans", "--output", "ListAllRand",
+                            "--city", "FR", "Carcassonne"])
+        self.assertEqual(res, 0)
+        out1, out2 = out1.split(b'\n'), out2.split(b'\n')
+        self.assertGreater(len(out1), 0)
+        self.assertItemsEqual(out1, out2)
+        res, out1, _ = RUN(["ivre", "runscans", "--output", "ListAll",
+                            "--asnum", "12345"])
+        self.assertEqual(res, 0)
+        res, out2, _ = RUN(["ivre", "runscans", "--output", "ListAllRand",
+                            "--asnum", "12345"])
+        self.assertEqual(res, 0)
+        out1, out2 = out1.split(b'\n'), out2.split(b'\n')
+        self.assertGreater(len(out1), 0)
+        self.assertItemsEqual(out1, out2)
+
+        # Clean
+        res = RUN(["ivre", "ipdata", "--init"], stdin=open(os.devnull))[0]
+        self.assertEqual(res, 0)
 
     def test_utils(self):
         """Functions that have not yet been tested"""
@@ -1073,16 +1454,16 @@ class IvreTests(unittest.TestCase):
             ivre.utils.range2nets((2, 1))
 
         # String utils
-        teststr = "TEST STRING -./*'"
+        teststr = b"TEST STRING -./*'"
         self.assertEqual(ivre.utils.regexp2pattern(teststr),
                          (re.escape(teststr), 0))
         self.assertEqual(
             ivre.utils.regexp2pattern(
-                re.compile('^' + re.escape(teststr) + '$')),
+                re.compile(b'^' + re.escape(teststr) + b'$')),
             (re.escape(teststr), 0))
         self.assertEqual(
             ivre.utils.regexp2pattern(re.compile(re.escape(teststr))),
-            ('.*' + re.escape(teststr) + '.*', 0))
+            (b'.*' + re.escape(teststr) + b'.*', 0))
         self.assertEqual(ivre.utils.str2list(teststr), teststr)
         teststr = "1,2|3"
         self.assertItemsEqual(ivre.utils.str2list(teststr),
@@ -1093,7 +1474,7 @@ class IvreTests(unittest.TestCase):
         self.assertFalse(ivre.utils.isfinal({}))
 
         # Nmap ports
-        ports = [1,3,2,4,6,80,5,5,110,111]
+        ports = [1, 3, 2, 4, 6, 80, 5, 5, 110, 111]
         self.assertEqual(
             set(ports),
             ivre.utils.nmapspec2ports(ivre.utils.ports2nmapspec(ports))
@@ -1124,23 +1505,283 @@ class IvreTests(unittest.TestCase):
         # Math utils
         # http://stackoverflow.com/a/15285588/3223422
         def is_prime(n):
-            if n == 2 or n == 3: return True
-            if n < 2 or n % 2 == 0: return False
-            if n < 9: return True
-            if n % 3 == 0: return False
+            if n == 2 or n == 3:
+                return True
+            if n < 2 or n % 2 == 0:
+                return False
+            if n < 9:
+                return True
+            if n % 3 == 0:
+                return False
             r = int(n**0.5)
             f = 5
             while f <= r:
-                if n % f == 0: return False
-                if n % (f + 2) == 0: return False
+                if n % f == 0:
+                    return False
+                if n % (f + 2) == 0:
+                    return False
                 f += 6
             return True
-        for _ in xrange(3):
+        for _ in range(3):
             nbr = random.randint(2, 1000)
             factors = list(ivre.mathutils.factors(nbr))
             self.assertTrue(is_prime(nbr) or len(factors) > 1)
             self.assertTrue(all(is_prime(x) for x in factors))
             self.assertEqual(reduce(lambda x, y: x * y, factors), nbr)
+
+        # Bro logs
+        basepath = os.getenv('BRO_SAMPLES')
+        badchars = re.compile('[%s]' % ''.join(
+            re.escape(char) for char in [os.path.sep, '-', '.']
+        ))
+        if basepath:
+            for dirname, _, fnames in os.walk(basepath):
+                for fname in fnames:
+                    if not fname.endswith('.log'):
+                        continue
+                    fname = os.path.join(dirname, fname)
+                    brofd = ivre.parser.bro.BroFile(fname)
+                    i = 0
+                    for i, record in enumerate(brofd):
+                        json.dumps(record, default=ivre.utils.serialize)
+                    self.check_value(
+                        'utils_bro_%s_count' % badchars.sub(
+                            '_',
+                            fname[len(basepath):-4].lstrip('/'),
+                        ),
+                        i + 1,
+                    )
+
+    def test_scans(self):
+        "Run scans, with and without agents"
+
+        # Check simple runscans
+        res, out, _ = RUN(["ivre", "runscans", "--output", "Test", "--test",
+                           "2"])
+        self.assertEqual(res, 0)
+        self.assertTrue(b'\nRead address 127.0.0.1\n' in out)
+        self.assertTrue(b'\nRead address 127.0.0.2\n' in out)
+        res = RUN(["ivre", "runscans", "--network", "127.0.0.1/31"])[0]
+        self.assertEqual(res, 0)
+        fdesc = tempfile.NamedTemporaryFile(delete=False)
+        fdesc.writelines(("127.0.0.%d\n" % i).encode() for i in range(2, 4))
+        fdesc.close()
+        res = RUN(["ivre", "runscans", "--file", fdesc.name, "--output",
+                   "XMLFork"])[0]
+        self.assertEqual(res, 0)
+        os.unlink(fdesc.name)
+        res = RUN(["ivre", "runscans", "--range", "127.0.0.4", "127.0.0.5",
+                   "--output", "XMLFull"])[0]
+        self.assertEqual(res, 0)
+        count = sum(len(walk_elt[2]) for walk_elt in os.walk('scans'))
+        self.assertEqual(count, 9)
+
+        # Generate a command line
+        res = RUN(["ivre", "runscans", "--output", "CommandLine"])[0]
+        self.assertEqual(res, 0)
+
+        # Scan using an agent
+        with AgentScanner(self) as agent:
+            agent.scan(["--test", "2"])
+
+        # Count the results
+        count = sum(len(walk_elt[2]) for walk_elt in os.walk('output/'))
+        self.assertEqual(count, 2)
+
+        # Clean
+        shutil.rmtree('output')
+
+        # Generate an agent
+        res, out, _ = RUN(["ivre", "runscans", "--output", "Agent"])
+        self.assertEqual(res, 0)
+        with open('ivre-agent.sh', 'wb') as fdesc:
+            fdesc.write(out)
+        os.chmod('ivre-agent.sh', 0o0755)
+
+        # Fork an agent
+        ivre.utils.makedirs('tmp')
+        pid_agent = subprocess.Popen([os.path.join(os.getcwd(),
+                                                   "ivre-agent.sh")],
+                                     preexec_fn=os.setsid,
+                                     cwd='tmp').pid
+
+        # Init DB for agents and for nmap
+        self.init_nmap_db()
+        res = RUN(["ivre", "runscansagentdb", "--init"],
+                  stdin=open(os.devnull))[0]
+        self.assertEqual(res, 0)
+        res = RUN(["ivre", "runscansagentdb", "--add-local-master"])[0]
+        self.assertEqual(res, 0)
+
+        # Add local agent
+        res = RUN(["ivre", "runscansagentdb", "--source", "TEST-AGENT-SOURCE",
+                   "--add-agent", os.path.join(os.getcwd(), "tmp")])[0]
+        self.assertEqual(res, 0)
+
+        # Create test scans
+        res = RUN(["ivre", "runscansagentdb", "--test", "2",
+                   "--assign-free-agents"])[0]
+        self.assertEqual(res, 0)
+        fdesc = tempfile.NamedTemporaryFile(delete=False)
+        fdesc.writelines(("127.0.0.%d\n" % i).encode() for i in range(3, 5))
+        fdesc.close()
+        res = RUN(["ivre", "runscansagentdb", "--file", fdesc.name,
+                   "--assign-free-agents"])[0]
+        self.assertEqual(res, 0)
+
+        # Test the lock mechanism
+        ## Check no scan is locked
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+        self.assertEqual(res, 0)
+        self.assertTrue(b'  - locked' not in out)
+        ## Get a scan id
+        scanid = next(iter(ivre.db.db.agent.get_scans()))
+        ## Lock it
+        locked_scan = ivre.db.db.agent.lock_scan(scanid)
+        self.assertIsInstance(locked_scan, dict)
+        self.assertEqual(locked_scan['pid'], os.getpid())
+        self.assertIsNotNone(locked_scan.get('lock'))
+        ## Check one scan is locked with our PID
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+        self.assertEqual(res, 0)
+        self.assertTrue(('  - locked (by %d)\n' % os.getpid()).encode() in out)
+        ## Attempt to lock it again
+        with(self.assertRaises(ivre.db.LockError)):
+            ivre.db.db.agent.lock_scan(scanid)
+        ## Unlock it
+        self.assertEqual(ivre.db.db.agent.unlock_scan(locked_scan), True)
+        ## Attempt to unlock it again
+        with(self.assertRaises(ivre.db.LockError)):
+            ivre.db.db.agent.unlock_scan(locked_scan)
+        with(self.assertRaises(ivre.db.LockError)):
+            ivre.db.db.agent.unlock_scan(ivre.db.db.agent.get_scan(scanid))
+        ## Check no scan is locked
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+        self.assertEqual(res, 0)
+        self.assertTrue(b'  - locked' not in out)
+        ## Lock the scan again
+        locked_scan = ivre.db.db.agent.lock_scan(scanid)
+        self.assertIsInstance(locked_scan, dict)
+        self.assertEqual(locked_scan['pid'], os.getpid())
+        self.assertIsNotNone(locked_scan.get('lock'))
+        ## Check one scan is locked with our PID
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+        self.assertEqual(res, 0)
+        self.assertTrue(('  - locked (by %d)\n' % os.getpid()).encode() in out)
+        ## Unlock all the scans from the CLI
+        res = RUN(["ivre", "runscansagentdb", "--force-unlock"],
+                  stdin=open(os.devnull))[0]
+        self.assertEqual(res, 0)
+        ## Check no scan is locked
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+        self.assertEqual(res, 0)
+        self.assertTrue(b'  - locked' not in out)
+
+        # Fork a daemon
+        daemon_cmd = ["runscansagentdb", "--daemon"]
+        if USE_COVERAGE:
+            daemon_cmd = COVERAGE + ["run", "--parallel-mode",
+                                     which("ivre")] + daemon_cmd
+        else:
+            daemon_cmd = ["ivre"] + daemon_cmd
+        pid_daemon = subprocess.Popen(daemon_cmd).pid
+        # Make sure the daemon is running
+        time.sleep(4)
+
+        # We should have two scans, wait until one is over
+        scanmatch = re.compile(b'scan:\n  - id: (?P<id>[0-9a-f]+)\n.*\n.*\n  '
+                               b'- targets added: (?P<nbadded>\\d+)\n  '
+                               b'- results fetched: (?P<nbfetched>\\d+)\n  '
+                               b'- total targets to add: (?P<nbtargets>\\d+)\n')
+        is_scan_over = lambda scan: int(scan['nbtargets']) == int(scan['nbfetched'])
+        while True:
+            res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+            self.assertEqual(res, 0)
+            scans = [scan.groupdict() for scan in scanmatch.finditer(out)]
+            self.assertEqual(len(scans), 2)
+            if any(is_scan_over(scan) for scan in scans):
+                break
+            time.sleep(2)
+        scan = next(scan for scan in scans if not is_scan_over(scan))
+
+        # We should have one agent
+        agentmatch = re.compile(b'agent:\n  - id: (?P<id>[0-9a-f]+)\n')
+        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-agents"])
+        self.assertEqual(res, 0)
+        agents = [agent.groupdict() for agent in agentmatch.finditer(out)]
+        self.assertEqual(len(agents), 1)
+        agent = agents[0]
+
+        # Assign the remaining scan to the agent
+        res = RUN(["ivre", "runscansagentdb", "--assign",
+                   "%s:%s" % (agent['id'].decode(), scan['id'].decode())])[0]
+        self.assertEqual(res, 0)
+        # Make sure the daemon handles the new scan
+        time.sleep(4)
+
+        # Wait until we have two scans, both of them over
+        while True:
+            res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
+            self.assertEqual(res, 0)
+            scans = [scan.groupdict() for scan in scanmatch.finditer(out)]
+            self.assertEqual(len(scans), 2)
+            if all(is_scan_over(scan) for scan in scans):
+                break
+            time.sleep(2)
+
+        # Wait for child processes to handle all the scans
+        while any(walk[2] for dirname in ['tmp/input', 'tmp/cur', 'tmp/output',
+                                          ivre.config.AGENT_MASTER_PATH]
+                  for walk in os.walk(dirname)
+                  if not (walk[0].startswith(os.path.join(
+                          ivre.config.AGENT_MASTER_PATH, 'output', ''
+                  )) or (walk[0] == ivre.config.AGENT_MASTER_PATH
+                         and walk[2] == ['whoami']))):
+            print(u"Waiting for runscans daemon & agent")
+            time.sleep(2)
+
+        # Kill the agent and the dameon
+        os.kill(pid_agent, signal.SIGTERM)
+        os.kill(pid_daemon, signal.SIGTERM)
+        os.waitpid(pid_agent, 0)
+        os.waitpid(pid_daemon, 0)
+
+        # Check we have 4 scan results
+        res, out, _ = RUN(["ivre", "scancli", "--count"])
+        self.assertEqual(res, 0)
+        self.assertEqual(int(out), 4)
+
+        # Clean
+        self.assertEqual(RUN(["ivre", "scancli", "--init"],
+                             stdin=open(os.devnull))[0], 0)
+        self.assertEqual(RUN(["ivre", "runscansagentdb", "--init"],
+                             stdin=open(os.devnull))[0], 0)
+        for dirname in ['scans', 'tmp']:
+            shutil.rmtree(dirname)
+
+    def test_conf(self):
+        # Ensure env var IVRE_CONF is taken into account
+        has_env_conf = "IVRE_CONF" in os.environ
+        if has_env_conf:
+            env_conf = os.environ["IVRE_CONF"]
+        else:
+            env_conf = __file__
+            os.environ["IVRE_CONF"] = env_conf
+        all_confs = list(ivre.config.get_config_file())
+        self.assertTrue(env_conf in all_confs,
+                        "Env conf %s should be in %s" % (env_conf, all_confs))
+        if not has_env_conf:
+            del os.environ["IVRE_CONF"]
+
+
+TESTS = set(["nmap", "passive", "data", "utils", "scans", "conf"])
+
+
+DATABASES = {
+    # **excluded** tests
+    #"mongo": ["flow"],
+    "postgres": ["scans"],
+}
 
 
 def parse_args():
@@ -1150,37 +1791,60 @@ def parse_args():
         parser = argparse.ArgumentParser(
             description='Run IVRE tests',
         )
+        use_argparse = True
     except ImportError:
         import optparse
         parser = optparse.OptionParser(
             description='Run IVRE tests',
         )
         parser.parse_args_orig = parser.parse_args
-        parser.parse_args = lambda: parser.parse_args_orig()[0]
+        def my_parse_args():
+            res = parser.parse_args_orig()
+            try:
+                test = next(test for test in res[1] if test not in TESTS)
+            except StopIteration:
+                pass
+            else:
+                raise optparse.OptionError(
+                    "invalid choice: %r (choose from %s)" % (
+                        test,
+                        ", ".join(repr(val) for val in sorted(TESTS)),
+                    ),
+                    "tests",
+                )
+            res[0].ensure_value('tests', res[1])
+            return res[0]
+        parser.parse_args = my_parse_args
         parser.add_argument = parser.add_option
+        use_argparse = False
     parser.add_argument('--samples', metavar='DIR',
                         default="./samples/")
     parser.add_argument('--coverage', action="store_true")
+    if use_argparse:
+        parser.add_argument('tests', nargs='*', choices=list(TESTS) + [[]])
     args = parser.parse_args()
     SAMPLES = args.samples
     USE_COVERAGE = args.coverage
+    if args.tests:
+        for test in TESTS.difference(args.tests):
+            test = "test_%s" % test
+            setattr(IvreTests, test,
+                    unittest.skip("User request")(getattr(IvreTests, test)))
     sys.argv = [sys.argv[0]]
-
-
-DATABASES = {
-    # **excluded** tests
-    #"mongo": ["flow"],
-    #"postgres": ["nmap"],
-}
 
 
 def parse_env():
     global DATABASE
     DATABASE = os.getenv("DB")
     for test in DATABASES.get(DATABASE, []):
-        sys.stderr.write("Desactivating test %r for database %r."
-                         "\n" % (test, DATABASE))
-        delattr(IvreTests, "test_%s" % test)
+        test = "test_%s" % test
+        setattr(
+            IvreTests,
+            test,
+            unittest.skip("Desactivated for database %r" % DATABASE)(
+                getattr(IvreTests, test),
+            ),
+        )
 
 
 if __name__ == '__main__':
@@ -1189,9 +1853,10 @@ if __name__ == '__main__':
     parse_env()
     import ivre.config
     import ivre.db
-    import ivre.utils
     import ivre.mathutils
+    import ivre.parser.bro
     import ivre.passive
+    import ivre.utils
     if not ivre.config.DEBUG:
         sys.stderr.write("You *must* have the DEBUG config value set to "
                          "True to run the tests.\n")
@@ -1207,6 +1872,11 @@ if __name__ == '__main__':
     else:
         RUN = python_run
         RUN_ITER = python_run_iter
+    try:
+        # Python 2 & 3 compatibility
+        IvreTests.assertItemsEqual = IvreTests.assertCountEqual
+    except AttributeError:
+        pass
     result = unittest.TextTestRunner(verbosity=2).run(
         unittest.TestLoader().loadTestsFromTestCase(IvreTests),
     )
@@ -1214,4 +1884,8 @@ if __name__ == '__main__':
         cov.stop()
         cov.save()
         coverage_report()
+    print("run=%d fail=%d errors=%d skipped=%d" % (result.testsRun,
+                                                   len(result.failures),
+                                                   len(result.errors),
+                                                   len(result.skipped)))
     sys.exit(len(result.failures) + len(result.errors))

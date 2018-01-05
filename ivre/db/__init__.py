@@ -21,23 +21,30 @@
 database backends.
 """
 
-import sys
-import socket
-import re
-import struct
-import urlparse
-import urllib
-import xml.sax
-import os
-import subprocess
-import shutil
-import tempfile
-import pickle
-import uuid
-import json
+
 import datetime
+from functools import reduce
+import json
+import os
+import pickle
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+try:
+    from urllib.parse import urlparse, unquote
+except ImportError:
+    from urlparse import urlparse
+    from urllib import unquote
+import uuid
+import xml.sax
 
 
+from builtins import range
+from future.utils import viewitems
 # tests: I don't want to depend on cluster for now
 try:
     import cluster
@@ -109,6 +116,13 @@ class DB(object):
 
         """
         raise NotImplementedError
+
+    @staticmethod
+    def convert_ip(addr):
+        try:
+            return utils.int2ip(addr)
+        except (TypeError, struct.error):
+            return addr
 
     @staticmethod
     def searchversion(version):
@@ -347,8 +361,8 @@ class DBNmap(DB):
             fchar = fdesc.read(1)
         try:
             store_scan_function = {
-                '<': self.store_scan_xml,
-                '{': self.store_scan_json,
+                b'<': self.store_scan_xml,
+                b'{': self.store_scan_json,
             }[fchar]
         except KeyError:
             raise ValueError("Unknown file type %s" % fname)
@@ -445,7 +459,7 @@ insert structures.
         self.start_store_hosts()
         with utils.open_file(fname) as fdesc:
             for line in fdesc:
-                host = self.json2dbrec(json.loads(line))
+                host = self.json2dbrec(json.loads(line.decode()))
                 for fname in ["_id"]:
                     if fname in host:
                         del host[fname]
@@ -529,7 +543,7 @@ insert structures.
                 screenwords = utils.screenwords(cls.getscreenshot(port))
                 if screenwords is not None:
                     port['screenwords'] = screenwords
-        for proto in openports.keys():
+        for proto in list(openports):
             if proto == 'count':
                 continue
             count = len(openports[proto]["ports"])
@@ -548,7 +562,7 @@ insert structures.
         doc["schema_version"] = 2
         for port in doc.get("ports", []):
             if port.get("service_method") == "table":
-                for key in port.keys():
+                for key in list(port):
                     if key.startswith('service_'):
                         del port[key]
 
@@ -609,7 +623,7 @@ insert structures.
         for port in doc.get('ports', []):
             if port['port'] == 'host':
                 port['port'] = -1
-        for state, (total, counts) in doc.get('extraports', {}).items():
+        for state, (total, counts) in list(viewitems(doc.get('extraports', {}))):
             doc['extraports'][state] = {"total": total, "reasons": counts}
 
     @staticmethod
@@ -621,7 +635,7 @@ insert structures.
         assert doc["schema_version"] == 5
         doc["schema_version"] = 6
         migrate_scripts = set(script for script, alias
-                              in xmlnmap.ALIASES_TABLE_ELEMS.iteritems()
+                              in viewitems(xmlnmap.ALIASES_TABLE_ELEMS)
                               if alias == 'vulns')
         for port in doc.get('ports', []):
             for script in port.get('scripts', []):
@@ -671,7 +685,7 @@ insert structures.
                     else:
                         script['vulns'] = [dict(tab, id=vulnid)
                                            for vulnid, tab in
-                                           script['vulns'].iteritems()]
+                                           viewitems(script['vulns'])]
 
     @staticmethod
     def json2dbrec(host):
@@ -1067,21 +1081,19 @@ class DBData(DB):
         raise NotImplementedError
 
     def parse_line_country_codes(self, line):
-        assert line.endswith('"\n')
-        line = line[:-2].split(',"')
-        return {'code': line[0], 'name': line[1]}
+        assert line.endswith(b'"\n')
+        line = line[:-2].split(b',"')
+        return {'code': line[0].decode(), 'name': line[1].decode()}
 
     def parse_line_country(self, line, feedipdata=None,
                            createipdata=False):
-        if line.endswith('\n'):
+        if line.endswith(b'\n'):
             line = line[:-1]
-        if line.endswith('"'):
+        if line.endswith(b'"'):
             line = line[:-1]
-        if line.startswith('"'):
+        if line.startswith(b'"'):
             line = line[1:]
-        line = line.split('","')
-        if line[4] not in self.country_codes:
-            self.country_codes[line[4]] = line[5]
+        line = line.split(b'","')
         if feedipdata is not None:
             for dbinst in feedipdata:
                 dbinst.update_country(
@@ -1090,17 +1102,17 @@ class DBData(DB):
                 )
         return {'start': int(line[2]),
                 'stop': int(line[3]),
-                'country_code': line[4]}
+                'country_code': line[4].decode()}
 
     @staticmethod
     def parse_line_city(line, feedipdata=None, createipdata=False):
-        if line.endswith('\n'):
+        if line.endswith(b'\n'):
             line = line[:-1]
-        if line.endswith('"'):
+        if line.endswith(b'"'):
             line = line[:-1]
-        if line.startswith('"'):
+        if line.startswith(b'"'):
             line = line[1:]
-        line = line.split('","')
+        line = line.split(b'","')
         if feedipdata is not None:
             for dbinst in feedipdata:
                 dbinst.update_city(
@@ -1113,24 +1125,24 @@ class DBData(DB):
 
     @staticmethod
     def parse_line_city_location(line):
-        if line.endswith('\n'):
+        if line.endswith(b'\n'):
             line = line[:-1]
         # Get an integer
-        i = line.index(',')
+        i = line.index(b',')
         parsedline = {'location_id': int(line[:i])}
         line = line[i + 1:]
         # Get 4 strings
         for field in ['country_code', 'region_code', 'city',
                       'postal_code']:
-            i = line.index('",')
+            i = line.index(b'",')
             curval = line[1:i]
             if curval:
                 parsedline[field] = curval.decode('latin-1')
             line = line[i + 2:]
         # Get 2 floats
         coords = []
-        for i in xrange(2):
-            i = line.index(',')
+        for i in range(2):
+            i = line.index(b',')
             curval = line[:i]
             if curval:
                 coords.append(float(curval))
@@ -1141,7 +1153,7 @@ class DBData(DB):
                 'coordinates': [coords[1], coords[0]],
             }
         # Get 1 int
-        i = line.index(',')
+        i = line.index(b',')
         curval = line[:i]
         if curval:
             parsedline['metro_code'] = int(curval)
@@ -1153,19 +1165,19 @@ class DBData(DB):
 
     @staticmethod
     def parse_line_asnum(line, feedipdata=None, createipdata=False):
-        if line.endswith('\n'):
+        if line.endswith(b'\n'):
             line = line[:-1]
-        line = line.split(',', 2)
+        line = line.split(b',', 2)
         parsedline = {
             'start': int(line[0]),
             'stop': int(line[1]),
         }
         data = line[2]
-        if data.endswith('"'):
+        if data.endswith(b'"'):
             data = data[:-1]
-        if data.startswith('"'):
+        if data.startswith(b'"'):
             data = data[1:]
-        if data.startswith('AS'):
+        if data.startswith(b'AS'):
             data = data.split(None, 1)
             parsedline['as_num'] = int(data[0][2:])
             if len(data) == 2:
@@ -1181,6 +1193,12 @@ class DBData(DB):
                                  parsedline.get('as_name'),
                                  create=createipdata)
         return parsedline
+
+
+
+class LockError(RuntimeError):
+    """A runtime error used when a lock cannot be acquired or released."""
+    pass
 
 
 class DBAgent(DB):
@@ -1327,11 +1345,8 @@ class DBAgent(DB):
                 str(agentid),
             )
             utils.makedirs(storedir)
-            with tempfile.NamedTemporaryFile(prefix="",
-                                             suffix=".xml",
-                                             dir=storedir,
-                                             delete=False) as fdesc:
-                pass
+            fdesc = tempfile.NamedTemporaryFile(prefix="", suffix=".xml",
+                                                dir=storedir, delete=False)
             shutil.move(
                 os.path.join(outpath, fname),
                 fdesc.name
@@ -1346,21 +1361,23 @@ class DBAgent(DB):
 
     def feed_all(self, masterid):
         for scanid in self.get_scans():
-            self.feed(masterid, scanid)
+            try:
+                self.feed(masterid, scanid)
+            except LockError:
+                utils.LOGGER.error(
+                    'Lock error - is another daemon process running?',
+                    exc_info=True,
+                )
 
     def feed(self, masterid, scanid):
         scan = self.lock_scan(scanid)
-        if scan is None:
-            raise StandardError(
-                "Could not acquire lock for scan %s" % scanid
-            )
         # TODO: handle "onhold" targets
         target = self.get_scan_target(scanid)
         try:
             for agentid in scan['agents']:
                 if self.get_agent(agentid)['master'] == masterid:
-                    for _ in xrange(self.may_receive(agentid)):
-                        self.add_target(agentid, scanid, target.next())
+                    for _ in range(self.may_receive(agentid)):
+                        self.add_target(agentid, scanid, next(target))
         except StopIteration:
             # This scan is over, let's free its agents
             for agentid in scan['agents']:
@@ -1380,7 +1397,7 @@ class DBAgent(DB):
             dir=self.get_local_path(agent, "input"),
             delete=False,
         ) as fdesc:
-            fdesc.write("%s\n" % addr)
+            fdesc.write(("%s\n" % addr).encode())
             return True
         return False
 
@@ -1437,8 +1454,21 @@ class DBAgent(DB):
         raise NotImplementedError
 
     def add_scan(self, target, assign_to_free_agents=True):
+        itertarget = iter(target)
+        try:
+            fdesc = itertarget.fdesc
+        except AttributeError:
+            pass
+        else:
+            if fdesc.closed:
+                itertarget.fdesc = (False, 0)
+            else:
+                itertarget.fdesc = (True, fdesc.tell())
         scan = {
-            "target": pickle.dumps(target.__iter__()),
+            # We need to explicitly call self.to_binary() because with
+            # MongoDB, Python 2.6 will store a unicode string that it
+            # won't be able un pickle.loads() later
+            "target": self.to_binary(pickle.dumps(itertarget)),
             "target_info": target.infos,
             "agents": [],
             "results": 0,
@@ -1453,24 +1483,50 @@ class DBAgent(DB):
         raise NotImplementedError
 
     def get_scan_target(self, scanid):
-        return pickle.loads(self._get_scan_target(self, scanid))
+        res =  pickle.loads(self._get_scan_target(scanid))
+        if hasattr(res, "fdesc"):
+            opened, seekval = res.fdesc
+            res.fdesc = open(res.target.filename)
+            if opened:
+                res.fdesc.seek(seekval)
+            else:
+                res.fdesc.close()
+        return res
 
     def _get_scan_target(self, scanid):
         raise NotImplementedError
 
     def lock_scan(self, scanid):
+        """Acquire lock for scanid. Returns the new scan object on success,
+and raises a LockError on failure.
+
+        """
         lockid = uuid.uuid1()
         scan = self._lock_scan(scanid, None, lockid.bytes)
         if scan['lock'] is not None:
-            scan['lock'] = uuid.UUID(bytes=scan['lock'])
+            # This might be a bug in uuid module, Python 2 only
+            ##  File "/opt/python/2.6.9/lib/python2.6/uuid.py", line 145, in __init__
+            ##    int = long(('%02x'*16) % tuple(map(ord, bytes)), 16)
+            # scan['lock'] = uuid.UUID(bytes=scan['lock'])
+            scan['lock'] = uuid.UUID(hex=utils.encode_hex(scan['lock']).decode())
         if scan['lock'] == lockid:
             return scan
 
     def unlock_scan(self, scan):
+        """Release lock for scanid. Returns True on success, and raises a
+LockError on failure.
+
+        """
+        if scan.get('lock') is None:
+            raise LockError('Cannot release lock for %r: scan is not '
+                            'locked' % scan['_id'])
         scan = self._lock_scan(scan['_id'], scan['lock'].bytes, None)
         return scan['lock'] is None
 
     def _lock_scan(self, scanid, oldlockid, newlockid):
+        raise NotImplementedError
+
+    def get_scan(self):
         raise NotImplementedError
 
     def get_scans(self):
@@ -1485,7 +1541,20 @@ class DBAgent(DB):
         raise NotImplementedError
 
     def update_scan_target(self, scanid, target):
-        return self._update_scan_target(scanid, pickle.dumps(target))
+        try:
+            fdesc = target.fdesc
+        except AttributeError:
+            pass
+        else:
+            if fdesc.closed:
+                target.fdesc = (False, 0)
+            else:
+                target.fdesc = (True, fdesc.tell())
+        # We need to explicitly call self.to_binary() because with
+        # MongoDB, Python 2.6 will store a unicode string that it
+        # won't be able un pickle.loads() later
+        return self._update_scan_target(scanid,
+                                        self.to_binary(pickle.dumps(target)))
 
     def _update_scan_target(self, scanid, target):
         raise NotImplementedError
@@ -1537,10 +1606,9 @@ def _mongodb_url2dbinfos(url):
         username = url.netloc[:url.netloc.index('@')]
         if ':' in username:
             userinfo = dict(zip(["username", "password"],
-                                map(urllib.unquote,
-                                    username.split(':', 1))))
+                                [unquote(val) for val in username.split(':', 1)]))
         else:
-            username = urllib.unquote(username)
+            username = unquote(username)
             if username == 'GSSAPI':
                 import krbV
                 userinfo = {
@@ -1591,7 +1659,7 @@ class MetaDB(object):
 
     @classmethod
     def url2dbinfos(cls, url):
-        url = urlparse.urlparse(url)
+        url = urlparse(url)
         if url.scheme in cls.extract_dbinfos:
             return cls.extract_dbinfos[url.scheme](url)
         return url.scheme, (url.geturl(),), {}
@@ -1625,7 +1693,7 @@ class MetaDB(object):
             self.db_types["passive"]["postgresql"] = PostgresDBPassive
         if urls is None:
             urls = {}
-        for datatype, dbtypes in self.db_types.iteritems():
+        for datatype, dbtypes in viewitems(self.db_types):
             specificurl = urls.get(datatype, url)
             if specificurl is not None:
                 (spurlscheme,

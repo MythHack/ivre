@@ -68,6 +68,7 @@ NMAP_SCAN_TEMPLATES = {
         #"verbosity": 2,
         #"ports": None,
         "host_timeout": "15m", # default value: None
+        "script_timeout": "2m", # default value: None
         "scripts_categories": ['default', 'discovery',
                                'auth'], # default value: None
         "scripts_exclude": ['broadcast', 'brute', 'dos',
@@ -85,6 +86,7 @@ NMAP_SCAN_TEMPLATES = {
 # NMAP_SCAN_TEMPLATES["aggressive"] = NMAP_SCAN_TEMPLATES["default"].copy()
 # NMAP_SCAN_TEMPLATES["aggressive"].update({
 #     "host_timeout": "30m",
+#     "script_timeout": "5m",
 #     "scripts_categories": ['default', 'discovery', 'auth', 'brute',
 #                            'exploit', 'intrusive'],
 #     "scripts_exclude": ['broadcast', 'external']
@@ -116,6 +118,43 @@ FLOW_TIME_PRECISION = 3600
 # When recording flow times, record the whole range from start_time to end_time
 # This option is experimental and possibly useless in practice
 FLOW_TIME_FULL_RANGE = False
+
+IPDATA_URLS = {
+    # 'GeoIPCountry.dat':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCountry/'
+    # 'GeoIP.dat.gz',
+    'GeoIPCountryCSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/GeoIPCountryCSV.zip',
+    # 'GeoIPCity.dat':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity.dat.gz',
+    'GeoIPCityCSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity_CSV/'
+    'GeoLiteCity-latest.zip',
+    # 'GeoIPASNum.dat':
+    # 'http://geolite.maxmind.com/download/geoip/database/asnum/'
+    # 'GeoIPASNum.dat.gz',
+    'GeoIPASNumCSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/asnum/GeoIPASNum2.zip',
+    # 'GeoIPCountryIPv6.dat':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.dat.gz',
+    # 'GeoIPCountryIPv6.csv':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.csv.gz',
+    # 'GeoIPCityIPv6.dat':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
+    # 'GeoLiteCityv6.dat.gz',
+    # 'GeoIPCityIPv6.csv':
+    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
+    # 'GeoLiteCityv6.csv.gz',
+    # 'GeoIPASNumIPv6.dat':
+    # 'http://download.maxmind.com/download/geoip/database/asnum/'
+    # 'GeoIPASNumv6.dat.gz',
+    # 'GeoIPASNumIPv6.csv':
+    # 'http://download.maxmind.com/download/geoip/database/asnum/'
+    # 'GeoIPASNum2v6.zip',
+    'iso3166.csv': 'http://dev.maxmind.com/static/csv/codes/iso3166.csv',
+    # This one is not from maxmind -- see http://thyme.apnic.net/
+    'BGP.raw': 'http://thyme.apnic.net/current/data-raw-table',
+}
 
 WEB_ALLOWED_REFERERS = None
 WEB_NOTES_BASE = "/dokuwiki/#IP#"
@@ -163,12 +202,14 @@ def get_config_file(paths=None):
                  for path in ['/etc', '/etc/ivre', '/usr/local/etc',
                               '/usr/local/etc/ivre']]
         paths.append(os.path.join(os.path.expanduser('~'), '.ivre.conf'))
+        if "IVRE_CONF" in os.environ:
+            paths.append(os.environ["IVRE_CONF"])
     for path in paths:
         if os.path.isfile(path):
             yield path
 
 for fname in get_config_file():
-    execfile(fname)
+    exec(compile(open(fname, "rb").read(), fname, 'exec'))
 
 def guess_prefix(directory=None):
     """Attempts to find the base directory where IVRE components are
@@ -191,7 +232,7 @@ def guess_prefix(directory=None):
     if __file__.startswith('/'):
         path = '/'
         # absolute path
-        for elt in __file__.split('/')[1:]:
+        for elt in __file__.split(os.path.sep)[1:]:
             if elt in ['lib', 'lib32', 'lib64']:
                 candidate = check_candidate(path, directory=directory)
                 if candidate is not None:

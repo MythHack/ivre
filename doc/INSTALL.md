@@ -17,20 +17,27 @@ If you plan to run scans from a machine, install
 [Nmap](http://nmap.org/) and optionally [ZMap](https://zmap.io/) and
 [Masscan](https://github.com/robertdavidgraham/masscan). If you want
 to integrate screenshots, install
-[Tesseract](https://github.com/tesseract-ocr/tesseract) and
-[PhantomJS](http://phantomjs.org/).
+[Tesseract](https://github.com/tesseract-ocr/tesseract),
+[ImageMagick](https://www.imagemagick.org/),
+[FFmpeg](http://ffmpeg.org/) and [PhantomJS](http://phantomjs.org/).
 
-If you plan to analyze PCAP file on a machine, install
-[Bro](http://www.bro.org/) (version 2.3 minimum) and
+If you plan to analyze PCAP file on a machine, install, depending on
+your needs, [Bro](http://www.bro.org/) (version 2.3 minimum),
 [p0f](http://lcamtuf.coredump.cx/p0f/) (version 2, will not work with
-version 3).
+version 3), [Argus](http://qosient.com/argus/) and/or
+[Nfdump](http://nfdump.sourceforge.net/).
 
-To install IVRE, you'll need [Python](http://www.python.org/) 2,
-version 2.6 minimum (prefer 2.7), with the following modules:
+To install IVRE, you'll need [Python](http://www.python.org/) 2
+(version 2.6 minimum, prefer 2.7) or 3 (version 3.3 minimum), with the
+following modules:
 
   * [Crypto](http://www.pycrypto.org/)
   * [pymongo](http://api.mongodb.org/python/) version 2.7.2 minimum.
-  * [py2neo](http://py2neo.org/v3/)
+  * [py2neo](http://py2neo.org/v3/) version 3 minimum, optional, to
+    use the flow module.
+  * [sqlalchemy](http://www.sqlalchemy.org/) and
+    [psycopg2](http://initd.org/psycopg/) to use the experimental
+    PostgreSQL backend.
   * [PIL](http://www.pythonware.com/products/pil/) optional, to trim
     screenshots.
 
@@ -41,6 +48,12 @@ The installation of [IVRE](README.md) itself can be done by:
   * using the `setup.py` (classical `./setup.py build; sudo ./setup.py
     install`) script.
 
+  * on Archlinux, there is an [AUR](https://aur.archlinux.org/)
+    package that can be installed using
+    [yaourt](https://aur.archlinux.org/packages/yaourt/) for example
+    (`yaourt -S ivre`). Please vote for the
+    [package](https://aur.archlinux.org/packages/ivre/) if you use it!
+
   * using [pip](https://pypi.python.org/pypi/pip): on a Debian-based
     system for example, install the packages `python-pip` and
     `python-dev` (needed to build dependencies) and run `pip install
@@ -48,7 +61,7 @@ The installation of [IVRE](README.md) itself can be done by:
     dependencies from [PyPI](https://pypi.python.org), the Python
     Package Index).
 
-  * building an RPM package (you can use the provided `buildrpm`
+  * building an RPM package (you can use the provided `pkg/buildrpm`
     script, or use the `setup.py` script with your own options) and
     then installing it.
 
@@ -71,18 +84,21 @@ You can override default values in three files:
     - `/usr/local/etc/ivre.conf` (read after, so higher priority)
   - one user-specific:
     - `~/.ivre.conf` (the last to be read, so highest priority)
+  - one environment based:
+    - `IVRE_CONF`, set it to the path of the configuration file to
+      read
 
 The file should contain lines of type `key = value`. Empty lines and
 comments (starting with the `#` character) are ignored. The following
 values can be changed:
 
-  - `DB`: the URL to use; default is `mongodb:///`, meaning use
+  - `DB`: the URL to use; default is `mongodb:///ivre`, meaning use
     default database (`ivre`) on the default host (`localhost`). Here
     is a more complete example:
-	`mongodb://user:password@host/db?colname_aaa=bbb&colname_ccc=ddd`
+    `mongodb://user:password@host/db?colname_aaa=bbb&colname_ccc=ddd`
 
-  - `DB_NMAP`, `DB_PASSIVE` and `DB_DATA`: specific URLs to use;
-    default is to use the URL from `DB` setting.
+  - `DB_NMAP`, `DB_PASSIVE`, `DB_FLOW` and `DB_DATA`: specific URLs to
+    use; default is to use the URL from `DB` setting.
 
   - `GEOIP_PATH`: default is `[INSTALL PREFIX]/share/ivre/geoip/`.
 
@@ -194,5 +210,5 @@ information about that.
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2016
+This file is part of IVRE. Copyright 2011 - 2017
 [Pierre LALET](mailto:pierre.lalet@cea.fr)
