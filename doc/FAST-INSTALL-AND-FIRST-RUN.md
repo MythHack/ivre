@@ -4,11 +4,11 @@ first scans and add the results to the database with all components
 machine.
 
 Please note that, depending on your distribution, the versions of some
-softwares might not be recent enough, particularly for MongoDB
+software packages might not be recent enough, particularly for MongoDB
 (version 2.6 minimum) and pymongo (version 2.7.2 minimum; see
 [README](README.md) to know which versions can be used with IVRE). If
-that's the case, you will have to install those softwares on you own,
-refering to their documentation (see
+that's the case, you will have to install those programs on you own,
+referring to their documentation (see
 [MongoDB on Debian](http://docs.mongodb.org/manual/tutorial/install-mongodb-on-debian/)
 or
 [MongoDB on Ubuntu](http://docs.mongodb.org/manual/tutorial/install-mongodb-on-ubuntu/)
@@ -23,11 +23,23 @@ You might also want to adapt it to your needs, architecture, etc.
 
 # Install #
 
-    $ sudo apt-get -y install mongodb python-pymongo python-crypto apache2 dokuwiki
+    $ sudo apt-get -y install mongodb python-pymongo python-crypto \
+    >   python-future python-bottle apache2 libapache2-mod-wsgi dokuwiki
     $ git clone https://github.com/cea-sec/ivre
     $ cd ivre
     $ python setup.py build
     $ sudo python setup.py install
+
+NB: if you are running Debian stable, the dokuwiki package has been
+removed (no idea why: it exists in both oldstable and testing). Run
+the following commands (or similar) if you cannot install dokuwiki,
+and try again:
+
+    $ echo 'APT::Default-Release "stable";' | \
+    >   sudo tee /etc/apt/apt.conf.d/99defaultrelease
+    $ echo 'deb http://deb.debian.org/debian testing main' | \
+    >   sudo tee -a /etc/apt/sources.list
+    $ sudo apt-get update
 
 
 # Setup #
@@ -36,8 +48,6 @@ You might also want to adapt it to your needs, architecture, etc.
     # cd /var/www/html ## or depending on your version /var/www
     # rm index.html
     # ln -s /usr/local/share/ivre/web/static/* .
-    # cd /usr/lib/cgi-bin
-    # ln -s /usr/local/share/ivre/web/cgi-bin/* .
     # cd /var/lib/dokuwiki/data/pages
     # ln -s /usr/local/share/ivre/dokuwiki/doc
     # cd /var/lib/dokuwiki/data/media
@@ -46,10 +56,18 @@ You might also want to adapt it to your needs, architecture, etc.
     # cd /usr/share/dokuwiki
     # patch -p0 < /usr/local/share/ivre/dokuwiki/backlinks.patch
     # cd /etc/apache2/mods-enabled
-    # for m in cgi rewrite ; do [ -L $m.load ] || ln -s ../mods-available/$m.load ; done
-    # cd /usr/local/share/ivre/web/cgi-bin
+    # for m in rewrite.load wsgi.conf wsgi.load ; do
+    >   [ -L $m ] || ln -s ../mods-available/$m ; done
+    # cd ../
+    # echo 'Alias /cgi "/usr/local/share/ivre/web/wsgi/app.wsgi"' > conf-enabled/ivre.conf
+    # echo '<Location /cgi>' >> conf-enabled/ivre.conf
+    # echo 'SetHandler wsgi-script' >> conf-enabled/ivre.conf
+    # echo 'Options +ExecCGI' >> conf-enabled/ivre.conf
+    # echo 'Require all granted' >> conf-enabled/ivre.conf
+    # echo '</Location>' >> conf-enabled/ivre.conf
     # sed -i 's/^\(\s*\)#Rewrite/\1Rewrite/' /etc/dokuwiki/apache.conf
-    # service apache2 reload
+    # echo 'WEB_GET_NOTEPAD_PAGES = "localdokuwiki"' >> /etc/ivre.conf
+    # service apache2 reload  ## or start
     # exit
 
 Open a web browser and visit [http://localhost/](http://localhost/).
@@ -63,12 +81,10 @@ button to check if everything works.
     This will remove any scan result in your database. Process ? [y/N] y
     $ ivre ipinfo --init
     This will remove any passive information in your database. Process ? [y/N] y
-    $ ivre ipdata --init
-    This will remove any country/AS information in your database. Process ? [y/N] y
     $ sudo ivre runscansagentdb --init
     This will remove any agent and/or scan in your database and files. Process ? [y/N] y
     $ sudo ivre ipdata --download
-    $ ivre ipdata --import-all --no-update-passive-db
+    $ sudo ivre ipdata --import-all
 
 The two latest steps may take a long time to run, nothing to worry
 about.
@@ -121,5 +137,5 @@ and the `ivre runscansagent` command.
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2015
+This file is part of IVRE. Copyright 2011 - 2019
 [Pierre LALET](mailto:pierre.lalet@cea.fr)

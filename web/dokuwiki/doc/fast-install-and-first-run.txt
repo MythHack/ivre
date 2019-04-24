@@ -1,6 +1,6 @@
 This file describes the steps to install [[doc:readme|IVRE]], run the first scans and add the results to the database with all components (scanner, web server, database server) on the same (Debian or Ubuntu) machine.
 
-Please note that, depending on your distribution, the versions of some softwares might not be recent enough, particularly for MongoDB (version 2.6 minimum) and pymongo (version 2.7.2 minimum; see [[doc:readme|README]] to know which versions can be used with IVRE). If that's the case, you will have to install those softwares on you own, refering to their documentation (see [[http://docs.mongodb.org/manual/tutorial/install-mongodb-on-debian/|MongoDB on Debian]] or [[http://docs.mongodb.org/manual/tutorial/install-mongodb-on-ubuntu/|MongoDB on Ubuntu]] and [[https://pypi.python.org/pypi/pymongo/|pymongo]]), instead of ''%%apt-get%%''-ting them.
+Please note that, depending on your distribution, the versions of some software packages might not be recent enough, particularly for MongoDB (version 2.6 minimum) and pymongo (version 2.7.2 minimum; see [[doc:readme|README]] to know which versions can be used with IVRE). If that's the case, you will have to install those programs on you own, referring to their documentation (see [[http://docs.mongodb.org/manual/tutorial/install-mongodb-on-debian/|MongoDB on Debian]] or [[http://docs.mongodb.org/manual/tutorial/install-mongodb-on-ubuntu/|MongoDB on Ubuntu]] and [[https://pypi.python.org/pypi/pymongo/|pymongo]]), instead of ''%%apt-get%%''-ting them.
 
 You might also want to adapt it to your needs, architecture, etc.
 
@@ -9,11 +9,23 @@ You might also want to adapt it to your needs, architecture, etc.
 ====== Install ======
 
 <code>
-$ sudo apt-get -y install mongodb python-pymongo python-crypto apache2 dokuwiki
+$ sudo apt-get -y install mongodb python-pymongo python-crypto \
+>   python-future python-bottle apache2 libapache2-mod-wsgi dokuwiki
 $ git clone https://github.com/cea-sec/ivre
 $ cd ivre
 $ python setup.py build
 $ sudo python setup.py install
+
+</code>
+NB: if you are running Debian stable, the dokuwiki package has been removed (no idea why: it exists in both oldstable and testing). Run the following commands (or similar) if you cannot install dokuwiki, and try again:
+
+<code>
+$ echo 'APT::Default-Release "stable";' | \
+>   sudo tee /etc/apt/apt.conf.d/99defaultrelease
+$ echo 'deb http://deb.debian.org/debian testing main' | \
+>   sudo tee -a /etc/apt/sources.list
+$ sudo apt-get update
+
 </code>
 ====== Setup ======
 
@@ -22,8 +34,6 @@ $ sudo -s
 # cd /var/www/html ## or depending on your version /var/www
 # rm index.html
 # ln -s /usr/local/share/ivre/web/static/* .
-# cd /usr/lib/cgi-bin
-# ln -s /usr/local/share/ivre/web/cgi-bin/* .
 # cd /var/lib/dokuwiki/data/pages
 # ln -s /usr/local/share/ivre/dokuwiki/doc
 # cd /var/lib/dokuwiki/data/media
@@ -32,13 +42,22 @@ $ sudo -s
 # cd /usr/share/dokuwiki
 # patch -p0 < /usr/local/share/ivre/dokuwiki/backlinks.patch
 # cd /etc/apache2/mods-enabled
-# for m in cgi rewrite ; do [ -L $m.load ] || ln -s ../mods-available/$m.load ; done
-# cd /usr/local/share/ivre/web/cgi-bin
+# for m in rewrite.load wsgi.conf wsgi.load ; do
+>   [ -L $m ] || ln -s ../mods-available/$m ; done
+# cd ../
+# echo 'Alias /cgi "/usr/local/share/ivre/web/wsgi/app.wsgi"' > conf-enabled/ivre.conf
+# echo '<Location /cgi>' >> conf-enabled/ivre.conf
+# echo 'SetHandler wsgi-script' >> conf-enabled/ivre.conf
+# echo 'Options +ExecCGI' >> conf-enabled/ivre.conf
+# echo 'Require all granted' >> conf-enabled/ivre.conf
+# echo '</Location>' >> conf-enabled/ivre.conf
 # sed -i 's/^\(\s*\)#Rewrite/\1Rewrite/' /etc/dokuwiki/apache.conf
-# service apache2 reload
+# echo 'WEB_GET_NOTEPAD_PAGES = "localdokuwiki"' >> /etc/ivre.conf
+# service apache2 reload  ## or start
 # exit
+
 </code>
-Open a web browser and visit http://localhost/. IVRE Web UI should show up, with no result of course. Click the HELP button to check if everything works.
+Open a web browser and visit [[http://localhost/|http:%%//%%localhost/]]. IVRE Web UI should show up, with no result of course. Click the HELP button to check if everything works.
 
 ====== Database init, data download & importation ======
 
@@ -47,12 +66,11 @@ $ ivre scancli --init
 This will remove any scan result in your database. Process ? [y/N] y
 $ ivre ipinfo --init
 This will remove any passive information in your database. Process ? [y/N] y
-$ ivre ipdata --init
-This will remove any country/AS information in your database. Process ? [y/N] y
 $ sudo ivre runscansagentdb --init
 This will remove any agent and/or scan in your database and files. Process ? [y/N] y
 $ sudo ivre ipdata --download
-$ ivre ipdata --import-all --no-update-passive-db
+$ sudo ivre ipdata --import-all
+
 </code>
 The two latest steps may take a long time to run, nothing to worry about.
 
@@ -62,6 +80,7 @@ Against 1k (routable) IP addresses, with a single nmap process:
 
 <code>
 $ sudo ivre runscans --routable --limit 1000
+
 </code>
 Go have some coffees and/or beers (remember that according to the traveler's theorem, for any time of the day, there exists a time zone in which it is OK to drink).
 
@@ -70,6 +89,7 @@ When the command has terminated, import the results:
 <code>
 $ ivre scan2db -c ROUTABLE,ROUTABLE-CAMPAIGN-001 -s MySource -r \
 >              scans/ROUTABLE/up
+
 </code>
 The ''%%-c%%'' argument adds categories to the scan results. Categories are arbitrary names used to filter results. In this example, the values are ''%%ROUTABLE%%'', meaning the results came out while scanning the entire reachable address space (as opposed to while scanning a specific network, AS or country, for example), and ''%%ROUTABLE-CAMPAIGN-001%%'', which is the name I have chosen to mark this particular scan campaign.
 
@@ -88,5 +108,5 @@ Another way to run scans efficiently is to use an [[doc:agent|agent]] and the ''
 
 ----
 
-This file is part of IVRE. Copyright 2011 - 2015 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
+This file is part of IVRE. Copyright 2011 - 2019 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
 

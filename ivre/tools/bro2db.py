@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -30,6 +30,7 @@ from ivre.parser.bro import BroFile
 from ivre.db import db
 from ivre import config
 from ivre import utils
+
 
 FLOW_KEYS_TCP = {"dport": "{id_resp_p}", "proto": '"tcp"'}
 FLOW_KEYS_UDP = {"dport": "{id_resp_p}", "proto": '"udp"'}
@@ -214,6 +215,7 @@ def conn2neo(bulk, rec):
             accumulators=accumulators)
     bulk.append(query_cache[linkattrs], rec)
 
+
 conn2neo.query_cache = {}
 
 
@@ -246,9 +248,11 @@ def dns2neo(bulk, rec):
         tmp_rec["addr"] = addr
         any2neo(ALL_DESCS["dns"], "host")(bulk, tmp_rec)
 
+
 def knwon_devices2neo(bulk, rec):
     any2neo(ALL_DESCS["known_devices__name"], "host")(bulk, rec)
     any2neo(ALL_DESCS["known_devices__mac"], "host")(bulk, rec)
+
 
 FUNCTIONS = {
     "conn": conn2neo,
@@ -259,23 +263,11 @@ FUNCTIONS = {
 
 def main():
     """Update the flow database from Bro logs"""
-    try:
-        import argparse
-        parser = argparse.ArgumentParser(description=__doc__)
+    parser, use_argparse = utils.create_argparser(__doc__,
+                                                  extraargs="logfiles")
+    if use_argparse:
         parser.add_argument('logfiles', nargs='*', metavar='FILE',
                             help='Bro log files')
-    except ImportError:
-        import optparse
-        parser = optparse.OptionParser(description=__doc__)
-        parser.parse_args_orig = parser.parse_args
-
-        def my_parse_args():
-            res = parser.parse_args_orig()
-            res[0].ensure_value('logfiles', res[1])
-            return res[0]
-        parser.parse_args = my_parse_args
-        parser.add_argument = parser.add_option
-
     parser.add_argument("-v", "--verbose", help="verbose mode",
                         action="store_true")
     parser.add_argument("-C", "--no-cleanup",

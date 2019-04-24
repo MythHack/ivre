@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -59,6 +59,7 @@ else:
     USE_PARTIAL = False
     # Also Python version <= 2.6: cannot use a function defined in
     # another function in a multiprocessing.Pool.imap()
+
     def _call_nmap_single_tuple(args):
         return _call_nmap_single(*args)
 
@@ -292,14 +293,14 @@ def main():
         import argparse
         parser = argparse.ArgumentParser(
             description='Run massive nmap scans.',
-            parents=[ivre.target.argparser,
-                     ivre.nmapopt.argparser])
+            parents=[ivre.target.ARGPARSER,
+                     ivre.nmapopt.ARGPARSER])
         using_argparse = True
     except ImportError:
         import optparse
         parser = optparse.OptionParser(
             description='Run massive nmap scans.')
-        for parent in [ivre.target.argparser, ivre.nmapopt.argparser]:
+        for parent in [ivre.target.ARGPARSER, ivre.nmapopt.ARGPARSER]:
             for args, kargs in parent.args:
                 parser.add_option(*args, **kargs)
         parser.parse_args_orig = parser.parse_args
@@ -454,12 +455,16 @@ def main():
             for _ in pool.imap(call_nmap_single, targets, chunksize=1):
                 pass
         else:
-            for _ in pool.imap(_call_nmap_single_tuple,
-                               ((targets.infos['categories'][0],
-                                 options,
-                                 accept_target_status,
-                                 target) for target in targets),
-                                chunksize=1):
+            for _ in pool.imap(
+                    _call_nmap_single_tuple,
+                    (
+                        (targets.infos['categories'][0],
+                         options,
+                         accept_target_status,
+                         target) for target in targets
+                    ),
+                    chunksize=1
+            ):
                 pass
         exit(0)
     elif args.output == 'ListAllRand':

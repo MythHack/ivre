@@ -1,6 +1,6 @@
 /*
  * This file is part of IVRE.
- * Copyright 2011 - 2015 Pierre LALET <pierre.lalet@cea.fr>
+ * Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
  *
  * IVRE is free software: you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by
@@ -76,10 +76,6 @@ var HELP_FILTERS = {
     },
     content: {
 	/* filters */
-	"archives": {
-	    "title": "<b>(!)</b>archives",
-	    "content": "Look for archived results. <code>!archives</code> has no effect, since it is the default behavior.",
-	},
 	"id:": {
 	    "title": "<b>(!)</b>id:<b>[object ID](,[object ID](,...))</b>",
 	    "content": "Look for results with a specific ObjectID.",
@@ -149,7 +145,7 @@ var HELP_FILTERS = {
 	    "content": "Look for a particular service, product and version, optionally on the specified port. [service name], [product name] and [version] can be either strings or regular expressions.",
 	},
 	"script:": {
-	    "title": "script:<b>[script id](:[script output])</b>",
+	    "title": "<b>(!)</b>script:<b>[script id](:[script output])</b>",
 	    "content": "Look for a port script, given its id, and optionally for a specific output. Both [script id] and [script output] can be either strings or regular expressions.",
 	},
 	/* results of scripts or version scans */
@@ -205,6 +201,11 @@ var HELP_FILTERS = {
 	    "title": "mysqlemptypwd",
 	    "content": "Look for MySQL servers with an empty password for the <code>root</code> account.",
 	},
+        "httphdr": {
+	    "title": "httphdr<b>(:[header](:[value]))</b>",
+            "title": "httphdr",
+            "content": "Look for HTTP headers."
+        },
 	"owa": {
 	    "title": "owa",
 	    "content": "Look for OWA (Outlook Web App) servers.",
@@ -297,6 +298,18 @@ var HELP_FILTERS = {
 	    "title": "xp445",
 	    "content": "Look for Windows XP machines with TCP/445 port open.",
 	},
+	"ssl-ja3-client": {
+	    "title": "(!)ssl-ja3-client<b>[:JA3]</b>",
+	    "content": "Look for hosts with a JA3 or with the given JA3.",
+	},
+	"ssl-ja3-server": {
+	    "title": "(!)ssl-ja3-server<b>[:[JA3S][:JA3]]</b>",
+	    "content": "Look for hosts with a JA3S, with the given JA3S, with a JA3S corresponding to the given JA3 or with the given JA3S corresponding to the given JA3",
+	},
+	"useragent": {
+	    "title": "(!)useragent<b>[:[string or regexp]]</b>",
+	    "content": "Look for hosts using a User-Agent matching the argument."
+	},
 	/* OS fingerprint */
 	"os:": {
 	    "title": "os:<b>[string or regexp]</b>",
@@ -347,7 +360,7 @@ var HELP_FILTERS = {
 	},
 	"countports:": {
 	    "title": "<b>(!)</b>countports:<b>[count](-[count])</b>",
-	    "content": "Loor for results with open port number within the specified range.",
+	    "content": "Look for results with open port number within the specified range.",
 	},
 	"otheropenport:": {
 	    "title": "otheropenport:<b>[port number](,[port number](,...))</b>",
@@ -395,6 +408,14 @@ var HELP_FILTERS = {
 	    "title": "display:host",
 	    "content": "Set the default display mode.",
 	},
+	"display:port": {
+	    "title": "display:port(:<b>([protocol]/)[port],(([protocol]/)[port],(...))</b>)",
+	    "content": "Display only (some) ports.",
+	},
+	"display:service": {
+	    "title": "display:service(:<b>[service],([service],(...))</b>)",
+	    "content": "Display only (some) services.",
+	},
 	"display:script": {
 	    "title": "display:script(:<b>[script id](,[script id](,...))</b>)",
 	    "content": "Display only script outputs. One or more scripts can be specified to only display those scripts' outputs.",
@@ -406,6 +427,10 @@ var HELP_FILTERS = {
 	"display:cpe": {
 	    "title": "display:cpe",
 	    "content": "Display only CPEs.",
+	},
+	"display:vulnerability": {
+	    "title": "display:vulnerability",
+	    "content": "Display only vulnerabilities.",
 	},
     },
 };
@@ -589,9 +614,29 @@ var HELP_TOPVALUES = {
 	    "content": "source",
 	    "title": "<b>(!)</b>source"
 	},
-	"s7.Module Type": {
-	    "content": "s7.Module Type",
-	    "title": "<b>(!)</b>s7.Module Type"
+	"s7.module": {
+	    "content": "s7.module",
+	    "title": "<b>(!)</b>s7.module"
+	},
+	"s7.version": {
+	    "content": "s7.version",
+	    "title": "<b>(!)</b>s7.version"
+	},
+	"s7.system_name": {
+	    "content": "s7.system_name",
+	    "title": "<b>(!)</b>s7.system_name"
+	},
+	"s7.module_name": {
+	    "content": "s7.module_name",
+	    "title": "<b>(!)</b>s7.module_name"
+	},
+	"s7.plant": {
+	    "content": "s7.plant",
+	    "title": "<b>(!)</b>s7.plant"
+	},
+	"s7.copyright": {
+	    "content": "s7.copyright",
+	    "title": "<b>(!)</b>s7.copyright"
 	},
 	"version": {
 	    "content": "version",
@@ -608,10 +653,6 @@ var HELP_TOPVALUES = {
 	"product:": {
 	    "content": "product:",
 	    "title": "<b>(!)</b>product:"
-	},
-	"s7.Module": {
-	    "content": "s7.Module",
-	    "title": "<b>(!)</b>s7.Module"
 	},
 	"countports:open": {
 	    "content": "countports:open",
@@ -660,10 +701,6 @@ var HELP_TOPVALUES = {
 	"port:open": {
 	    "content": "port:open",
 	    "title": "<b>(!)</b>port:open"
-	},
-	"s7.Version": {
-	    "content": "s7.Version",
-	    "title": "<b>(!)</b>s7.Version"
 	},
 	"enip.devtype": {
 	    "content": "enip.devtype",
@@ -745,6 +782,42 @@ var HELP_TOPVALUES = {
 	    "content": "ike.vendor_ids.value",
 	    "title": "<b>(!)</b>ike.vendor_ids.value"
 	},
+	"httphdr:": {
+	    "title": "httphdr<b>(:[name])",
+	    "content": "Top HTTP header values seen",
+	},
+	"httphdr.name": {
+	    "title": "httphdr.name",
+	    "content": "Top HTTP headers used",
+	},
+	"httphdr.value": {
+	    "title": "httphdr.value",
+	    "content": "Top HTTP header values seen, regardless of the header name",
+	},
+	"useragent:": {
+	    "title": "<b>(!)<b>useragent<b>[:[value]]</b>",
+	    "content": "Top HTTP User-Agent values seen."
+	},
+        "ja3-client:": {
+	    "title": "<b>(!)<b>ja3-client<b>[:[value]]</b>",
+	    "content": "Top JA3 client values (MD5)."
+        },
+        "ja3-client.md5:": {
+	    "title": "<b>(!)<b>ja3-client.md5<b>[:[value]]</b>",
+	    "content": "Top JA3 client values (MD5)."
+        },
+        "ja3-client.sha1:": {
+	    "title": "<b>(!)<b>ja3-client.sha1<b>[:[value]]</b>",
+	    "content": "Top JA3 client values (SHA1)."
+        },
+        "ja3-client.sha256:": {
+	    "title": "<b>(!)<b>ja3-client.sha256<b>[:[value]]</b>",
+	    "content": "Top JA3 client values (SHA256)."
+        },
+        "ja3-client.raw:": {
+	    "title": "<b>(!)<b>ja3-client.raw<b>[:[value]]</b>",
+	    "content": "Top JA3 client values (raw fingerprint)."
+        },
     }
 };
 
@@ -933,10 +1006,6 @@ var _SUBMENU_SORT = [
 	     {title: "Open ports",
 	      action: "$scope.setparam('-sortby', 'openports.count', true);",
 	      icon: "arrow-up",
-	     },
-	     {title: "Archives",
-	      action: "'archives' in FILTER.parametersobj ? $scope.unsetparam('archives') : $scope.setparam('archives');",
-	      icon: "file",
 	     },
 	 ],
 	},

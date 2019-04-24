@@ -2,7 +2,7 @@
 
 <!--
   This file is part of IVRE.
-  Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+  Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 
   IVRE is free software: you can redistribute it and/or modify it
   under the terms of the GNU General Public License as published by
@@ -33,7 +33,7 @@
     <script type="text/javascript">
       var config = {};
     </script>
-    <script type="text/javascript" src="cgi-bin/jsconfig.py"></script>
+    <script type="text/javascript" src="cgi/config"></script>
     <script type="text/javascript" src="ivre/content.js"></script>
     <script type="text/javascript" src="ivre/form-helpers.js"></script>
     <script type="text/javascript" src="ivre/utils.js"></script>
@@ -60,7 +60,7 @@
 	    </thead>
 	    <tbody>
 	      <tr ng-repeat="filter in all_filters"
-		  ng-class="{succes: filter.count > 0, warning: filter.count === undefined, error: filter.count === 0}">
+		  ng-class="{success: filter.count > 0, warning: filter.count === undefined, error: filter.count === 0}">
 		<td>{{names[filter.name]}}</td>
 		<td ng-switch="filter.count">
 		  <span ng-switch-when="0">No result!</span>
@@ -134,7 +134,7 @@
 	    <div>
 	      <center>
 		<span name="charttitle"></span>
-		<i class="icon-remove clickable"
+		<i class="glyphicon glyphicon-remove clickable"
 		   onclick="hidecharts();"></i>
 	      </center>
 	    </div>
@@ -146,7 +146,7 @@
 	    <div>
 	      <center>
 		<span name="charttitle"></span>
-		<i class="icon-remove clickable"
+		<i class="glyphicon glyphicon-remove clickable"
 		   onclick="hidecharts();"></i>
 	      </center>
 	    </div>

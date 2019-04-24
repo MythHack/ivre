@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2019 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -23,27 +23,32 @@ databases.
 """
 
 
-import datetime
-import json
-import os
-import re
-import uuid
 try:
     from collections import OrderedDict
 except ImportError:
     # fallback to dict for Python 2.6
     OrderedDict = dict
+from copy import deepcopy
+import datetime
+import hashlib
+import json
+import os
+import random
+import re
+import socket
+import struct
+import uuid
 
 
-from builtins import bytes, range
-from future.utils import viewitems, viewvalues
+from future.builtins import bytes, range
+from future.utils import viewitems
 from past.builtins import basestring
 import bson
 import pymongo
 
 
-from ivre.db import DB, DBNmap, DBPassive, DBData, DBAgent, LockError
-from ivre import utils, xmlnmap, config
+from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, LockError
+from ivre import config, passive, utils, xmlnmap
 
 
 class Nmap2Mongo(xmlnmap.Nmap2DB):
@@ -52,12 +57,41 @@ class Nmap2Mongo(xmlnmap.Nmap2DB):
         return bson.Binary(data)
 
 
+def _old_array(*values, **kargs):
+    """Returns a string construction using '$concat' to replace arrays for
+MongoDB < 3.2.
+
+    Uses kargs because Python 2.7 would not accept this:
+
+    def _old_array(*values, sep="###", convert_to_string=False):
+
+    """
+    sep = kargs.get("sep", "###")
+    convert_to_string = kargs.get("convert_to_string", False)
+    result = []
+    values = iter(values)
+    try:
+        elt = next(values)
+    except StopIteration:
+        return ""
+    # $toLower is used as a hack to convert a value to a string and
+    # prevent the exception "$concat only supports strings, not ..."
+    result.append({'$toLower': elt} if convert_to_string else elt)
+    for elt in values:
+        result.extend([sep, {'$toLower': elt} if convert_to_string else elt])
+    if len(result) == 1:
+        return result[0]
+    return {'$concat': result}
+
+
 class MongoDB(DB):
 
-    schema_migrations = {}
-    schema_migrations_indexes = {}
-    schema_latest_versions = {}
+    schema_migrations_indexes = []
+    schema_latest_versions = []
+    hint_indexes = []
     needunwind = []
+    ipaddr_fields = []
+    no_limit = 0
 
     def __init__(self, host, dbname,
                  username=None, password=None, mechanism=None,
@@ -76,8 +110,7 @@ class MongoDB(DB):
             self.maxtime = int(maxtime)
         except TypeError:
             self.maxtime = None
-        self.indexes = {}
-        self.hint_indexes = {}
+        self.schema_migrations = []
 
     def set_limits(self, cur):
         if self.maxscan is not None:
@@ -86,12 +119,13 @@ class MongoDB(DB):
             cur.max_time_ms(self.maxtime)
         return cur
 
-    def get_hint(self, spec):
+    @classmethod
+    def get_hint(cls, spec):
         """Given a query spec, return an appropriate index in a form
         suitable to be passed to Cursor.hint().
 
         """
-        for fieldname, hint in viewitems(self.hint_indexes):
+        for fieldname, hint in viewitems(cls.hint_indexes[cls.column_passive]):
             if fieldname in spec:
                 return hint
 
@@ -135,6 +169,15 @@ class MongoDB(DB):
             return self._server_info
 
     @property
+    def mongodb_32_more(self):
+        """True iff MongoDB server version is 3.2 or more."""
+        try:
+            return self._mongodb_32_more
+        except AttributeError:
+            self._mongodb_32_more = self.server_info['versionArray'] >= [3, 2]
+            return self._mongodb_32_more
+
+    @property
     def find(self):
         """Wrapper around column .find() method, depending on pymongo
         version.
@@ -150,11 +193,10 @@ class MongoDB(DB):
                     if 'fields' in kargs:
                         kargs['projection'] = kargs.pop('fields')
                     return self.db[colname].find(*args, **kargs)
-                self._find = _find
             else:
                 def _find(colname, *args, **kargs):
                     return self.db[colname].find(*args, **kargs)
-                self._find = _find
+            self._find = _find
             return self._find
 
     @property
@@ -180,8 +222,46 @@ class MongoDB(DB):
                 self._find_one = _find_one
             return self._find_one
 
+    def _get_cursor(self, column, flt, **kargs):
+        """Like .get(), but returns a MongoDB cursor (suitable for use with
+e.g.  .explain()) based on the column and a filter.
+
+        """
+        if "fields" in kargs and any(fld in kargs["fields"]
+                                     for fld in self.ipaddr_fields):
+            fields = []
+            for fld in kargs["fields"]:
+                if fld in self.ipaddr_fields:
+                    fields.extend(['%s_0' % fld, '%s_1' % fld])
+                else:
+                    fields.append(fld)
+            kargs["fields"] = fields
+        if "sort" in kargs and any(fld in (field for field, _ in kargs["sort"])
+                                   for fld in self.ipaddr_fields):
+            sort = []
+            for fld, way in kargs["sort"]:
+                if fld in self.ipaddr_fields:
+                    sort.extend([('%s_0' % fld, way), ('%s_1' % fld, way)])
+                else:
+                    sort.append((fld, way))
+            kargs["sort"] = sort
+        return self.set_limits(self.find(column, flt, **kargs))
+
     def count(self, *args, **kargs):
-        return self.get(*args, **kargs).count()
+        return self._get(*args, **kargs).count()
+
+    @staticmethod
+    def ip2internal(addr):
+        if isinstance(addr, list):
+            return addr
+        return [val - 0x8000000000000000 for val in
+                struct.unpack("!QQ", utils.ip2bin(addr))]
+
+    @staticmethod
+    def internal2ip(addr):
+        return utils.bin2ip(
+            struct.pack("!QQ", *(val + 0x8000000000000000 for val in addr))
+        )
 
     @staticmethod
     def serialize(obj):
@@ -194,74 +274,139 @@ class MongoDB(DB):
                           default=self.serialize)
 
     def create_indexes(self):
-        for colname, indexes in viewitems(self.indexes):
+        for colnum, indexes in enumerate(self.indexes):
+            colname = self.columns[colnum]
             for index in indexes:
                 self.db[colname].create_index(index[0], **index[1])
 
     def ensure_indexes(self):
-        for colname, indexes in viewitems(self.indexes):
+        for colnum, indexes in enumerate(self.indexes):
+            colname = self.columns[colnum]
             for index in indexes:
                 self.db[colname].ensure_index(index[0], **index[1])
 
-    def migrate_schema(self, colname, version):
+    def _migrate_update_record(self, colname, recid, update):
+        """Define how an update is handled. Purpose-specific subclasses may
+want to do something special here, e.g., mix with other records.
+
+        """
+        return self.db[colname].update({"_id": recid}, update)
+
+    def migrate_schema(self, colnum, version):
         """Process to schema migrations in column `colname` starting
         from `version`.
 
         """
         failed = 0
-        while version in self.schema_migrations[colname]:
-            updated = False
+        while version in self.schema_migrations[colnum]:
             new_version, migration_function = self.schema_migrations[
-                colname][version]
+                colnum
+            ][version]
             utils.LOGGER.info(
-                "Migrating column %s from version %r to %r",
-                colname, version, new_version,
+                "Migrating column %d from version %r to %r",
+                colnum, version, new_version,
             )
+            # Ensuring new indexes
+            new_indexes = self.schema_migrations_indexes[colnum].get(
+                new_version, {}
+            ).get("ensure", [])
+            if new_indexes:
+                utils.LOGGER.info(
+                    "Creating new indexes...",
+                )
+            if self.mongodb_32_more:
+                try:
+                    self.db[self.columns[colnum]].create_indexes(
+                        [
+                            pymongo.IndexModel(idx[0], **idx[1])
+                            for idx in new_indexes
+                        ]
+                    )
+                except pymongo.errors.OperationFailure:
+                    utils.LOGGER.debug("Cannot create indexes %r",
+                                       new_indexes, exc_info=True)
+            else:
+                for idx in new_indexes:
+                    try:
+                        self.db[self.columns[colnum]].create_index(idx[0],
+                                                                   **idx[1])
+                    except pymongo.errors.OperationFailure:
+                        utils.LOGGER.debug("Cannot create index %s", idx,
+                                           exc_info=True)
+            if new_indexes:
+                utils.LOGGER.info(
+                    "  ... Done.",
+                )
+            utils.LOGGER.info(
+                "Migrating records...",
+            )
+            updated = False
             # unlimited find()!
-            for record in self.find(colname, self.searchversion(version)):
+            for i, record in enumerate(
+                    self.find(self.columns[colnum],
+                              self.searchversion(version),
+                              no_cursor_timeout=True).batch_size(50000)
+            ):
                 try:
                     update = migration_function(record)
-                except Exception as exc:
-                    utils.LOGGER.warning(
-                        "Cannot migrate host %s [%s: %s]", record['_id'],
-                        exc.__class__.__name__, exc.message,
-                    )
-                    failed += 1
-                else:
                     if update is not None:
                         updated = True
-                        self.db[colname].update({"_id": record["_id"]}, update)
-            if updated:
-                for action, indexes in viewitems(
-                        self.schema_migrations_indexes[colname].get(
-                            new_version, {}
-                        )
-                ):
-                    function = getattr(self.db[colname], "%s_index" % action)
-                    for idx in indexes:
-                        try:
-                            function(idx[0], **idx[1])
-                        except pymongo.errors.OperationFailure as exc:
-                            utils.LOGGER.warning(
-                                "Cannot %s index %s [%s: %s]", action, idx,
-                                exc.__class__.__name__, exc.message,
-                            )
+                        self._migrate_update_record(self.columns[colnum],
+                                                    record["_id"],
+                                                    update)
+                except Exception:
+                    utils.LOGGER.warning(
+                        "Cannot migrate result %r", record, exc_info=True,
+                    )
+                    failed += 1
+                if (i + 1) % 100000 == 0:
+                    utils.LOGGER.info(
+                        "  %d records migrated", i + 1
+                    )
             utils.LOGGER.info(
-                "Migration of column %s from version %r to %r DONE",
-                colname, version, new_version,
+                "  ... Done.",
+            )
+            # Checking for required actions on indexes
+            utils.LOGGER.info(
+                "  Performing other actions on indexes...",
+            )
+            for action, indexes in viewitems(
+                    self.schema_migrations_indexes[colnum].get(
+                        new_version, {}
+                    )
+            ):
+                if action == "ensure":
+                    continue
+                function = getattr(self.db[self.columns[colnum]],
+                                   "%s_index" % action)
+                for idx in indexes:
+                    try:
+                        function(idx[0], **idx[1])
+                    except pymongo.errors.OperationFailure:
+                        (utils.LOGGER.warning if updated
+                         else utils.LOGGER.debug)(
+                            "Cannot %s index %s", action, idx,
+                            exc_info=True
+                        )
+            utils.LOGGER.info(
+                "  ... Done.",
+            )
+            utils.LOGGER.info(
+                "Migration of column %d from version %r to %r DONE",
+                colnum, version, new_version,
             )
             version = new_version
         if failed:
             utils.LOGGER.info("Failed to migrate %d documents", failed)
 
-    def cmp_schema_version(self, colname, document):
-        """Returns 0 if the `document`'s schema version matches the
-        code's current version for `colname`, -1 if it is higher (you
+    def cmp_schema_version(self, colnum, document):
+        """Returns 0 if the `document`'s schema version matches the code's
+        current version for column `colnum`, -1 if it is higher (you
         need to update IVRE), and 1 if it is lower (you need to call
         .migrate_schema()).
 
         """
-        val1 = self.schema_latest_versions.get(colname, 0)
+        val1 = self.schema_latest_versions[colnum]
         val2 = document.get("schema_version", 0)
         return (val1 > val2) - (val1 < val2)
 
@@ -320,7 +465,8 @@ class MongoDB(DB):
             pipeline += [{"$limit": topnbr}]
         return pipeline
 
-    def _distinct(self, field, flt=None, sort=None, limit=None, skip=None):
+    def _distinct_pipeline(self, field, flt=None, sort=None, limit=None,
+                           skip=None, is_ipfield=False):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
 
@@ -341,8 +487,101 @@ class MongoDB(DB):
             subfield = field.rsplit('.', i)[0]
             if subfield in self.needunwind:
                 pipeline += [{"$unwind": "$" + subfield}]
+        if is_ipfield:
+            if self.mongodb_32_more:
+                pipeline.append(
+                    {'$project': {field: ['$%s_0' % field, '$%s_1' % field]}}
+                )
+            else:
+                pipeline.append(
+                    {'$project': {field: _old_array(
+                        '$%s_0' % field, '$%s_1' % field,
+                        convert_to_string=True,
+                    )}}
+                )
         pipeline.append({'$group': {'_id': '$%s' % field}})
         return pipeline
+
+    def _distinct(self, column, field, flt=None, sort=None, limit=None,
+                  skip=None):
+        """This method makes use of the aggregation framework to
+        produce distinct values for a given field in a given column.
+
+        """
+        is_ipfield = field in self.ipaddr_fields
+        cursor = self.set_limits(
+            self.db[column].aggregate(
+                self._distinct_pipeline(field, flt=flt, sort=sort, limit=limit,
+                                        skip=skip, is_ipfield=is_ipfield),
+                cursor={}
+            )
+        )
+        if is_ipfield:
+            if self.mongodb_32_more:
+                return (None if res['_id'][0] is None else res['_id']
+                        for res in cursor)
+            return ([int(val) for val in res] if res[0] else None
+                    for res in (res['_id'].split('###') for res in cursor))
+        return (res['_id'] for res in cursor)
+
+    def _features_port_list(self, flt, yieldall, use_service, use_product,
+                            use_version):
+        pipeline, port, service_base = self._features_port_list_pipeline(
+            flt, use_service, use_product, use_version,
+        )
+        project = [port]
+        if use_service:
+            project.append('%s.service_name' % service_base)
+            if use_product:
+                project.append('%s.service_product' % service_base)
+                if use_version:
+                    project.append('%s.service_version' % service_base)
+        if self.mongodb_32_more:
+            project = {'field': project}
+        else:
+            project[0] = {"$toLower": project[0]}
+            none_value = "XXX_%s_XXX" % ''.join(random.choice(
+                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                '0123456789'
+            ) for _ in range(10))
+            for i, v in enumerate(project[1:]):
+                project[i + 1] = {"$ifNull": [v, none_value]}
+            project = {'field': _old_array(*project)}
+        pipeline.extend([
+            {'$project': project},
+            {'$group': {"_id": "$field"}},
+        ])
+        if self.mongodb_32_more:
+            if not yieldall:
+                # When not using yieldall, we can sort in
+                # database. Because port numbers are converted to
+                # strings in MongoDB < 3.2, we cannot rely on this
+                # sort however
+                pipeline.append(
+                    {'$sort': OrderedDict([("_id", 1)])}
+                )
+            for rec in self.db[
+                    self.columns[self._features_column]
+            ].aggregate(pipeline, cursor={}):
+                yield rec['_id']
+        else:
+            for rec in self.db[
+                    self.columns[self._features_column]
+            ].aggregate(pipeline, cursor={}):
+                data = rec['_id'].split('###')
+                # first value is a port number, converted to a string
+                # by _old_array()
+                data[0] = int(data[0])
+                # other values are strings, or None, which would be
+                # converted to the empty string by _old_array()
+                for i, v in enumerate(data[1:]):
+                    if v == none_value:
+                        data[i + 1] = None
+                yield data
+
+    def _features_port_list_pipeline(self, flt, use_service, use_product,
+                                     use_version):
+        raise NotImplementedError()
 
     # filters
     flt_empty = {}
@@ -359,9 +598,9 @@ class MongoDB(DB):
     def to_binary(data):
         return bson.Binary(data)
 
-    @staticmethod
-    def flt2str(flt):
-        return json.dumps(flt)
+    @classmethod
+    def flt2str(cls, flt):
+        return json.dumps(flt, default=cls.serialize)
 
     @staticmethod
     def _flt_and(cond1, cond2):
@@ -419,49 +658,47 @@ class MongoDB(DB):
         return {"schema_version":
                 {"$exists": False} if version is None else version}
 
-    @staticmethod
-    def searchhost(addr, neg=False):
+    @classmethod
+    def searchhost(cls, addr, neg=False):
         """Filters (if `neg` == True, filters out) one particular host
         (IP address).
 
         """
-        try:
-            addr = utils.ip2int(addr)
-        except (TypeError, utils.socket.error):
-            pass
-        return {'addr': {'$ne': addr} if neg else addr}
+        addr = cls.ip2internal(addr)
+        if neg:
+            return {'$or': [{'addr_0': {'$ne': addr[0]}},
+                            {'addr_1': {'$ne': addr[1]}}]}
+        return {'addr_0': addr[0], 'addr_1': addr[1]}
 
-    @staticmethod
-    def searchhosts(hosts, neg=False):
-        def convert(addr):
-            try:
-                return utils.ip2int(addr)
-            except (TypeError, utils.socket.error):
-                return addr
-        return {'addr': {'$nin' if neg else '$in': [convert(host)
-                                                    for host in hosts]}}
+    @classmethod
+    def searchhosts(cls, hosts, neg=False):
+        return {'$and' if neg else '$or':
+                [cls.searchhost(host, neg=neg) for host in hosts]}
 
-    @staticmethod
-    def searchrange(start, stop, neg=False):
+    @classmethod
+    def searchrange(cls, start, stop, neg=False):
         """Filters (if `neg` == True, filters out) one particular IP
         address range.
 
         """
-        try:
-            start = utils.ip2int(start)
-        except (TypeError, utils.socket.error):
-            pass
-        try:
-            stop = utils.ip2int(stop)
-        except (TypeError, utils.socket.error):
-            pass
+        start = cls.ip2internal(start)
+        stop = cls.ip2internal(stop)
         if neg:
             return {'$or': [
-                {'addr': {'$lt': start}},
-                {'addr': {'$gt': stop}}
+                {'addr_0': start[0], 'addr_1': {'$lt': start[1]}},
+                {'addr_0': {'$lt': start[0]}},
+                {'addr_0': stop[0], 'addr_1': {'$gt': stop[1]}},
+                {'addr_0': {'$gt': stop[0]}},
             ]}
-        return {'addr': {'$gte': start,
-                         '$lte': stop}}
+        if start[0] == stop[0]:
+            return {'addr_0': start[0], 'addr_1': {'$gte': start[1],
+                                                   '$lte': stop[1]}}
+        return {'$and': [
+            {'$or': [{'addr_0': start[0], 'addr_1': {'$gte': start[1]}},
+                     {'addr_0': {'$gt': start[0]}}]},
+            {'$or': [{'addr_0': stop[0], 'addr_1': {'$lte': stop[1]}},
+                     {'addr_0': {'$lt': stop[0]}}]},
+        ]}
 
     @staticmethod
     def searchval(key, val):
@@ -479,120 +716,105 @@ class MongoDB(DB):
             return {key: {'$gte': val}}
 
 
-class MongoDBNmap(MongoDB, DBNmap):
+class MongoDBActive(MongoDB, DBActive):
 
-    needunwind = ["categories", "ports", "ports.scripts",
-                  "ports.scripts.ssh-hostkey",
-                  "ports.scripts.smb-enum-shares.shares",
-                  "ports.scripts.ls.volumes",
-                  "ports.scripts.ls.volumes.files",
-                  "ports.scripts.mongodb-databases.databases",
-                  "ports.scripts.mongodb-databases.databases.shards",
-                  "ports.scripts.ike-info.transforms",
-                  "ports.scripts.ike-info.vendor_ids",
-                  "ports.scripts.vulns",
-                  "ports.scripts.vulns.check_results",
-                  "ports.scripts.vulns.description",
-                  "ports.scripts.vulns.extra_info",
-                  "ports.scripts.vulns.ids",
-                  "ports.scripts.vulns.refs",
-                  "ports.screenwords",
-                  "traces", "traces.hops",
-                  "os.osmatch", "os.osclass", "hostnames",
-                  "hostnames.domains", "cpes"]
-
-    def __init__(self, host, dbname,
-                 colname_scans="scans", colname_hosts="hosts",
-                 colname_oldscans="archivesscans",
-                 colname_oldhosts="archiveshosts",
-                 **kargs):
-        MongoDB.__init__(self, host, dbname, **kargs)
-        DBNmap.__init__(self)
-        self.content_handler = Nmap2Mongo
-        self.output_function = None
-        self.colname_scans = colname_scans
-        self.colname_hosts = colname_hosts
-        self.colname_oldscans = colname_oldscans
-        self.colname_oldhosts = colname_oldhosts
-        self.indexes = {
-            self.colname_hosts: [
-                ([('scanid', pymongo.ASCENDING)], {}),
-                ([('schema_version', pymongo.ASCENDING)], {}),
-                ([('addr', pymongo.ASCENDING)], {}),
-                ([('starttime', pymongo.ASCENDING)], {}),
-                ([('endtime', pymongo.ASCENDING)], {}),
-                ([('source', pymongo.ASCENDING)], {}),
-                ([('categories', pymongo.ASCENDING)], {}),
-                ([('hostnames.domains', pymongo.ASCENDING)], {}),
-                ([('traces.hops.domains', pymongo.ASCENDING)], {}),
-                ([('openports.count', pymongo.ASCENDING)], {}),
-                ([('openports.tcp.ports', pymongo.ASCENDING)], {}),
-                ([('openports.tcp.count', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('openports.udp.ports', pymongo.ASCENDING)], {}),
-                ([('openports.udp.count', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('ports.port', pymongo.ASCENDING)], {}),
-                ([('ports.state_state', pymongo.ASCENDING)], {}),
-                ([('ports.service_name', pymongo.ASCENDING)], {}),
-                ([('ports.scripts.id', pymongo.ASCENDING)], {}),
-                ([('ports.scripts.ls.volumes.volume', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('ports.scripts.ls.volumes.files.filename',
-                   pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([
-                    ('ports.scripts.vulns.id', pymongo.ASCENDING),
-                    ('ports.scripts.vulns.state', pymongo.ASCENDING),
-                ], {"sparse": True}),
-                ([('ports.scripts.vulns.state', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([
-                    ('ports.screenshot', pymongo.ASCENDING),
-                    ('ports.screenwords', pymongo.ASCENDING),
-                ],
-                 {"sparse": True}),
-                ([('infos.as_num', pymongo.ASCENDING)], {}),
-                ([
-                    ('traces.hops.ipaddr', pymongo.ASCENDING),
-                    ('traces.hops.ttl', pymongo.ASCENDING),
-                ], {}),
-                ([
-                    ('infos.country_code', pymongo.ASCENDING),
-                    ('infos.city', pymongo.ASCENDING),
-                ], {}),
-                ([('infos.loc', pymongo.GEOSPHERE)], {}),
-                ([
-                    ('cpes.type', pymongo.ASCENDING),
-                    ('cpes.vendor', pymongo.ASCENDING),
-                    ('cpes.product', pymongo.ASCENDING),
-                    ('cpes.version', pymongo.ASCENDING),
-                ],
-                 {"sparse": True}),
-            ],
-            self.colname_oldhosts: [
-                ([('scanid', pymongo.ASCENDING)], {}),
-                ([('schema_version', pymongo.ASCENDING)], {}),
-                ([('addr', pymongo.ASCENDING)], {}),
-                ([('starttime', pymongo.ASCENDING)], {}),
-                ([('source', pymongo.ASCENDING)], {}),
-            ],
-        }
-        self.schema_migrations = {
-            self.colname_hosts: {
-                None: (1, self.migrate_schema_hosts_0_1),
-                1: (2, self.migrate_schema_hosts_1_2),
-                2: (3, self.migrate_schema_hosts_2_3),
-                3: (4, self.migrate_schema_hosts_3_4),
-                4: (5, self.migrate_schema_hosts_4_5),
-                5: (6, self.migrate_schema_hosts_5_6),
-                6: (7, self.migrate_schema_hosts_6_7),
-                7: (8, self.migrate_schema_hosts_7_8),
-            },
-        }
-        self.schema_migrations[self.colname_oldhosts] = self.schema_migrations[
-            self.colname_hosts].copy()
-        self.schema_migrations_indexes[colname_hosts] = {
+    ipaddr_fields = ["addr", "traces.hops.ipaddr", "state_reason_ip"]
+    needunwind = [
+        "categories",
+        "cpes",
+        "os.osclass",
+        "os.osmatch",
+        "ports",
+        "ports.screenwords",
+        "ports.scripts",
+        "ports.scripts.http-headers",
+        "ports.scripts.http-user-agent",
+        "ports.scripts.ike-info.transforms",
+        "ports.scripts.ike-info.vendor_ids",
+        "ports.scripts.ls.volumes",
+        "ports.scripts.ls.volumes.files",
+        "ports.scripts.mongodb-databases.databases",
+        "ports.scripts.mongodb-databases.databases.shards",
+        "ports.scripts.smb-enum-shares.shares",
+        "ports.scripts.ssh-hostkey",
+        "ports.scripts.ssl-ja3-client",
+        "ports.scripts.ssl-ja3-server",
+        "ports.scripts.vulns",
+        "ports.scripts.vulns.check_results",
+        "ports.scripts.vulns.description",
+        "ports.scripts.vulns.extra_info",
+        "ports.scripts.vulns.ids",
+        "ports.scripts.vulns.refs",
+        "traces",
+        "traces.hops",
+        "hostnames",
+        "hostnames.domains",
+    ]
+    column_hosts = 0
+    _features_column = 0
+    indexes = [
+        # hosts
+        [
+            ([('scanid', pymongo.ASCENDING)], {}),
+            ([('schema_version', pymongo.ASCENDING)], {}),
+            ([
+                ('addr_0', pymongo.ASCENDING),
+                ('addr_1', pymongo.ASCENDING),
+            ], {}),
+            ([('starttime', pymongo.ASCENDING)], {}),
+            ([('endtime', pymongo.ASCENDING)], {}),
+            ([('source', pymongo.ASCENDING)], {}),
+            ([('categories', pymongo.ASCENDING)], {}),
+            ([('hostnames.domains', pymongo.ASCENDING)], {}),
+            ([('traces.hops.domains', pymongo.ASCENDING)], {}),
+            ([('openports.count', pymongo.ASCENDING)], {}),
+            ([('openports.tcp.ports', pymongo.ASCENDING)], {}),
+            ([('openports.tcp.count', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('openports.udp.ports', pymongo.ASCENDING)], {}),
+            ([('openports.udp.count', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('ports.port', pymongo.ASCENDING)], {}),
+            ([('ports.state_state', pymongo.ASCENDING)], {}),
+            ([('ports.service_name', pymongo.ASCENDING)], {}),
+            ([('ports.scripts.id', pymongo.ASCENDING)], {}),
+            ([('ports.scripts.ls.volumes.volume', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('ports.scripts.ls.volumes.files.filename',
+               pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([
+                ('ports.scripts.vulns.id', pymongo.ASCENDING),
+                ('ports.scripts.vulns.state', pymongo.ASCENDING),
+            ], {"sparse": True}),
+            ([('ports.scripts.vulns.state', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([
+                ('ports.screenshot', pymongo.ASCENDING),
+                ('ports.screenwords', pymongo.ASCENDING),
+            ], {"sparse": True}),
+            ([('infos.as_num', pymongo.ASCENDING)], {}),
+            ([
+                ('traces.hops.ipaddr_0', pymongo.ASCENDING),
+                ('traces.hops.ipaddr_1', pymongo.ASCENDING),
+                ('traces.hops.ttl', pymongo.ASCENDING),
+            ], {}),
+            ([
+                ('infos.country_code', pymongo.ASCENDING),
+                ('infos.city', pymongo.ASCENDING),
+            ], {}),
+            ([('infos.loc', pymongo.GEOSPHERE)], {}),
+            ([
+                ('cpes.type', pymongo.ASCENDING),
+                ('cpes.vendor', pymongo.ASCENDING),
+                ('cpes.product', pymongo.ASCENDING),
+                ('cpes.version', pymongo.ASCENDING),
+            ], {"sparse": True}),
+        ],
+    ]
+    schema_migrations_indexes = [
+        # hosts
+        {
             1: {"ensure": [
                 ([
                     ('ports.screenshot', pymongo.ASCENDING),
@@ -610,10 +832,11 @@ class MongoDBNmap(MongoDB, DBNmap):
             3: {"ensure": [
                 ([('ports.scripts.ls.volumes.volume', pymongo.ASCENDING)],
                  {"sparse": True}),
-                ([('ports.scripts.ls.volumes.files.filename', pymongo.ASCENDING)],
+                ([('ports.scripts.ls.volumes.files.filename',
+                   pymongo.ASCENDING)],
                  {"sparse": True}),
-                ## let's skip these ones since we are going to drop
-                ## them right after that
+                # Let's skip these ones since we are going to drop
+                # them right after that.
                 # ([('scripts.ls.volumes.volume', pymongo.ASCENDING)],
                 #  {"sparse": True}),
                 # ([('scripts.ls.volumes.files.filename', pymongo.ASCENDING)],
@@ -622,35 +845,65 @@ class MongoDBNmap(MongoDB, DBNmap):
             4: {"drop": [
                 ([('scripts.id', pymongo.ASCENDING)], {}),
                 ([('scripts.ls.volumes.volume', pymongo.ASCENDING)], {}),
-                ([('scripts.ls.volumes.files.filename', pymongo.ASCENDING)], {}),
+                ([('scripts.ls.volumes.files.filename', pymongo.ASCENDING)],
+                 {}),
             ]},
             6: {"ensure": [
                 ([('ports.scripts.vulns.state', pymongo.ASCENDING)],
                  {"sparse": True}),
             ]},
-        }
-        self.schema_migrations_indexes[colname_oldhosts] = {
-            1: {"ensure": [([('schema_version', pymongo.ASCENDING)], {})]},
-            4: {"drop": [
-                ([
-                    ('ports.screenshot', pymongo.ASCENDING),
-                    ('ports.screenwords', pymongo.ASCENDING),
-                ], {}),
-                ]}
-        }
-        self.schema_latest_versions = {
-            self.colname_hosts: xmlnmap.SCHEMA_VERSION,
-            self.colname_oldhosts: xmlnmap.SCHEMA_VERSION,
-        }
+            11: {
+                "drop": [
+                    ([('addr', pymongo.ASCENDING)], {}),
+                    ([
+                        ('traces.hops.ipaddr', pymongo.ASCENDING),
+                        ('traces.hops.ttl', pymongo.ASCENDING),
+                    ], {}),
+                ],
+                "ensure": [
+                    ([
+                        ('addr_0', pymongo.ASCENDING),
+                        ('addr_1', pymongo.ASCENDING),
+                    ], {}),
+                    ([
+                        ('traces.hops.ipaddr_0', pymongo.ASCENDING),
+                        ('traces.hops.ipaddr_1', pymongo.ASCENDING),
+                        ('traces.hops.ttl', pymongo.ASCENDING),
+                    ], {}),
+                ],
+            },
+        },
+    ]
+    schema_latest_versions = [
+        # hosts
+        xmlnmap.SCHEMA_VERSION,
+    ]
 
+    def __init__(self, host, dbname, colname_hosts, **kargs):
+        MongoDB.__init__(self, host, dbname, **kargs)
+        DBActive.__init__(self)
+        self.columns = [colname_hosts]
+        self.schema_migrations = [
+            # hosts
+            {
+                None: (1, self.migrate_schema_hosts_0_1),
+                1: (2, self.migrate_schema_hosts_1_2),
+                2: (3, self.migrate_schema_hosts_2_3),
+                3: (4, self.migrate_schema_hosts_3_4),
+                4: (5, self.migrate_schema_hosts_4_5),
+                5: (6, self.migrate_schema_hosts_5_6),
+                6: (7, self.migrate_schema_hosts_6_7),
+                7: (8, self.migrate_schema_hosts_7_8),
+                8: (9, self.migrate_schema_hosts_8_9),
+                9: (10, self.migrate_schema_hosts_9_10),
+                10: (11, self.migrate_schema_hosts_10_11),
+            },
+        ]
 
     def init(self):
         """Initializes the "active" columns, i.e., drops those columns and
 creates the default indexes."""
-        self.db[self.colname_scans].drop()
-        self.db[self.colname_hosts].drop()
-        self.db[self.colname_oldscans].drop()
-        self.db[self.colname_oldhosts].drop()
+        self.db[self.columns[self.column_hosts]].drop()
         self.create_indexes()
 
     def cmp_schema_version_host(self, host):
@@ -659,28 +912,17 @@ creates the default indexes."""
         and 1 if it is lower (you need to call .migrate_schema()).
 
         """
-        return self.cmp_schema_version(self.colname_hosts, host)
+        return self.cmp_schema_version(self.column_hosts, host)
 
-    def cmp_schema_version_scan(self, scan):
-        """Returns 0 if the `scan`'s schema version matches the code's
-        current version, -1 if it is higher (you need to update IVRE),
-        and 1 if it is lower (you need to call .migrate_schema()).
-
-        """
-        return self.cmp_schema_version(self.colname_scans, scan)
-
-    def migrate_schema(self, archive, version):
-        """Process to schema migrations in column `colname_hosts` or
-        `colname_oldhosts` depending on `archive`archive value,
-        starting from `version`.
+    def migrate_schema(self, version):
+        """Process to schema migrations in column hosts starting from
+        `version`.
 
         """
-        MongoDB.migrate_schema(
-            self, self.colname_oldhosts if archive else self.colname_hosts,
-            version,
-        )
+        MongoDB.migrate_schema(self, self.column_hosts, version)
 
-    def migrate_schema_hosts_0_1(self, doc):
+    @classmethod
+    def migrate_schema_hosts_0_1(cls, doc):
         """Converts a record from version 0 (no "schema_version" key
         in the document) to version 1 (`doc["schema_version"] ==
         1`). Version 1 adds an "openports" nested document to ease
@@ -699,7 +941,7 @@ creates the default indexes."""
                     "ports", []).append(port["port"])
             # create the screenwords attribute
             if 'screenshot' in port and 'screenwords' not in port:
-                screenwords = utils.screenwords(self.getscreenshot(port))
+                screenwords = utils.screenwords(cls.getscreenshot(port))
                 if screenwords is not None:
                     port['screenwords'] = screenwords
                     updated_ports = True
@@ -894,22 +1136,178 @@ creates the default indexes."""
             update["$set"]["ports"] = doc['ports']
         return update
 
-    def get(self, flt, archive=False, **kargs):
-        """Queries the active column (the old one if "archive" is set to True)
-with the provided filter "flt", and returns a MongoDB cursor.
+    @staticmethod
+    def migrate_schema_hosts_8_9(doc):
+        """Converts a record from version 8 to version 9. Version 9 creates a
+        structured output for http-headers script.
+
+        """
+        assert doc["schema_version"] == 8
+        update = {"$set": {"schema_version": 9}}
+        updated = False
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] == "http-headers":
+                    if 'http-headers' not in script:
+                        data = xmlnmap.add_http_headers_data(script)
+                        if data is not None:
+                            script['http-headers'] = data
+                            updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_9_10(doc):
+        """Converts a record from version 9 to version 10. Version 10 changes
+the field names of the structured output for s7-info script.
+
+        """
+        assert doc["schema_version"] == 9
+        update = {"$set": {"schema_version": 10}}
+        updated = False
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] == "s7-info":
+                    if 's7-info' in script:
+                        xmlnmap.change_s7_info_keys(script['s7-info'])
+                        updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
+        return update
+
+    @classmethod
+    def migrate_schema_hosts_10_11(cls, doc):
+        """Converts a record from version 10 to version 11. Version 11 changes
+the way IP addresses are stored.
+
+In version 10, they are stored as integers.
+
+In version 11, they are stored as canonical string representations in
+JSON format, and as two 64-bit unsigned integers (the `addr` field
+becomes `addr_0` and `addr_1`, and the same applies to other fields
+representing IP addresses).
+
+The reasons for this choice are the impossibility to store (and hence,
+index) unsigned 128-bit integers in MongoDB.
+
+        """
+        assert doc["schema_version"] == 10
+        update = {"$set": {"schema_version": 11}}
+
+        def convert(val):
+            return cls.ip2internal(utils.force_int2ip(val))
+        try:
+            addr = convert(doc['addr'])
+        except (KeyError, ValueError):
+            pass
+        else:
+            update["$unset"] = {"addr": ""}
+            update["$set"]["addr_0"], update["$set"]["addr_1"] = addr
+        updated = False
+        for port in doc.get('ports', []):
+            if 'state_reason_ip' in port:
+                try:
+                    ipaddr = convert(port['state_reason_ip'])
+                except ValueError:
+                    pass
+                else:
+                    del port['state_reason_ip']
+                    (port['state_reason_ip_0'],
+                     port['state_reason_ip_1']) = ipaddr
+                    updated = True
+            for script in port.get('scripts', []):
+                if script['id'] == 'ssl-cert':
+                    if 'pem' in script['ssl-cert']:
+                        data = ''.join(
+                            script['ssl-cert']['pem'].splitlines()[1:-1]
+                        ).encode()
+                        try:
+                            newout, newinfo = xmlnmap.create_ssl_cert(data)
+                        except Exception:
+                            utils.LOGGER.warning('Cannot parse certificate %r',
+                                                 data,
+                                                 exc_info=True)
+                        else:
+                            script['output'] = '\n'.join(newout)
+                            script['ssl-cert'] = newinfo
+                            updated = True
+                            continue
+                    try:
+                        pubkeytype = {
+                            'rsaEncryption': 'rsa',
+                            'id-ecPublicKey': 'ec',
+                            'id-dsa': 'dsa',
+                            'dhpublicnumber': 'dh',
+                        }[script['ssl-cert'].pop('pubkeyalgo')]
+                    except KeyError:
+                        pass
+                    else:
+                        script['pubkey'] = {'type': pubkeytype}
+                        updated = True
+        if updated:
+            update["$set"]["ports"] = doc['ports']
+        updated = False
+        for trace in doc.get('traces', []):
+            for hop in trace.get('hops', []):
+                if 'ipaddr' in hop:
+                    try:
+                        ipaddr = convert(hop['ipaddr'])
+                    except ValueError:
+                        pass
+                    else:
+                        del hop['ipaddr']
+                        hop['ipaddr_0'], hop['ipaddr_1'] = ipaddr
+                        updated = True
+        if updated:
+            update["$set"]["traces"] = doc['traces']
+        return update
+
+    def _get(self, flt, **kargs):
+        """Like .get(), but returns a MongoDB cursor (suitable for use with
+e.g.  .explain()).
+
+        """
+        return self._get_cursor(self.columns[self.column_hosts], flt, **kargs)
+
+    def get(self, spec, **kargs):
+        """Queries the active column with the provided filter "spec",
+and returns a MongoDB cursor.
 
 This should be very fast, as no operation is done (the cursor is only
 returned). Next operations (e.g., .count(), enumeration, etc.) might
 take a long time, depending on both the operations and the filter.
 
-Any keyword argument other than "archive" is passed to the .find()
-method of the Mongodb column object, without any validation (and might
-have no effect if it is not expected)."""
-        return self.set_limits(self.find(
-            self.colname_oldhosts if archive else self.colname_hosts,
-            flt,
-            **kargs
-        ))
+Any keyword argument is passed to the .find() method of the Mongodb
+column object, without any validation (and might have no effect if
+it is not expected)."""
+        # Convert IP addresses to internal DB format
+        for host in self._get(spec, **kargs):
+            try:
+                host['addr'] = self.internal2ip([host.pop('addr_0'),
+                                                 host.pop('addr_1')])
+            except (KeyError, socket.error):
+                pass
+            for port in host.get('ports', []):
+                try:
+                    port['state_reason_ip'] = self.internal2ip([
+                        port.pop('state_reason_ip_0'),
+                        port.pop('state_reason_ip_1'),
+                    ])
+                except (KeyError, socket.error):
+                    pass
+            for trace in host.get('traces', []):
+                for hop in trace.get('hops', []):
+                    try:
+                        hop['ipaddr'] = self.internal2ip([hop.pop('ipaddr_0'),
+                                                          hop.pop('ipaddr_1')])
+                    except (KeyError, socket.error):
+                        pass
+            if 'coordinates' in host.get('infos', {}).get('loc', {}):
+                host['infos']['coordinates'] = host['infos'].pop('loc')[
+                    'coordinates'
+                ][::-1]
+            yield host
 
     @staticmethod
     def getscanids(host):
@@ -920,14 +1318,8 @@ have no effect if it is not expected)."""
             return scanids
         return [scanids]
 
-    def getscan(self, scanid, archive=False):
-        return self.find_one(
-            self.colname_oldscans if archive else self.colname_scans,
-            {'_id': scanid},
-        )
-
     def setscreenshot(self, host, port, data, protocol='tcp',
-                      archive=False, overwrite=False):
+                      overwrite=False):
         """Sets the content of a port's screenshot."""
         try:
             port = [p for p in host.get('ports', [])
@@ -948,32 +1340,35 @@ have no effect if it is not expected)."""
         screenwords = utils.screenwords(data)
         if screenwords is not None:
             port['screenwords'] = screenwords
-        self.db[
-            self.colname_oldhosts if archive else self.colname_hosts
-        ].update({"_id": host['_id']}, {"$set": {'ports': host['ports']}})
+        self.db[self.columns[self.column_hosts]].update(
+            {"_id": host['_id']}, {"$set": {'ports': host['ports']}}
+        )
 
     def setscreenwords(self, host, port=None, protocol="tcp",
-                       archive=False, overwrite=False):
+                       overwrite=False):
         """Sets the `screenwords` attribute based on the screenshot
         data.
 
         """
         if port is None:
             if overwrite:
-                flt_cond = lambda p: 'screenshot' in p
+                def flt_cond(p):
+                    return 'screenshot' in p
             else:
-                flt_cond = lambda p: ('screenshot' in p
-                                      and 'screenwords' not in p)
+                def flt_cond(p):
+                    return 'screenshot' in p and 'screenwords' not in p
         else:
             if overwrite:
-                flt_cond = lambda p: ('screenshot' in p
-                                      and p.get('port') == port
-                                      and p.get('protocol') == protocol)
+                def flt_cond(p):
+                    return ('screenshot' in p and
+                            p.get('port') == port and
+                            p.get('protocol') == protocol)
             else:
-                flt_cond = lambda p: ('screenshot' in p
-                                      and 'screenwords' not in p
-                                      and p.get('port') == port
-                                      and p.get('protocol') == protocol)
+                def flt_cond(p):
+                    return ('screenshot' in p and
+                            'screenwords' not in p and
+                            p.get('port') == port and
+                            p.get('protocol') == protocol)
         updated = False
         for port in host.get('ports', []):
             if not flt_cond(port):
@@ -983,12 +1378,11 @@ have no effect if it is not expected)."""
                 port['screenwords'] = screenwords
                 updated = True
         if updated:
-            self.db[
-                self.colname_oldhosts if archive else self.colname_hosts
-            ].update({"_id": host['_id']}, {"$set": {'ports': host['ports']}})
+            self.db[self.columns[self.column_hosts]].update(
+                {"_id": host['_id']}, {"$set": {'ports': host['ports']}}
+            )
 
-    def removescreenshot(self, host, port=None, protocol='tcp',
-                         archive=False):
+    def removescreenshot(self, host, port=None, protocol='tcp'):
         """Removes screenshots"""
         changed = False
         for p in host.get('ports', []):
@@ -1003,34 +1397,87 @@ have no effect if it is not expected)."""
                     del p['screenshot']
                     changed = True
         if changed:
-            self.db[
-                self.colname_oldhosts if archive else self.colname_hosts
-            ].update({"_id": host["_id"]}, {"$set": {'ports': host['ports']}})
+            self.db[self.columns[self.column_hosts]].update(
+                {"_id": host["_id"]}, {"$set": {'ports': host['ports']}}
+            )
 
-    def getlocations(self, flt, archive=False):
-        col = self.db[self.colname_oldhosts if archive else self.colname_hosts]
+    def getlocations(self, flt):
+        col = self.db[self.columns[self.column_hosts]]
         pipeline = [
             {"$match": self.flt_and(flt, self.searchhaslocation())},
             {"$project": {"_id": 0, "coords": "$infos.loc.coordinates"}},
             {"$group": {"_id": "$coords", "count": {"$sum": 1}}},
         ]
-        return col.aggregate(pipeline, cursor={})
+        return ({'_id': tuple(rec['_id'][::-1]), 'count': rec['count']}
+                for rec in col.aggregate(pipeline, cursor={}))
 
-    def is_scan_present(self, scanid):
-        for colname in [self.colname_scans, self.colname_oldscans]:
-            if self.find_one(colname, {"_id": scanid},
-                             fields=[]) is not None:
-                return True
-        return False
+    def get_ips_ports(self, flt, limit=None, skip=None):
+        cur = self._get(
+            flt, fields=['addr_0', 'addr_1', 'ports.port',
+                         'ports.state_state'],
+            limit=limit or 0, skip=skip or 0,
+        )
+        count = sum(len(host.get('ports', [])) for host in cur)
+        cur.rewind()
+        return ((dict(res, addr=self.internal2ip([res['addr_0'],
+                                                  res['addr_1']]))
+                 for res in cur),
+                count)
+
+    def get_ips(self, flt, limit=None, skip=None):
+        cur = self._get(flt, fields=['addr_0', 'addr_1'], limit=limit or 0,
+                        skip=skip or 0)
+        return ((dict(res, addr=self.internal2ip([res['addr_0'],
+                                                  res['addr_1']]))
+                 for res in cur),
+                cur.count())
+
+    def get_open_port_count(self, flt, limit=None, skip=None):
+        cur = self._get(
+            flt, fields=['addr_0', 'addr_1', 'starttime', 'openports.count'],
+            limit=limit or 0, skip=skip or 0,
+        )
+        return ((dict(res, addr=self.internal2ip([res['addr_0'],
+                                                  res['addr_1']]))
+                 for res in cur),
+                cur.count())
 
     def store_host(self, host):
-        ident = self.db[self.colname_hosts].insert(host)
-        utils.LOGGER.debug("HOST STORED: %r in %r", ident, self.colname_hosts)
-        return ident
-
-    def store_scan_doc(self, scan):
-        ident = self.db[self.colname_scans].insert(scan)
-        utils.LOGGER.debug("SCAN STORED: %r in %r", ident, self.colname_scans)
+        host = deepcopy(host)
+        # Convert IP addresses to internal DB format
+        try:
+            host['addr_0'], host['addr_1'] = self.ip2internal(host.pop('addr'))
+        except (KeyError, ValueError):
+            pass
+        for port in host.get('ports', []):
+            if 'state_reason_ip' in port:
+                try:
+                    (
+                        port['state_reason_ip_0'],
+                        port['state_reason_ip_1'],
+                    ) = self.ip2internal(
+                        port.pop('state_reason_ip')
+                    )
+                except ValueError:
+                    pass
+        for trace in host.get('traces', []):
+            for hop in trace.get('hops', []):
+                if 'ipaddr' in hop:
+                    try:
+                        hop['ipaddr_0'], hop['ipaddr_1'] = self.ip2internal(
+                            hop.pop('ipaddr')
+                        )
+                    except ValueError:
+                        pass
+        # keep location data in appropriate format for GEOSPHERE index
+        if 'coordinates' in host.get('infos', {}):
+            host['infos']['loc'] = {
+                "type": "Point",
+                "coordinates": host['infos'].pop('coordinates')[::-1],
+            }
+        ident = self.db[self.columns[self.column_hosts]].insert(host)
+        utils.LOGGER.debug("HOST STORED: %r in %r", ident,
+                           self.columns[self.column_hosts])
         return ident
 
     def merge_host_docs(self, rec1, rec2):
@@ -1038,18 +1485,7 @@ have no effect if it is not expected)."""
         hard-to-merge fields are lost (e.g., extraports).
 
         """
-        if rec1.get("schema_version") != rec2.get("schema_version"):
-            raise ValueError("Cannot merge host documents. "
-                             "Schema versions differ (%r != %r)" % (
-                                 rec1.get("schema_version"),
-                                 rec2.get("schema_version")))
-        rec = {}
-        if "schema_version" in rec1:
-            rec["schema_version"] = rec1["schema_version"]
-        # When we have different values, we will use the one from the
-        # most recent scan, rec2
-        if rec1.get("starttime") > rec2.get("starttime"):
-            rec1, rec2 = rec2, rec1
+        rec = super(MongoDBActive, self).merge_host_docs(rec1, rec2)
         scanid = set()
         for record in [rec1, rec2]:
             scanid.update(self.getscanids(record))
@@ -1058,167 +1494,19 @@ have no effect if it is not expected)."""
                 rec["scanid"] = scanid.pop()
             else:
                 rec["scanid"] = list(scanid)
-        for fname, function in [("starttime", min), ("endtime", max)]:
-            try:
-                rec[fname] = function(record[fname] for record in [rec1, rec2]
-                                      if fname in record)
-            except ValueError:
-                pass
-        rec["state"] = "up" if rec1.get("state") == "up" else rec2.get("state")
-        if rec["state"] is None:
-            del rec["state"]
-        rec["categories"] = list(
-            set(rec1.get("categories", [])).union(
-                rec2.get("categories", []))
-        )
-        for field in ["addr", "source", "os"]:
-            rec[field] = rec2[field] if rec2.get(field) else rec1.get(field)
-            if not rec[field]:
-                del rec[field]
-        rec["traces"] = rec1.get("traces", []) + rec2.get("traces", [])
-        rec["infos"] = {}
-        for record in [rec1, rec2]:
-            rec["infos"].update(record.get("infos", {}))
-        # We want to make sure of (type, name) unicity
-        hostnames = dict(((h['type'], h['name']), h.get('domains'))
-                         for h in (rec1.get("hostnames", [])
-                                   + rec2.get("hostnames", [])))
-        rec["hostnames"] = [{"type": h[0], "name": h[1], "domains": d}
-                            for h, d in viewitems(hostnames)]
-        ports = dict(((port.get("protocol"), port["port"]), port.copy())
-                     for port in rec2.get("ports", []))
-        for port in rec1.get("ports", []):
-            if (port.get('protocol'), port['port']) in ports:
-                curport = ports[(port.get('protocol'), port['port'])]
-                if 'scripts' in curport:
-                    curport['scripts'] = curport['scripts'][:]
-                else:
-                    curport['scripts'] = []
-                present_scripts = set(
-                    script['id'] for script in curport['scripts']
-                )
-                for script in port.get("scripts", []):
-                    if script['id'] not in present_scripts:
-                        curport['scripts'].append(script)
-                if not curport['scripts']:
-                    del curport['scripts']
-                if 'service_name' in port and not 'service_name' in curport:
-                    for key in port:
-                        if key.startswith("service_"):
-                            curport[key] = port[key]
-            else:
-                ports[(port.get('protocol'), port['port'])] = port
-        rec["ports"] = list(viewvalues(ports))
-        rec["openports"] = {}
-        for record in [rec1, rec2]:
-            for proto in record.get('openports', {}):
-                if proto == 'count':
-                    continue
-                rec['openports'].setdefault(
-                    proto, {}).setdefault(
-                        'ports', set()).update(
-                            record['openports'][proto]['ports'])
-        if rec['openports']:
-            for proto in list(rec['openports']):
-                count = len(rec['openports'][proto]['ports'])
-                rec['openports'][proto]['count'] = count
-                rec['openports']['count'] = rec['openports'].get(
-                    'count', 0) + count
-                rec['openports'][proto]['ports'] = list(
-                    rec['openports'][proto]['ports'])
-        else:
-            rec['openports']["count"] = 0
-        for field in ["traces", "infos", "ports"]:
-            if not rec[field]:
-                del rec[field]
         return rec
 
-    def remove(self, host, archive=False):
-        """Removes the host "host" from the active (the old one if
-        "archive" is set to True) column. "host" must be the host
-        record as returned by MongoDB.
-
-        If "host" has a "scanid" attribute, and if it refers to a scan
-        that have no more host record after the deletion of "host",
-        then the scan record is also removed.
+    def remove(self, host):
+        """Removes the host "view" from the active column.
+        "view" must be the record as returned by MongoDB.
 
         """
-        if archive:
-            colname_hosts = self.colname_oldhosts
-            colname_scans = self.colname_oldscans
-        else:
-            colname_hosts = self.colname_hosts
-            colname_scans = self.colname_scans
-        self.db[colname_hosts].remove(spec_or_id=host['_id'])
-        for scanid in self.getscanids(host):
-            if self.find_one(colname_hosts, {'scanid': scanid}) is None:
-                self.db[colname_scans].remove(spec_or_id=scanid)
+        self.db[self.columns[self.column_hosts]].remove(spec_or_id=host['_id'])
 
-    def store_or_merge_host(self, host, gettoarchive, merge=False):
-        if merge and self.merge_host(host):
-            return
-        self.archive_from_func(host, gettoarchive)
-        self.store_host(host)
+    def store_or_merge_host(self, host):
+        raise NotImplementedError
 
-    def archive(self, host, unarchive=False):
-        """Archives (when `unarchive` is True, unarchives) a given
-        host record. Also (un)archives the corresponding scan and
-        removes the scan from the "not archived" (or "archived") scan
-        collection if not there is no host left in the "not archived"
-        (or "archived") host collumn.
-
-        """
-        col_from_hosts, col_from_scans, col_to_hosts, col_to_scans = (
-            (self.colname_oldhosts, self.colname_oldscans,
-             self.colname_hosts, self.colname_scans)
-            if unarchive else
-            (self.colname_hosts, self.colname_scans,
-             self.colname_oldhosts, self.colname_oldscans)
-        )
-        if self.find_one(col_from_hosts, {"_id": host['_id']}) is None:
-            utils.LOGGER.warning(
-                "Cannot %sarchive: host %s does not exist in %r",
-                "un" if unarchive else "", host['_id'], col_from_hosts
-            )
-        # store the host in the archive hosts collection
-        self.db[col_to_hosts].insert(host)
-        utils.LOGGER.debug(
-            "HOST %sARCHIVED: %s in %r", "UN" if unarchive else "",
-            host['_id'], col_to_hosts,
-        )
-        # remove the host from the (not archived) hosts collection
-        self.db[col_from_hosts].remove(spec_or_id=host['_id'])
-        utils.LOGGER.debug("HOST REMOVED: %s from %r", host['_id'],
-                           col_from_hosts)
-        for scanid in self.getscanids(host):
-            scan = self.find_one(col_from_scans, {'_id': scanid})
-            if scan is not None:
-                # store the scan in the archive scans collection if it
-                # is not there yet
-                if self.find_one(col_to_scans,
-                                 {'_id': scanid}) is None:
-                    self.db[col_to_scans].insert(scan)
-                    utils.LOGGER.debug(
-                        "SCAN %sARCHIVED: %s in %r\n",
-                        "UN" if unarchive else "", scanid, col_to_scans,
-                    )
-                # remove the scan from the (not archived) scans
-                # collection if there is no more hosts related to this
-                # scan in the hosts collection
-                if self.find_one(col_from_hosts,
-                                 {'scanid': scanid}) is None:
-                    self.db[col_from_scans].remove(spec_or_id=scanid)
-                    utils.LOGGER.debug(
-                        "SCAN REMOVED: %s in %r", scanid, col_from_scans,
-                    )
-
-    def archive_from_func(self, host, gettoarchive):
-        if gettoarchive is None:
-            return
-        for rec in gettoarchive(host['addr'], host.get('source')):
-            self.archive(rec)
-
-    def get_mean_open_ports(self, flt, archive=False):
+    def get_mean_open_ports(self, flt):
         """This method returns for a specific query `flt` a list of
         dictionary objects whose keys are `id` and `mean`; the value
         for `id` is a backend-dependant and uniquely identifies a
@@ -1264,12 +1552,10 @@ have no effect if it is not expected)."""
                           "id": "$_id",
                           "mean": {"$multiply": ["$count", "$ports"]}}},
         ]
-        return self.db[
-            self.colname_oldhosts if archive
-            else self.colname_hosts
-        ].aggregate(aggr, cursor={})
+        return self.db[self.columns[self.column_hosts]].aggregate(aggr,
+                                                                  cursor={})
 
-    def group_by_port(self, flt, archive=False):
+    def group_by_port(self, flt):
         """Work-in-progress function to get scan results grouped by
         common open ports
 
@@ -1296,10 +1582,8 @@ have no effect if it is not expected)."""
             {"$group": {"_id": "$ports",
                         "ids": {"$addToSet": "$_id"}}},
         ]
-        return self.db[
-            self.colname_oldhosts if archive
-            else self.colname_hosts
-        ].aggregate(aggr, cursor={})
+        return self.db[self.columns[self.column_hosts]].aggregate(aggr,
+                                                                  cursor={})
 
     @staticmethod
     def json2dbrec(host):
@@ -1422,10 +1706,8 @@ have no effect if it is not expected)."""
 
         """
         if neg:
-            if isinstance(src, utils.REGEXP_T):
-                return {'source': {'$not': src}}
-            return {'source': {'$ne': src}}
-        return {'source': src}
+            return {'source': {'$not': {'$in': [src]}}}
+        return {'source': {'$in': [src]}}
 
     @staticmethod
     def searchport(port, protocol='tcp', state='open', neg=False):
@@ -1501,7 +1783,7 @@ have no effect if it is not expected)."""
             return {'$or': [{'openports.count': cond} for cond in flt]}
         # return {'openports.count':
         #         dict(item for cond in flt for item in viewitems(cond))}
-        return {'openports.count': {'$lte':maxn, '$gte':minn}}
+        return {'openports.count': {'$lte': maxn, '$gte': minn}}
 
     @staticmethod
     def searchopenport(neg=False):
@@ -1542,12 +1824,12 @@ have no effect if it is not expected)."""
         return {'ports': {'$elemMatch': flt}}
 
     @staticmethod
-    def searchscript(name=None, output=None, values=None):
+    def searchscript(name=None, output=None, values=None, neg=False):
         """Search a particular content in the scripts results.
 
         """
         req = {}
-        if name is not None:
+        if name:
             req['id'] = name
         if output is not None:
             req['output'] = output
@@ -1555,19 +1837,35 @@ have no effect if it is not expected)."""
             if name is None:
                 raise TypeError(".searchscript() needs a `name` arg "
                                 "when using a `values` arg")
-            for field, value in viewitems(values):
-                req["%s.%s" % (xmlnmap.ALIASES_TABLE_ELEMS.get(name, name),
-                               field)] = value
+            if isinstance(values, (basestring, utils.REGEXP_T)):
+                req[xmlnmap.ALIASES_TABLE_ELEMS.get(name, name)] = values
+            else:
+                for field, value in viewitems(values):
+                    req["%s.%s" % (xmlnmap.ALIASES_TABLE_ELEMS.get(name, name),
+                                   field)] = value
         if not req:
-            return {"ports.scripts": {"$exists": True}}
+            return {"ports.scripts": {"$exists": not neg}}
         if len(req) == 1:
             field, value = next(iter(viewitems(req)))
-            return {"ports.scripts.%s" % field: value}
-        return {"ports.scripts": {"$elemMatch": req}}
+            if neg:
+                return {"ports.scripts.%s" % field: {"$ne": value}}
+            else:
+                return {"ports.scripts.%s" % field: value}
+        if neg:
+            return {"ports.scripts": {"$not": {"$elemMatch": req}}}
+        else:
+            return {"ports.scripts": {"$elemMatch": req}}
+
+    @classmethod
+    def searchcert(cls, keytype=None):
+        if keytype is None:
+            return cls.searchscript(name="ssl-cert")
+        return cls.searchscript(name="ssl-cert",
+                                values={'pubkey.type': keytype})
 
     @staticmethod
-    def searchsvchostname(srv):
-        return {'ports.service_hostname': srv}
+    def searchsvchostname(hostname):
+        return {'ports.service_hostname': hostname}
 
     @staticmethod
     def searchwebmin():
@@ -1741,25 +2039,32 @@ have no effect if it is not expected)."""
             )
         return {'endtime': {'$gte': start}, 'starttime': {'$lte': stop}}
 
-    @staticmethod
-    def searchhop(hop, ttl=None, neg=False):
+    @classmethod
+    def searchhop(cls, hop, ttl=None, neg=False):
         try:
-            hop = utils.ip2int(hop)
-        except (TypeError, utils.socket.error):
+            hop = cls.ip2internal(hop)
+        except ValueError:
             pass
         if ttl is None:
-            return {'traces.hops.ipaddr': {'$ne': hop} if neg else hop}
+            flt = {'traces.hops': {'$elemMatch': {'ipaddr_0': hop[0],
+                                                  'ipaddr_1': hop[1]}}}
+            return {'$not': flt} if neg else flt
         if neg:
             return {
                 '$or': [
                     {'traces.hops': {'$elemMatch': {
                         'ttl': ttl,
-                        'ipaddr': {'$ne': hop},
+                        '$or': [
+                            {'ipaddr_0': {'$ne': hop[0]}},
+                            {'ipaddr_1': {'$ne': hop[1]}},
+                        ],
                     }}},
                     {'traces.hops.ttl': {'$ne': ttl}},
                 ]
             }
-        return {'traces.hops': {'$elemMatch': {'ipaddr': hop, 'ttl': ttl}}}
+        return {'traces.hops': {'$elemMatch': {'ipaddr_0': hop[0],
+                                               'ipaddr_1': hop[1],
+                                               'ttl': ttl}}}
 
     @staticmethod
     def searchhopdomain(hop, neg=False):
@@ -1843,8 +2148,8 @@ have no effect if it is not expected)."""
             return {"cpes": {"$elemMatch": flt}}
 
     def topvalues(self, field, flt=None, topnbr=10, sort=None,
-                  limit=None, skip=None, least=False, archive=False,
-                  aggrflt=None, specialproj=None, specialflt=None):
+                  limit=None, skip=None, least=False, aggrflt=None,
+                  specialproj=None, specialflt=None):
         """
         This method makes use of the aggregation framework to produce
         top values for a given field or pseudo-field. Pseudo-fields are:
@@ -1860,6 +2165,7 @@ have no effect if it is not expected)."""
           - script:<scriptid> / script:<port>:<scriptid>
             / script:host:<scriptid>
           - cert.* / smb.* / sshkey.* / ike.*
+          - httphdr / httphdr.{name,value} / httphdr:<name>
           - modbus.* / s7.* / enip.*
           - mongo.dbs.*
           - vulns.*
@@ -1867,7 +2173,8 @@ have no effect if it is not expected)."""
           - file.* / file.*:scriptid
           - hop
         """
-        null_if_empty = lambda val: val if val else None
+        def null_if_empty(val):
+            return val if val else None
         outputproc = None
         if flt is None:
             flt = self.flt_empty
@@ -1880,77 +2187,146 @@ have no effect if it is not expected)."""
             field = "categories"
         elif field == "country":
             flt = self.flt_and(flt, {"infos.country_code": {"$exists": True}})
-            field = "infos.country_code"
-            outputproc = lambda x: {
-                'count': x['count'],
-                '_id': (
-                    x['_id'],
-                    self.globaldb.data.country_name_by_code(x['_id']),
-                ),
-            }
+            field = "country"
+            if self.mongodb_32_more:
+                specialproj = {"_id": 0,
+                               "country": [
+                                   "$infos.country_code",
+                                   {"$ifNull": ["$infos.country_name", "?"]},
+                               ]}
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialproj = {"_id": 0,
+                               "country": _old_array(
+                                   "$infos.country_code",
+                                   {"$ifNull": ["$infos.country_name", "?"]},
+                               )}
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'].split('###', 1))}
         elif field == "city":
             flt = self.flt_and(
                 flt,
                 {"infos.country_code": {"$exists": True}},
                 {"infos.city": {"$exists": True}}
             )
-            specialproj = {"_id": 0,
-                           "city": {"$concat": [
-                               "$infos.country_code",
-                               "###",
-                               "$infos.city",
-                           ]}}
-            field = "city"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(x['_id'].split('###', 1))}
+            if self.mongodb_32_more:
+                specialproj = {"_id": 0,
+                               "city": [
+                                   "$infos.country_code",
+                                   "$infos.city",
+                               ]}
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialproj = {"_id": 0,
+                               "city": _old_array(
+                                   "$infos.country_code",
+                                   "$infos.city",
+                               )}
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'].split('###', 1))}
         elif field == "asnum":
             flt = self.flt_and(flt, {"infos.as_num": {"$exists": True}})
             field = "infos.as_num"
         elif field == "as":
             flt = self.flt_and(flt, {"infos.as_num": {"$exists": True}})
-            specialproj = {
-                "_id": 0,
-                "as": {"$concat": [
-                    # hack to convert the integer to a string and
-                    # prevent the exception "$concat only supports
-                    # strings, not NumberInt32"
-                    {"$toLower": "$infos.as_num"},
-                    "###",
-                    {"$ifNull": ['$infos.as_name', ""]},
-                    #"$infos.as_name",
-                ]}}
-            field = "as"
-            outputproc = lambda x: {
-                'count': x['count'],
-                '_id': (None, None) if x['_id'] is None else tuple(
-                    int(y) if i == 0 else y for i, y in
-                    enumerate(x['_id'].split('###'))
-                ),
-            }
-        elif field == "net" or field.startswith("net:"):
-            field = "addr"
-            mask = int(field.split(':', 1)[1]) if ':' in field else 24
-            if self.server_info['versionArray'] >= [3, 2]:
+            if self.mongodb_32_more:
                 specialproj = {
                     "_id": 0,
-                    "addr": {"$floor": {"$divide": ["$addr",
-                                                    2 ** (32 - mask)]}},
+                    "as": ["$infos.as_num", '$infos.as_name'],
+                }
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(
+                            int(y) if i == 0 else y
+                            for i, y in enumerate(x['_id'])
+                        ),
+                    }
+            else:
+                specialproj = {
+                    "_id": 0,
+                    "as": _old_array(
+                        {"$toLower": "$infos.as_num"},
+                        {"$ifNull": ['$infos.as_name', '']},
+                    )
+                }
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(
+                            int(y) if i == 0 else y for i, y in
+                            enumerate(x['_id'].split('###'))
+                        ),
+                    }
+        elif field == "addr":
+            specialproj = {
+                "_id": 0,
+                '$addr_0': 1,
+                '$addr_1': 1,
+            }
+            if self.mongodb_32_more:
+                specialflt = [{"$project": {field: ['$addr_0', '$addr_1']}}]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': self.internal2ip(x['_id']),
+                    }
+            else:
+                specialflt = [{"$project": {field: _old_array(
+                    "$addr_0", "$addr_1",
+                    convert_to_string=True,
+                )}}]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': self.internal2ip([int(val) for val in
+                                                 x['_id'].split('###')]),
+                    }
+        elif field == "net" or field.startswith("net:"):
+            flt = self.flt_and(flt, self.searchipv4())
+            mask = int(field.split(':', 1)[1]) if ':' in field else 24
+            field = "addr"
+            # This should not overflow thanks to .searchipv4() filter
+            addr = {"$add": ["$addr_1", 0x7fff000100000000]}
+            if self.mongodb_32_more:
+                specialproj = {
+                    "_id": 0,
+                    "addr": {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}},
                 }
             else:
                 specialproj = {
                     "_id": 0,
-                    "addr": {"$subtract": [{"$divide": ["$addr",
+                    "addr": {"$subtract": [{"$divide": [addr,
                                                         2 ** (32 - mask)]},
                                            {"$mod": [{"$divide": [
-                                               "$addr",
+                                               addr,
                                                2 ** (32 - mask),
                                            ]}, 1]}]},
                 }
-            outputproc = lambda x: {
-                'count': x['count'],
-                '_id': '%s/%d' % (utils.int2ip(x['_id'] * 2 ** (32 - mask)),
-                                  mask),
-            }
+            flt = self.flt_and(flt, self.searchipv4())
+
+            def outputproc(x):
+                return {
+                    'count': x['count'],
+                    '_id': '%s/%d' % (
+                        utils.int2ip(int(x['_id']) * 2 ** (32 - mask)),
+                        mask,
+                    ),
+                }
         elif field == "port" or field.startswith("port:"):
             if field == "port":
                 info = {"$exists": True}
@@ -1964,24 +2340,35 @@ have no effect if it is not expected)."""
                 )
             field = "ports.port"
             flt = self.flt_and(flt, {flt_field: info})
-            specialproj = {"_id": 0, flt_field: 1, field: 1, "ports.protocol": 1}
-            specialflt = [
-                {"$match": {flt_field: info}},
-                {"$project": {field: {"$concat": [
-                    # hack to convert the integer to a
-                    # string and prevent the exception
-                    # "$concat only supports strings, not
-                    # NumberInt32"
-                    "$ports.protocol",
-                    "###",
-                    {"$toLower": "$ports.port"},
-                ]}}},
-            ]
-            outputproc = lambda x: {
-                'count': x['count'],
-                '_id': tuple(int(y) if i == 1 else y for i, y in
-                             enumerate(x['_id'].split('###'))),
-            }
+            specialproj = {"_id": 0, flt_field: 1, field: 1,
+                           "ports.protocol": 1}
+            if self.mongodb_32_more:
+                specialflt = [
+                    {"$match": {flt_field: info}},
+                    {"$project": {field: ["$ports.protocol", "$ports.port"]}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(int(y) if i == 1 else y for i, y in
+                                     enumerate(x['_id'])),
+                    }
+            else:
+                specialflt = [
+                    {"$match": {flt_field: info}},
+                    {"$project": {field: _old_array(
+                        "$ports.protocol",
+                        {"$toLower": "$ports.port"},
+                    )}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(int(y) if i == 1 else y for i, y in
+                                     enumerate(x['_id'].split('###'))),
+                    }
         elif field.startswith("portlist:"):
             specialproj = {"ports.port": 1, "ports.protocol": 1,
                            "ports.state_state": 1}
@@ -1993,7 +2380,7 @@ have no effect if it is not expected)."""
                 # We use $redact instead of $match to keep an empty
                 # list when no port matches.
                 #
-                # The firts "$cond" help us make the difference
+                # The first "$cond" help us make the difference
                 # between main document ($ports exists in that case)
                 # and a nested document ($ports does not exist in that
                 # case). The second only keeps ports we are interested in.
@@ -2012,10 +2399,12 @@ have no effect if it is not expected)."""
                 {"$project": {"portlist": "$ports"}},
             ]
             field = "portlist"
-            outputproc = lambda x: {
-                'count': x['count'],
-                '_id': [(y['protocol'], y['port']) for y in x['_id']],
-            }
+
+            def outputproc(x):
+                return {
+                    'count': x['count'],
+                    '_id': [(y['protocol'], y['port']) for y in x['_id']],
+                }
 
         elif field.startswith('countports:'):
             state = field.split(':', 1)[1]
@@ -2027,8 +2416,8 @@ have no effect if it is not expected)."""
                 specialflt = [
                     {"$project": {"ports": {"$ifNull": ["$ports", []]}}},
                     # See "portlist:".
-                    {"$redact": {"$cond": {"if": {"$eq": [{"$ifNull": ["$ports",
-                                                                       None]},
+                    {"$redact": {"$cond": {"if": {"$eq": [{"$ifNull":
+                                                           ["$ports", None]},
                                                           None]},
                                            "then": {
                                                "$cond": {
@@ -2052,12 +2441,13 @@ have no effect if it is not expected)."""
                 {"$match": {"ports.state_state": "open"}},
                 {"$project":
                  {"ports.service_name":
-                  {"$ifNull": ["$ports.service_name", ""]},
-                 }},
+                  {"$ifNull": ["$ports.service_name", ""]}}},
             ]
             field = "ports.service_name"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'] if x['_id'] else None}
+
+            def outputproc(x):
+                return {'count': x['count'],
+                        '_id': x['_id'] if x['_id'] else None}
         elif field.startswith("service:"):
             port = int(field.split(':', 1)[1])
             flt = self.flt_and(flt, self.searchport(port))
@@ -2066,8 +2456,7 @@ have no effect if it is not expected)."""
                 {"$match": {"ports.port": port}},
                 {"$project":
                  {"ports.service_name":
-                  {"$ifNull": ["$ports.service_name", ""]},
-                 }},
+                  {"$ifNull": ["$ports.service_name", ""]}}},
             ]
             field = "ports.service_name"
         elif field == 'product':
@@ -2078,20 +2467,37 @@ have no effect if it is not expected)."""
                 "ports.service_name": 1,
                 "ports.service_product": 1,
             }
-            specialflt = [
-                {"$match": {"ports.state_state": "open"}},
-                {"$project":
-                 {"ports.service_product":
-                  {"$concat": [
-                      {"$ifNull": ["$ports.service_name", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_product", ""]},
-                  ]}}}
-            ]
+            if self.mongodb_32_more:
+                specialflt = [
+                    {"$match": {"ports.state_state": "open"}},
+                    {"$project":
+                     {"ports.service_product":
+                      ["$ports.service_name",
+                       "$ports.service_product"]}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(x['_id']),
+                    }
+            else:
+                specialflt = [
+                    {"$match": {"ports.state_state": "open"}},
+                    {"$project":
+                     {"ports.service_product": _old_array(
+                         {"$ifNull": ["$ports.service_name", ""]},
+                         {"$ifNull": ["$ports.service_product", ""]},
+                     )}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(elt if elt else None for elt in
+                                     x['_id'].split('###')),
+                    }
             field = "ports.service_product"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(elt if elt else None for elt in
-                                                 x['_id'].split('###'))}
         elif field.startswith('product:'):
             service = field.split(':', 1)[1]
             if service.isdigit():
@@ -2111,19 +2517,34 @@ have no effect if it is not expected)."""
                 "ports.service_name": 1,
                 "ports.service_product": 1,
             }
-            specialflt.append(
-                {"$project":
-                 {"ports.service_product":
-                  {"$concat": [
-                      {"$ifNull": ["$ports.service_name", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_product", ""]},
-                  ]}}}
-            )
+            if self.mongodb_32_more:
+                specialflt.append(
+                    {"$project":
+                     {"ports.service_product":
+                      ["$ports.service_name", "$ports.service_product"]}},
+                )
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(x['_id']),
+                    }
+            else:
+                specialflt.append(
+                    {"$project":
+                     {"ports.service_product": _old_array(
+                         {"$ifNull": ["$ports.service_name", ""]},
+                         {"$ifNull": ["$ports.service_product", ""]},
+                     )}},
+                )
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(elt if elt else None for elt in
+                                     x['_id'].split('###')),
+                    }
             field = "ports.service_product"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(elt if elt else None for elt in
-                                                 x['_id'].split('###'))}
         elif field == 'version':
             flt = self.flt_and(flt, self.searchopenport())
             specialproj = {
@@ -2133,22 +2554,40 @@ have no effect if it is not expected)."""
                 "ports.service_product": 1,
                 "ports.service_version": 1,
             }
-            specialflt = [
-                {"$match": {"ports.state_state": "open"}},
-                {"$project":
-                 {"ports.service_product":
-                  {"$concat": [
-                      {"$ifNull": ["$ports.service_name", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_product", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_version", ""]},
-                  ]}}}
-            ]
+            if self.mongodb_32_more:
+                specialflt = [
+                    {"$match": {"ports.state_state": "open"}},
+                    {"$project":
+                     {"ports.service_product": [
+                         "$ports.service_name",
+                         "$ports.service_product",
+                         "$ports.service_version",
+                     ]}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(x['_id']),
+                    }
+            else:
+                specialflt = [
+                    {"$match": {"ports.state_state": "open"}},
+                    {"$project":
+                     {"ports.service_product": _old_array(
+                         {"$ifNull": ["$ports.service_name", ""]},
+                         {"$ifNull": ["$ports.service_product", ""]},
+                         {"$ifNull": ["$ports.service_version", ""]},
+                     )}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(elt if elt else None for elt in
+                                     x['_id'].split('###')),
+                    }
             field = "ports.service_product"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(elt if elt else None for elt in
-                                                 x['_id'].split('###'))}
         elif field.startswith('version:'):
             service = field.split(':', 1)[1]
             if service.isdigit():
@@ -2179,21 +2618,38 @@ have no effect if it is not expected)."""
                 "ports.service_product": 1,
                 "ports.service_version": 1,
             }
-            specialflt.append(
-                {"$project":
-                 {"ports.service_product":
-                  {"$concat": [
-                      {"$ifNull": ["$ports.service_name", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_product", ""]},
-                      "###",
-                      {"$ifNull": ["$ports.service_version", ""]},
-                  ]}}}
-            )
+            if self.mongodb_32_more:
+                specialflt.append(
+                    {"$project":
+                     {"ports.service_product": [
+                         "$ports.service_name",
+                         "$ports.service_product",
+                         "$ports.service_version",
+                     ]}},
+                )
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(x['_id']),
+                    }
+            else:
+                specialflt.append(
+                    {"$project":
+                     {"ports.service_product": _old_array(
+                         {"$ifNull": ["$ports.service_name", ""]},
+                         {"$ifNull": ["$ports.service_product", ""]},
+                         {"$ifNull": ["$ports.service_version", ""]},
+                     )}},
+                )
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': tuple(elt if elt else None for elt in
+                                     x['_id'].split('###')),
+                    }
             field = "ports.service_product"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(elt if elt else None for elt in
-                                                 x['_id'].split('###'))}
         elif field.startswith("cpe"):
             try:
                 field, cpeflt = field.split(":", 1)
@@ -2223,7 +2679,7 @@ have no effect if it is not expected)."""
             cpeflt2 = dict(("cpes.%s" % key, value) for key, value in cpeflt)
             # We need to keep enough cpes.* fields for the projection
             # *and* for our filter
-            fields = fields[:max(fields.index(field), len(cpeflt)) + 1]
+            fields = fields[:max(fields.index(field), len(cpeflt2)) + 1]
             flt = self.flt_and(flt, cpeflt1)
             specialproj = dict(("cpes.%s" % fname, 1) for fname in fields)
             specialproj["_id"] = 0
@@ -2238,8 +2694,10 @@ have no effect if it is not expected)."""
             specialflt.append(
                 {"$project": {"cpes.%s" % field: {"$concat": concat}}})
             field = "cpes.%s" % field
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(x['_id'].split(':', 3))}
+
+            def outputproc(x):
+                return {'count': x['count'],
+                        '_id': tuple(x['_id'].split(':', 3))}
         elif field == 'devicetype':
             field = "ports.service_devicetype"
         elif field.startswith('devicetype:'):
@@ -2301,21 +2759,142 @@ have no effect if it is not expected)."""
         elif field.startswith('cert.'):
             subfield = field[5:]
             field = 'ports.scripts.ssl-cert.' + subfield
+        elif field == 'useragent' or field.startswith('useragent:'):
+            if field == 'useragent':
+                flt = self.flt_and(flt, self.searchuseragent())
+            else:
+                subfield = utils.str2regexp(field[10:])
+                flt = self.flt_and(flt,
+                                   self.searchuseragent(useragent=subfield))
+                specialflt = [
+                    {"$match": {'ports.scripts.http-user-agent': subfield}},
+                ]
+            field = "ports.scripts.http-user-agent"
+        elif field == 'ja3-client' or (
+                field.startswith('ja3-client') and field[10] in ':.'
+        ):
+            if ':' in field:
+                field, value = field.split(':', 1)
+                subkey, value = self._ja3keyvalue(utils.str2regexp(value))
+                specialflt = [
+                    {"$match": {
+                        'ports.scripts.ssl-ja3-client.%s' % subkey: value,
+                    }},
+                ]
+            else:
+                value = None
+                subkey = None
+            if '.' in field:
+                field, subfield = field.split('.', 1)
+            else:
+                subfield = 'md5'
+            if subkey is not None and subkey != subfield:
+                specialproj = {"_id": 0,
+                               "ports.scripts.ssl-ja3-client.%s" % subkey: 1,
+                               "ports.scripts.ssl-ja3-client.%s" % subfield: 1}
+            flt = self.flt_and(flt, self.searchja3client(value_or_hash=value))
+            field = "ports.scripts.ssl-ja3-client.%s" % subfield
+        elif field == 'ja3-server' or (
+                field.startswith('ja3-server') and field[10] in ':.'
+        ):
+            if ':' in field:
+                field, values = field.split(':', 1)
+                if ':' in values:
+                    value1, value2 = values.split(':', 1)
+                    if value1:
+                        subkey1, value1 = self._ja3keyvalue(
+                            utils.str2regexp(value1)
+                        )
+                    else:
+                        subkey1, value1 = None, None
+                    if value2:
+                        subkey2, value2 = self._ja3keyvalue(
+                            utils.str2regexp(value2)
+                        )
+                    else:
+                        subkey2, value2 = None, None
+                else:
+                    subkey1, value1 = self._ja3keyvalue(
+                        utils.str2regexp(values)
+                    )
+                    subkey2, value2 = None, None
+            else:
+                subkey1, value1 = None, None
+                subkey2, value2 = None, None
+            if '.' in field:
+                field, subfield = field.split('.', 1)
+            else:
+                subfield = 'md5'
+            flt = self.flt_and(flt, self.searchja3server(
+                value_or_hash=value1,
+                client_value_or_hash=value2,
+            ))
+            specialproj = {
+                "_id": 0,
+                "ports.scripts.ssl-ja3-server.%s" % subfield: 1,
+                "ports.scripts.ssl-ja3-server.client.%s" % subfield: 1,
+            }
+            if subkey1 is not None and subkey1 != subfield:
+                specialproj["ports.scripts.ssl-ja3-server.%s" % subkey1] = 1
+            if subkey2 is not None and subkey2 != subfield:
+                specialproj[
+                    "ports.scripts.ssl-ja3-server.client.%s" % subkey2
+                ] = 1
+            field = "ports.scripts.ssl-ja3-server"
+            if self.mongodb_32_more:
+                specialflt.append({"$project": {
+                    "_id": 0,
+                    field: [
+                        '$ports.scripts.ssl-ja3-server.%s' % subfield,
+                        '$ports.scripts.ssl-ja3-server.client.%s' % subfield,
+                    ],
+                }})
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialflt.append({"$project": {
+                    "_id": 0,
+                    field: _old_array(
+                        '$ports.scripts.ssl-ja3-server.%s' % subfield,
+                        '$ports.scripts.ssl-ja3-server.client.%s' % subfield,
+                        convert_to_string=True,
+                    ),
+                }})
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'].split('###', 1))}
         elif field == 'sshkey.bits':
             flt = self.flt_and(flt, self.searchsshkey())
             specialproj = {"ports.scripts.ssh-hostkey.type": 1,
                            "ports.scripts.ssh-hostkey.bits": 1}
-            specialflt = [{"$project": {
-                "_id": 0,
-                "ports.scripts.ssh-hostkey.bits": {
-                    "$concat": [
+            if self.mongodb_32_more:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ssh-hostkey.bits": [
                         "$ports.scripts.ssh-hostkey.type",
-                        "###",
                         "$ports.scripts.ssh-hostkey.bits",
-                    ]}}}]
+                    ],
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ssh-hostkey.bits": _old_array(
+                        "$ports.scripts.ssh-hostkey.type",
+                        "$ports.scripts.ssh-hostkey.bits",
+                    ),
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'].split('###'))}
             field = "ports.scripts.ssh-hostkey.bits"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(x['_id'].split('###'))}
         elif field.startswith('sshkey.'):
             flt = self.flt_and(flt, self.searchsshkey())
             subfield = field[7:]
@@ -2324,49 +2903,91 @@ have no effect if it is not expected)."""
             flt = self.flt_and(flt, self.searchscript(name="ike-info"))
             specialproj = {"ports.scripts.ike-info.vendor_ids.value": 1,
                            "ports.scripts.ike-info.vendor_ids.name": 1}
-            specialflt = [{"$project": {
-                "_id": 0,
-                "ports.scripts.ike-info.vendor_ids": {
-                    "$concat": [
+            if self.mongodb_32_more:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ike-info.vendor_ids": [
                         "$ports.scripts.ike-info.vendor_ids.value",
-                        "###",
-                        {"$ifNull": ["$ports.scripts.ike-info.vendor_ids.name", ""]},
-                    ]}}}]
+                        "$ports.scripts.ike-info.vendor_ids.name",
+                    ],
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ike-info.vendor_ids": _old_array(
+                        "$ports.scripts.ike-info.vendor_ids.value",
+                        {"$ifNull": ["$ports.scripts.ike-info.vendor_ids.name",
+                                     ""]},
+                    ),
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(null_if_empty(val) for val
+                                         in x['_id'].split('###'))}
             field = "ports.scripts.ike-info.vendor_ids"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(null_if_empty(val) for val in
-                                                 x['_id'].split('###'))}
         elif field == 'ike.transforms':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
                 values={"transforms": {"$exists": True}},
             ))
-            specialproj = {"ports.scripts.ike-info.transforms.Authentication": 1,
-                           "ports.scripts.ike-info.transforms.Encryption": 1,
-                           "ports.scripts.ike-info.transforms.GroupDesc": 1,
-                           "ports.scripts.ike-info.transforms.Hash": 1,
-                           "ports.scripts.ike-info.transforms.LifeDuration": 1,
-                           "ports.scripts.ike-info.transforms.LifeType": 1}
-            specialflt = [{"$project": {
-                "_id": 0,
-                "ports.scripts.ike-info.transforms": {
-                    "$concat": [
-                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Authentication", ""]},
-                        "###",
-                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Encryption", ""]},
-                        "###",
-                        {"$ifNull": ["$ports.scripts.ike-info.transforms.GroupDesc", ""]},
-                        "###",
-                        {"$ifNull": ["$ports.scripts.ike-info.transforms.Hash", ""]},
-                        "###",
-                        {"$toLower": "$ports.scripts.ike-info.transforms.LifeDuration"},
-                        "###",
-                        {"$ifNull": ["$ports.scripts.ike-info.transforms.LifeType", ""]},
-                    ]}}}]
+            specialproj = {
+                "ports.scripts.ike-info.transforms.Authentication": 1,
+                "ports.scripts.ike-info.transforms.Encryption": 1,
+                "ports.scripts.ike-info.transforms.GroupDesc": 1,
+                "ports.scripts.ike-info.transforms.Hash": 1,
+                "ports.scripts.ike-info.transforms.LifeDuration": 1,
+                "ports.scripts.ike-info.transforms.LifeType": 1,
+            }
+            if self.mongodb_32_more:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ike-info.transforms": [
+                        "$ports.scripts.ike-info.transforms.Authentication",
+                        "$ports.scripts.ike-info.transforms.Encryption",
+                        "$ports.scripts.ike-info.transforms.GroupDesc",
+                        "$ports.scripts.ike-info.transforms.Hash",
+                        "$ports.scripts.ike-info.transforms.LifeDuration",
+                        "$ports.scripts.ike-info.transforms.LifeType",
+                    ],
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.ike-info.transforms": _old_array(
+                        {"$ifNull": [
+                            "$ports.scripts.ike-info.transforms."
+                            "Authentication",
+                            "",
+                        ]},
+                        {"$ifNull": [
+                            "$ports.scripts.ike-info.transforms.Encryption",
+                            "",
+                        ]},
+                        {"$ifNull":
+                         ["$ports.scripts.ike-info.transforms.GroupDesc", ""]},
+                        {"$ifNull":
+                         ["$ports.scripts.ike-info.transforms.Hash", ""]},
+                        {"$toLower":
+                         "$ports.scripts.ike-info.transforms.LifeDuration"},
+                        {"$ifNull":
+                         ["$ports.scripts.ike-info.transforms.LifeType", ""]},
+                    ),
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(null_if_empty(val) for val
+                                         in x['_id'].split('###'))}
             field = "ports.scripts.ike-info.transforms"
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': tuple(null_if_empty(val) for val in
-                                                 x['_id'].split('###'))}
         elif field == 'ike.notification':
             flt = self.flt_and(flt, self.searchscript(
                 name="ike-info",
@@ -2376,6 +2997,48 @@ have no effect if it is not expected)."""
         elif field.startswith('ike.'):
             flt = self.flt_and(flt, self.searchscript(name="ike-info"))
             field = "ports.scripts.ike-info." + field[4:]
+        elif field == 'httphdr':
+            flt = self.flt_and(flt, self.searchscript(name="http-headers"))
+            specialproj = {"_id": 0, "ports.scripts.http-headers.name": 1,
+                           "ports.scripts.http-headers.value": 1}
+            if self.mongodb_32_more:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.http-headers": [
+                        "$ports.scripts.http-headers.name",
+                        "$ports.scripts.http-headers.value",
+                    ],
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(x['_id'])}
+            else:
+                specialflt = [{"$project": {
+                    "_id": 0,
+                    "ports.scripts.http-headers": _old_array(
+                        "$ports.scripts.http-headers.name",
+                        "$ports.scripts.http-headers.value",
+                    ),
+                }}]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': tuple(null_if_empty(val) for val
+                                         in x['_id'].split('###'))}
+            field = "ports.scripts.http-headers"
+        elif field.startswith('httphdr.'):
+            flt = self.flt_and(flt, self.searchscript(name="http-headers"))
+            field = "ports.scripts.http-headers.%s" % field[8:]
+        elif field.startswith('httphdr:'):
+            flt = self.flt_and(flt, self.searchscript(name="http-headers"))
+            specialproj = {"_id": 0, "ports.scripts.http-headers.name": 1,
+                           "ports.scripts.http-headers.value": 1}
+            specialflt = [
+                {"$match": {"ports.scripts.http-headers.name":
+                            field[8:].lower()}}
+            ]
+            field = "ports.scripts.http-headers.value"
         elif field.startswith('modbus.'):
             flt = self.flt_and(flt, self.searchscript(name="modbus-discover"))
             subfield = field[7:]
@@ -2398,7 +3061,8 @@ have no effect if it is not expected)."""
             }.get(subfield, subfield)
             field = 'ports.scripts.enip-info.' + subfield
         elif field.startswith('mongo.dbs.'):
-            flt = self.flt_and(flt, self.searchscript(name="mongodb-databases"))
+            flt = self.flt_and(flt,
+                               self.searchscript(name="mongodb-databases"))
             field = 'ports.scripts.mongodb-databases.' + field[10:]
         elif field.startswith('vulns.'):
             flt = self.flt_and(flt, self.searchvuln())
@@ -2412,15 +3076,38 @@ have no effect if it is not expected)."""
                     "ports.scripts.vulns.id": 1,
                     field: 1,
                 }
-                specialflt = [{"$project": {"_id": 0,
-                                            field: {"$concat": [
-                                                "$ports.scripts.vulns.id",
-                                                "###",
-                                                "$" + field,
-                                            ]}}}]
-                outputproc = lambda x: {'count': x['count'],
-                                        '_id': tuple(x['_id'].split('###', 1))}
-        elif field == 'file' or (field.startswith('file') and field[4] in '.:'):
+                if self.mongodb_32_more:
+                    specialflt = [{
+                        "$project": {
+                            "_id": 0,
+                            field: [
+                                "$ports.scripts.vulns.id",
+                                "$" + field,
+                            ],
+                        },
+                    }]
+
+                    def outputproc(x):
+                        return {'count': x['count'],
+                                '_id': tuple(x['_id'])}
+                else:
+                    specialflt = [{
+                        "$project": {
+                            "_id": 0,
+                            field: _old_array(
+                                "$ports.scripts.vulns.id",
+                                "$" + field,
+                            ),
+                        },
+                    }]
+
+                    def outputproc(x):
+                        return {
+                            'count': x['count'],
+                            '_id': tuple(x['_id'].split('###', 1)),
+                        }
+        elif field == 'file' or (field.startswith('file') and
+                                 field[4] in '.:'):
             if field.startswith('file:'):
                 scripts = field[5:]
                 if '.' in scripts:
@@ -2441,24 +3128,52 @@ have no effect if it is not expected)."""
                     {"$match": {"ports.scripts.id":
                                 flt['ports.scripts']['$elemMatch']['id']}},
                     {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
-                    #{"$project": {field: 1}},
+                    # {"$project": {field: 1}},
                 ]
             else:
                 specialflt = [
                     {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
                 ]
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': x['_id'] if x['_id'] else None}
+
+            def outputproc(x):
+                return {'count': x['count'],
+                        '_id': x['_id'] if x['_id'] else None}
         elif field == 'screenwords':
             field = 'ports.screenwords'
             flt = self.flt_and(flt, self.searchscreenshot(words=True))
         elif field == 'hop':
             field = 'traces.hops.ipaddr'
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': utils.int2ip(x['_id'])}
+            specialproj = {"_id": 0,
+                           "traces.hops.ipaddr_0": 1,
+                           "traces.hops.ipaddr_1": 1}
+            if self.mongodb_32_more:
+                specialflt = [
+                    {"$project": {field: ['$traces.hops.ipaddr_0',
+                                          '$traces.hops.ipaddr_1']}},
+                ]
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': self.internal2ip(x['_id'])}
+            else:
+                specialflt = [
+                    {"$project": {field: _old_array('$traces.hops.ipaddr_0',
+                                                    '$traces.hops.ipaddr_1',
+                                                    convert_to_string=True)}},
+                ]
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': self.internal2ip([
+                            int(val) for val in
+                            x['_id'].split('###')
+                        ]),
+                    }
         elif field.startswith('hop') and field[3] in ':>':
             specialproj = {"_id": 0,
-                           "traces.hops.ipaddr": 1,
+                           "traces.hops.ipaddr_0": 1,
+                           "traces.hops.ipaddr_1": 1,
                            "traces.hops.ttl": 1}
             specialflt = [
                 {"$match": {
@@ -2466,45 +3181,135 @@ have no effect if it is not expected)."""
                         int(field[4:])
                         if field[3] == ':' else
                         {"$gt": int(field[4:])}
+                    )}}]
+            if self.mongodb_32_more:
+                specialflt.append(
+                    {"$project": {'traces.hops.ipaddr': [
+                        '$traces.hops.ipaddr_0',
+                        '$traces.hops.ipaddr_1',
+                    ]}},
+                )
+
+                def outputproc(x):
+                    return {'count': x['count'],
+                            '_id': self.internal2ip(x['_id'])}
+            else:
+                specialflt.append(
+                    {"$project": {'traces.hops.ipaddr': _old_array(
+                        '$traces.hops.ipaddr_0',
+                        '$traces.hops.ipaddr_1',
+                        convert_to_string=True,
                     )}},
-                {"$project": {"traces.hops.ipaddr": 1}}
-            ]
+                )
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': self.internal2ip([
+                            int(val) for val in
+                            x['_id'].split('###')
+                        ]),
+                    }
             field = 'traces.hops.ipaddr'
-            outputproc = lambda x: {'count': x['count'],
-                                    '_id': utils.int2ip(x['_id'])}
         pipeline = self._topvalues(
             field, flt=flt, topnbr=topnbr, sort=sort, limit=limit,
             skip=skip, least=least, aggrflt=aggrflt,
             specialproj=specialproj, specialflt=specialflt,
         )
         cursor = self.set_limits(
-            self.db[self.colname_oldhosts
-                    if archive else
-                    self.colname_hosts].aggregate(pipeline, cursor={})
+            self.db[self.columns[self.column_hosts]].aggregate(pipeline,
+                                                               cursor={})
         )
         if outputproc is not None:
             return (outputproc(res) for res in cursor)
         return cursor
 
-    def distinct(self, field, flt=None, sort=None, limit=None, skip=None,
-                 archive=False):
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
 
         """
-        cursor = self.set_limits(
-            self.db[self.colname_oldhosts
-                    if archive else
-                    self.colname_hosts].aggregate(
-                        self._distinct(field, flt=flt, sort=sort,
-                                       limit=limit, skip=skip),
-                        cursor={},
-                    )
+        return self._distinct(self.columns[self.column_hosts], field, flt=flt,
+                              sort=sort, limit=limit, skip=skip)
+
+    def _features_port_list_pipeline(self, flt, use_service, use_product,
+                                     use_version):
+        return (
+            [{"$match": self.flt_and(flt, {'ports.port': {'$exists': True}})},
+             {"$project": {'_id': 0, 'ports': 1}},
+             {"$unwind": "$ports"},
+             {"$match": {'ports.port': {'$ne': -1}}}],
+            '$ports.port',
+            '$ports'
         )
-        return (res['_id'] for res in cursor)
+
+    def _features_port_get(self, features, flt, yieldall, use_service,
+                           use_product, use_version):
+        if use_version:
+            def _extract(rec):
+                for port in rec.get('ports', []):
+                    if port['port'] == -1:
+                        continue
+                    yield (port['port'], port.get('service_name'),
+                           port.get('service_product'),
+                           port.get('service_version'))
+                    if not yieldall:
+                        continue
+                    if port.get('service_version') is not None:
+                        yield (port['port'], port.get('service_name'),
+                               port.get('service_product'), None)
+                    else:
+                        continue
+                    if port.get('service_product') is not None:
+                        yield (port['port'], port.get('service_name'), None,
+                               None)
+                    else:
+                        continue
+                    if port.get('service_name') is not None:
+                        yield (port['port'], None, None, None)
+        elif use_product:
+            def _extract(rec):
+                for port in rec.get('ports', []):
+                    if port['port'] == -1:
+                        continue
+                    yield (port['port'], port.get('service_name'),
+                           port.get('service_product'))
+                    if not yieldall:
+                        continue
+                    if port.get('service_product') is not None:
+                        yield (port['port'], port.get('service_name'), None)
+                    else:
+                        continue
+                    if port.get('service_name') is not None:
+                        yield (port['port'], None, None)
+        elif use_service:
+            def _extract(rec):
+                for port in rec.get('ports', []):
+                    if port['port'] == -1:
+                        continue
+                    yield (port['port'], port.get('service_name'))
+                    if not yieldall:
+                        continue
+                    if port.get('service_name') is not None:
+                        yield (port['port'], None)
+        else:
+            def _extract(rec):
+                for port in rec.get('ports', []):
+                    if port['port'] == -1:
+                        continue
+                    yield (port['port'], )
+        n_features = len(features)
+        for rec in self.get(flt):
+            currec = [0] * n_features
+            for feat in _extract(rec):
+                try:
+                    currec[features[feat]] = 1
+                except KeyError:
+                    pass
+            yield (rec['addr'], currec)
 
     def diff_categories(self, category1, category2, flt=None,
-                        archive=False, include_both_open=True):
+                        include_both_open=True):
         """`category1` and `category2` must be categories (provided as str or
         unicode objects)
 
@@ -2525,6 +3330,10 @@ have no effect if it is not expected)."""
 
         """
         category_filter = self.searchcategory([category1, category2])
+        if self.mongodb_32_more:
+            addr = ['$addr_0', '$addr_1']
+        else:
+            addr = _old_array('$addr_0', '$addr_1', convert_to_string=True)
         pipeline = [
             {"$match": (category_filter if flt is None else
                         self.flt_and(flt, category_filter))},
@@ -2532,135 +3341,336 @@ have no effect if it is not expected)."""
             {"$match": category_filter},
             {"$unwind": "$ports"},
             {"$match": {"ports.state_state": "open"}},
-            {"$project": {"_id": 0, "addr": 1, "ports.protocol": 1,
-                          "ports.port": 1, "categories": 1}},
+            {"$project": {"_id": 0, "addr": addr, "ports.protocol": 1,
+                          "ports.port": 1,
+                          "categories": 1}},
             {"$group": {"_id": {"addr": "$addr", "proto": "$ports.protocol",
                                 "port": "$ports.port"},
                         "categories": {"$push": "$categories"}}},
         ]
-        cursor = self.db[self.colname_oldhosts if archive else
-                         self.colname_hosts].aggregate(pipeline, cursor={})
+        cursor = self.db[self.columns[self.column_hosts]].aggregate(
+            pipeline, cursor={}
+        )
+
         def categories_to_val(categories):
             state1, state2 = category1 in categories, category2 in categories
             # assert any(states)
             return (state2 > state1) - (state2 < state1)
         cursor = (dict(x['_id'], value=categories_to_val(x['categories']))
                   for x in cursor)
+        if not self.mongodb_32_more:
+            cursor = (
+                dict(x, addr=[int(val) for val in x['addr'].split('###')])
+                for x in cursor
+            )
         if include_both_open:
             return cursor
         else:
             return (result for result in cursor if result["value"])
 
-    def update_country(self, start, stop, code, create=False):
-        """Update country info on existing Nmap scan result documents"""
-        name = self.globaldb.data.country_name_by_code(code)
-        for colname in [self.colname_hosts, self.colname_oldhosts]:
-            self.db[colname].update(
-                self.searchrange(start, stop),
-                {'$set': {'infos.country_code': code,
-                          'infos.country_name': name}},
-                multi=True,
-            )
 
-    def update_city(self, start, stop, locid, create=False):
-        """Update city/location info on existing Nmap scan result documents"""
-        updatespec = dict(("infos.%s" % key, value) for key, value in
-                          viewitems(self.globaldb.data.location_byid(locid)))
-        if "infos.country_code" in updatespec:
-            updatespec[
-                "infos.country_name"
-            ] = self.globaldb.data.country_name_by_code(
-                updatespec["infos.country_code"]
-            )
-        for colname in [self.colname_hosts, self.colname_oldhosts]:
-            self.db[colname].update(
-                self.searchrange(start, stop),
-                {'$set': updatespec},
-                multi=True,
-            )
+class MongoDBNmap(MongoDBActive, DBNmap):
 
-    def update_as(self, start, stop, asnum, asname, create=False):
-        """Update AS info on existing Nmap scan result documents"""
-        if asname is None:
-            updatespec = {'infos.as_num': asnum}
-        else:
-            updatespec = {'infos.as_num': asnum, 'infos.as_name': asname}
-        # we first update existing records
-        for colname in [self.colname_hosts, self.colname_oldhosts]:
-            self.db[colname].update(
-                self.searchrange(start, stop),
-                {'$set': updatespec},
-                multi=True,
-            )
+    column_scans = 1
+
+    def __init__(self, host, dbname, colname_scans="scans",
+                 colname_hosts="hosts", **kwargs):
+        MongoDBActive.__init__(self, host, dbname, colname_hosts=colname_hosts,
+                               **kwargs)
+        DBNmap.__init__(self)
+        self.columns.append(colname_scans)
+        self.schema_migrations.append({})  # scans
+        self.content_handler = Nmap2Mongo
+        self.output_function = None
+
+    def store_scan_doc(self, scan):
+        ident = self.db[self.columns[self.column_scans]].insert(scan)
+        utils.LOGGER.debug("SCAN STORED: %r in %r", ident,
+                           self.columns[self.column_scans])
+        return ident
+
+    def store_or_merge_host(self, host):
+        self.store_host(host)
+
+    def init(self):
+        self.db[self.columns[self.column_scans]].drop()
+        super(MongoDBNmap, self).init()
+
+    def cmp_schema_version_scan(self, scan):
+        """Returns 0 if the `scan`'s schema version matches the code's
+        current version, -1 if it is higher (you need to update IVRE),
+        and 1 if it is lower (you need to call .migrate_schema()).
+
+        """
+        return self.cmp_schema_version(self.column_scans, scan)
+
+    def getscan(self, scanid):
+        return self.find_one(self.columns[self.column_scans], {'_id': scanid})
+
+    def is_scan_present(self, scanid):
+        if self.find_one(self.columns[self.column_scans], {"_id": scanid},
+                         fields=[]) is not None:
+            return True
+        return False
+
+    def remove(self, host):
+        """Removes the host "host" from the active column.
+        "host" must be the host record as returned by MongoDB.
+
+        If "host" has a "scanid" attribute, and if it refers to a scan
+        that have no more host record after the deletion of "host",
+        then the scan record is also removed.
+
+        """
+        super(MongoDBNmap, self).remove(host)
+        for scanid in self.getscanids(host):
+            if self.find_one(self.columns[self.column_hosts],
+                             {'scanid': scanid}) is None:
+                self.db[self.columns[self.column_scans]].remove(
+                    spec_or_id=scanid
+                )
+
+
+class MongoDBView(MongoDBActive, DBView):
+
+    def __init__(self, host, dbname, colname_hosts="views", **kwargs):
+        MongoDBActive.__init__(self, host, dbname, colname_hosts=colname_hosts,
+                               **kwargs)
+        DBView.__init__(self)
+
+    def store_or_merge_host(self, host):
+        if not self.merge_host(host):
+            self.store_host(host)
 
 
 class MongoDBPassive(MongoDB, DBPassive):
 
+    needunwind = ["infos.san"]
+    ipaddr_fields = ["addr"]
+    column_passive = 0
+    _features_column = 0
+    indexes = [
+        # passive
+        [
+            ([('schema_version', pymongo.ASCENDING)], {}),
+            ([('port', pymongo.ASCENDING)], {}),
+            ([('value', pymongo.ASCENDING)], {}),
+            ([('targetval', pymongo.ASCENDING)], {}),
+            ([
+                ('recontype', pymongo.ASCENDING),
+                ('source', pymongo.ASCENDING)
+            ], {}),
+            ([('firstseen', pymongo.ASCENDING)], {}),
+            ([('lastseen', pymongo.ASCENDING)], {}),
+            ([('sensor', pymongo.ASCENDING)], {}),
+            ([
+                ('addr_0', pymongo.ASCENDING),
+                ('addr_1', pymongo.ASCENDING),
+                ('recontype', pymongo.ASCENDING),
+                ('port', pymongo.ASCENDING),
+            ], {}),
+            # HTTP Auth basic
+            ([('infos.username', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.password', pymongo.ASCENDING)],
+             {"sparse": True}),
+            # DNS
+            ([('infos.domain', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.domaintarget', pymongo.ASCENDING)],
+             {"sparse": True}),
+            # SSL
+            ([('infos.md5', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.sha1', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.sha256', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.issuer_text', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.subject_text', pymongo.ASCENDING)],
+             {"sparse": True}),
+            ([('infos.pubkeyalgo', pymongo.ASCENDING)],
+             {"sparse": True}),
+        ],
+    ]
+    schema_migrations_indexes = [
+        # passive
+        {
+            1: {
+                "drop": [
+                    ([('recontype', pymongo.ASCENDING)], {}),
+                    ([
+                        ('addr', pymongo.ASCENDING),
+                        ('recontype', pymongo.ASCENDING),
+                        ('port', pymongo.ASCENDING),
+                    ], {}),
+                    ([('infos.issuer', pymongo.ASCENDING)],
+                     {"sparse": True}),
+                    ([('infos.subject', pymongo.ASCENDING)],
+                     {"sparse": True}),
+                ],
+                "ensure": [
+                    ([
+                        ('recontype', pymongo.ASCENDING),
+                        ('source', pymongo.ASCENDING)
+                    ], {}),
+                    ([
+                        ('addr_0', pymongo.ASCENDING),
+                        ('addr_1', pymongo.ASCENDING),
+                        ('recontype', pymongo.ASCENDING),
+                        ('port', pymongo.ASCENDING),
+                    ], {}),
+                    ([('schema_version', pymongo.ASCENDING)], {}),
+                    ([('infos.issuer_text', pymongo.ASCENDING)],
+                     {"sparse": True}),
+                    ([('infos.subject_text', pymongo.ASCENDING)],
+                     {"sparse": True}),
+                    ([('infos.san', pymongo.ASCENDING)],
+                     {"sparse": True}),
+                ],
+            },
+        }
+    ]
+    schema_latest_versions = [
+        # hosts
+        xmlnmap.SCHEMA_VERSION,
+    ]
+    hint_indexes = [
+        # passive
+        OrderedDict([
+            ["addr_0", [("addr_0", 1), ("addr_1", 1), ("recontype", 1),
+                        ("port", 1)]],
+            ["targetval", [("targetval", 1)]],
+        ]),
+    ]
+
     def __init__(self, host, dbname,
                  colname_passive="passive",
-                 colname_ipdata="ipdata",
                  **kargs):
         MongoDB.__init__(self, host, dbname, **kargs)
         DBPassive.__init__(self)
-        self.colname_passive = colname_passive
-        self.colname_ipdata = colname_ipdata
-        self.indexes = {
-            self.colname_passive: [
-                ([('port', pymongo.ASCENDING)], {}),
-                ([('value', pymongo.ASCENDING)], {}),
-                ([('targetval', pymongo.ASCENDING)], {}),
-                ([('recontype', pymongo.ASCENDING)], {}),
-                ([('firstseen', pymongo.ASCENDING)], {}),
-                ([('lastseen', pymongo.ASCENDING)], {}),
-                ([('sensor', pymongo.ASCENDING)], {}),
-                ([
-                    ('addr', pymongo.ASCENDING),
-                    ('recontype', pymongo.ASCENDING),
-                    ('port', pymongo.ASCENDING),
-                ], {}),
-                # HTTP Auth basic
-                ([('infos.username', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.password', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                # DNS
-                ([('infos.domain', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.domaintarget', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                # SSL
-                ([('infos.md5hash', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.sha1hash', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.issuer', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.subject', pymongo.ASCENDING)],
-                 {"sparse": True}),
-                ([('infos.pubkeyalgo', pymongo.ASCENDING)],
-                 {"sparse": True}),
-            ],
-            self.colname_ipdata: [
-                ([('country_code', pymongo.ASCENDING)], {}),
-                ([('location_id', pymongo.ASCENDING)], {}),
-                ([('as_num', pymongo.ASCENDING)], {}),
-                ([('addr', pymongo.ASCENDING)],
-                 {'unique': True}),
-            ],
-        }
-        self.hint_indexes = OrderedDict([
-            ["addr", [("addr", 1), ("recontype", 1), ("port", 1)]],
-            ["targetval", [("targetval", 1)]],
-        ])
+        self.columns = [colname_passive]
+        self.schema_migrations = [
+            # passive
+            {
+                None: (1, self.migrate_schema_passive_0_1),
+            },
+        ]
 
     def init(self):
         """Initializes the "passive" columns, i.e., drops the columns, and
 creates the default indexes."""
-        self.db[self.colname_passive].drop()
-        self.db[self.colname_ipdata].drop()
+        self.db[self.columns[self.column_passive]].drop()
         self.create_indexes()
 
-    def get(self, spec, **kargs):
+    def cmp_schema_version_passive(self, rec):
+        """Returns 0 if the `rec`'s schema version matches the code's
+        current version, -1 if it is higher (you need to update IVRE),
+        and 1 if it is lower (you need to call .migrate_schema()).
+
+        """
+        return self.cmp_schema_version(self.column_passive, rec)
+
+    def migrate_schema(self, version):
+        """Process to schema migrations in column passive starting from
+        `version`.
+
+        """
+        MongoDB.migrate_schema(self, self.column_passive, version)
+
+    def _migrate_update_record(self, colname, recid, update):
+        """Define how an update is handled. Purpose-specific subclasses may
+want to do something special here, e.g., mix with other records.
+
+        """
+        if colname == self.columns[self.column_passive]:  # just in case
+            del update['_id']
+            self.insert_or_update_mix(update, getinfos=passive.getinfos)
+            self.remove(recid)
+        else:
+            return super(MongoDBPassive,
+                         self)._migrate_update_record(colname, recid, update)
+
+    @classmethod
+    def migrate_schema_passive_0_1(cls, doc):
+        """Converts a record from version 0 (no "schema_version" key in the
+document) to version 1 (`doc["schema_version"] == 1`). Version 1
+changes the way IP addresses and timestamps are stored.
+
+In version 0, IP addresses are stored as integers and timestamps
+(firstseen & lastseen) as floats.
+
+In version 1, IP addresses are stored as two 64-bit unsigned integers
+(the `addr` field becomes `addr_0` and `addr_1`) and timestamps are
+stored as Timestamps (a BSON type, represented as datetime.datetime
+objects by the Python driver; this format is already used in the
+active databases)
+
+Also, the structured data for SSL certificates has been updated.
+
+        """
+        assert "schema_version" not in doc
+        doc = cls.internal2rec(doc)
+        doc["schema_version"] = 1
+        for key in ["firstseen", "lastseen"]:
+            doc[key] = datetime.datetime.fromtimestamp(doc[key])
+        if "addr" in doc:
+            doc['addr_0'], doc['addr_1'] = cls.ip2internal(utils.force_int2ip(
+                doc.pop('addr')
+            ))
+        if (
+                doc["recontype"] == "SSL_SERVER" and
+                doc["source"] == "cert"
+        ):
+            doc.update(passive._getinfos_cert(doc))
+        return doc
+
+    def _get(self, flt, **kargs):
+        """Like .get(), but returns a MongoDB cursor (suitable for use with
+e.g.  .explain()).
+
+        """
+        return self._get_cursor(self.columns[self.column_passive], flt,
+                                **kargs)
+
+    @classmethod
+    def rec2internal(cls, rec):
+        """Given a record as presented to the user, fixes it before it can be
+inserted in the database.
+
+        """
+        try:
+            rec['addr_0'], rec['addr_1'] = cls.ip2internal(rec.pop('addr'))
+        except (KeyError, ValueError):
+            pass
+        if rec.get('recontype') == 'SSL_SERVER' and \
+           rec.get('source') == 'cert':
+            rec['value'] = cls.to_binary(
+                utils.decode_b64(rec['value'].encode())
+            )
+        cls._fix_sizes(rec)
+        return rec
+
+    @classmethod
+    def internal2rec(cls, rec):
+        """Given a record as stored in the database, fixes it before it can be
+returned to backend-agnostic functions.
+
+        """
+        try:
+            rec['addr'] = cls.internal2ip([rec.pop('addr_0'),
+                                           rec.pop('addr_1')])
+        except (KeyError, socket.error):
+            pass
+        for key in ['value', 'targetval']:
+            if 'full' + key in rec:
+                rec[key] = rec.pop('full' + key)
+        if 'fullinfos' in rec:
+            rec.setdefault('infos', {}).update(rec.pop('fullinfos'))
+        return rec
+
+    def get(self, spec, hint=None, **kargs):
         """Queries the passive column with the provided filter "spec", and
 returns a MongoDB cursor.
 
@@ -2671,8 +3681,11 @@ take a long time, depending on both the operations and the filter.
 Any keyword argument is passed to the .find() method of the Mongodb
 column object, without any validation (and might have no effect if it
 is not expected)."""
-        return self.set_limits(
-            self.find(self.colname_passive, spec, **kargs))
+        cursor = self._get(spec, **kargs)
+        if hint is not None:
+            cursor.hint(hint)
+        for rec in cursor:
+            yield self.internal2rec(rec)
 
     def get_one(self, spec, **kargs):
         """Same function as get, except .find_one() method is called
@@ -2680,57 +3693,99 @@ instead of .find(), so the first record matching "spec" (or None) is
 returned.
 
 Unlike get(), this function might take a long time, depending
-on "spec" and the indexes set on colname_passive column."""
+on "spec" and the indexes set on passive column."""
         # TODO: check limits
-        return self.find_one(self.colname_passive, spec, **kargs)
+        rec = self.find_one(self.columns[self.column_passive], spec, **kargs)
+        if rec is None:
+            return None
+        return self.internal2rec(rec)
 
     def update(self, spec, **kargs):
         """Updates the first record matching "spec" in the "passive" column,
 setting values according to the keyword arguments.
 """
-        self.db[self.colname_passive].update(spec, {'$set': kargs})
+        self.db[self.columns[self.column_passive]].update(
+            spec, {'$set': kargs}
+        )
+
+    @classmethod
+    def _fix_sizes(cls, spec):
+        # Finally we prepare the record to be stored. For that, we make
+        # sure that no indexed value has a size greater than MAXVALLEN. If
+        # so, we replace the value with its SHA1 hash and store the
+        # original value in full[original column name].
+        for key in ['value', 'targetval']:
+            if len(spec.get(key, "")) > utils.MAXVALLEN:
+                spec['full' + key] = spec[key]
+                value = spec[key]
+                if not isinstance(value, bytes):
+                    value = value.encode()
+                spec[key] = hashlib.sha1(value).hexdigest()
+        # We enforce a utils.MAXVALLEN // 10 size limits for subkey values in
+        # infos; this is because MongoDB cannot index values longer than 1024
+        # bytes.
+        for field in list(spec.get("infos", {})):
+            # Do not limit size of non-indexed values
+            if field not in (idx[6:]
+                             for idxes, _ in cls.indexes[cls.column_passive]
+                             for idx, _ in idxes if idx.startswith('infos')):
+                continue
+            value = spec["infos"][field]
+            if isinstance(value, basestring) and \
+               len(value) > utils.MAXVALLEN // 10:
+                spec.setdefault("fullinfos", {})[field] = value
+                spec["infos"][field] = value[:utils.MAXVALLEN // 10]
 
     def insert(self, spec, getinfos=None):
         """Inserts the record "spec" into the passive column."""
         if getinfos is not None:
             spec.update(getinfos(spec))
-        self.db[self.colname_passive].insert(spec)
-        if 'addr' in spec:
-            self.set_data(spec['addr'])
+        spec = self.rec2internal(spec)
+        self.db[self.columns[self.column_passive]].insert(spec)
 
-    def insert_or_update(self, timestamp, spec, getinfos=None):
+    def insert_or_update(self, timestamp, spec, getinfos=None, lastseen=None):
         if spec is None:
             return
-        hint = self.get_hint(spec)
-        current = self.get(spec, fields=[])
-        if hint is not None:
-            current.hint(hint)
+        orig = deepcopy(spec)
+        spec = self.rec2internal(spec)
         try:
-            current = current[0]
-        except IndexError:
+            del spec['infos']
+        except KeyError:
+            pass
+        hint = self.get_hint(spec)
+        current = self.get(spec, hint=hint, fields=[])
+        try:
+            current = next(current)
+        except StopIteration:
             current = None
         updatespec = {
-            '$inc': {'count': 1},
+            '$inc': {'count': spec.pop("count", 1)},
             '$min': {'firstseen': timestamp},
-            '$max': {'lastseen': timestamp},
+            '$max': {'lastseen': lastseen or timestamp},
         }
         if current is not None:
-            self.db[self.colname_passive].update(
+            self.db[self.columns[self.column_passive]].update(
                 {'_id': current['_id']},
                 updatespec,
             )
         else:
             if getinfos is not None:
-                infos = getinfos(spec)
-                if infos:
+                orig.update(getinfos(orig))
+                try:
+                    infos = {'infos': orig['infos']}
+                except KeyError:
+                    pass
+                else:
+                    self._fix_sizes(infos)
                     updatespec['$setOnInsert'] = infos
-            self.db[self.colname_passive].update(
+            self.db[self.columns[self.column_passive]].update(
                 spec,
                 updatespec,
                 upsert=True,
             )
 
-    def insert_or_update_bulk(self, specs, getinfos=None):
+    def insert_or_update_bulk(self, specs, getinfos=None,
+                              separated_timestamps=True):
         """Like `.insert_or_update()`, but `specs` parameter has to be an
         iterable of (timestamp, spec) values. This will perform bulk
         MongoDB inserts with the major drawback that the `getinfos`
@@ -2743,28 +3798,54 @@ setting values according to the keyword arguments.
         method.
 
         """
-        bulk = self.db[self.colname_passive].initialize_unordered_bulk_op()
+        bulk = self.db[
+            self.columns[self.column_passive]
+        ].initialize_unordered_bulk_op()
         count = 0
+
+        if separated_timestamps:
+            def generator(specs):
+                for timestamp, spec in specs:
+                    yield timestamp, timestamp, spec
+        else:
+            def generator(specs):
+                for spec in specs:
+                    firstseen = spec.pop("firstseen", None)
+                    lastseen = spec.pop("lastseen", None)
+                    yield firstseen or lastseen, lastseen or firstseen, spec
         try:
-            for timestamp, spec in specs:
-                if spec is not None:
-                    updatespec = {
-                        '$inc': {'count': 1},
-                        '$min': {'firstseen': timestamp},
-                        '$max': {'lastseen': timestamp},
-                    }
-                    if getinfos is not None:
-                        infos = getinfos(spec)
-                        if infos:
-                            updatespec['$setOnInsert'] = infos
-                    bulk.find(spec).upsert().update(updatespec)
-                    count += 1
-                    if count >= config.BULK_UPSERTS_MAXSIZE:
-                        utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", count)
-                        bulk.execute()
-                        bulk = self.db[self.colname_passive]\
-                                   .initialize_unordered_bulk_op()
-                        count = 0
+            for firstseen, lastseen, spec in generator(specs):
+                if spec is None:
+                    continue
+                updatespec = {
+                    '$inc': {'count': 1},
+                    '$min': {'firstseen': firstseen},
+                    '$max': {'lastseen': lastseen},
+                }
+                if getinfos is not None:
+                    spec.update(getinfos(spec))
+                    try:
+                        infos = {'infos': spec['infos']}
+                    except KeyError:
+                        pass
+                    else:
+                        self._fix_sizes(infos)
+                        updatespec['$setOnInsert'] = infos
+                spec = self.rec2internal(spec)
+                findspec = deepcopy(spec)
+                for key in ['infos', 'fullinfos']:
+                    try:
+                        del findspec[key]
+                    except KeyError:
+                        pass
+                bulk.find(findspec).upsert().update(updatespec)
+                count += 1
+                if count >= config.MONGODB_BATCH_SIZE:
+                    utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", count)
+                    bulk.execute()
+                    bulk = self.db[self.columns[self.column_passive]]\
+                               .initialize_unordered_bulk_op()
+                    count = 0
         except IOError:
             pass
         if count > 0:
@@ -2776,35 +3857,33 @@ setting values according to the keyword arguments.
         "firstseen", "lastseen" and "count") by mixing "firstseen",
         "lastseen" and "count" from "spec" and from the database.
 
-        This is usefull to mix records from different databases.
+        This is useful to mix records from different databases.
 
         """
         updatespec = {}
+        spec = self.rec2internal(spec)
         if 'firstseen' in spec:
-            updatespec['$min'] = {'firstseen': spec['firstseen']}
-            del spec['firstseen']
+            updatespec['$min'] = {'firstseen': spec.pop('firstseen')}
         if 'lastseen' in spec:
-            updatespec['$max'] = {'lastseen': spec['lastseen']}
-            del spec['lastseen']
+            updatespec['$max'] = {'lastseen': spec.pop('lastseen')}
         if 'count' in spec:
-            updatespec['$inc'] = {'count': spec['count']}
-            del spec['count']
+            updatespec['$inc'] = {'count': spec.pop('count')}
         else:
-            updatespec['$inc'] = {'count': spec['count']}
+            updatespec['$inc'] = {'count': 1}
         if 'infos' in spec:
-            updatespec['$setOnInsert'] = {'infos': spec['infos']}
-            del spec['infos']
+            updatespec['$setOnInsert'] = {'infos': spec.pop('infos')}
         if 'fullinfos' in spec:
             if '$setOnInsert' in updatespec:
                 updatespec['$setOnInsert'].update(
-                    {'fullinfos': spec['fullinfos']}
+                    {'fullinfos': spec.pop('fullinfos')}
                 )
             else:
-                updatespec['$setOnInsert'] = {'fullinfos': spec['fullinfos']}
-            del spec['fullinfos']
+                updatespec['$setOnInsert'] = {
+                    'fullinfos': spec.pop('fullinfos'),
+                }
         current = self.get_one(spec, fields=[])
         if current:
-            self.db[self.colname_passive].update(
+            self.db[self.columns[self.column_passive]].update(
                 {'_id': current['_id']},
                 updatespec,
             )
@@ -2813,16 +3892,18 @@ setting values according to the keyword arguments.
                 infos = getinfos(spec)
                 if infos:
                     updatespec['$setOnInsert'] = infos
-            self.db[self.colname_passive].update(
+            self.db[self.columns[self.column_passive]].update(
                 spec,
                 updatespec,
                 upsert=True,
             )
 
-    def remove(self, spec):
-        self.db[self.colname_passive].remove(spec)
+    def remove(self, spec_or_id):
+        self.db[self.columns[self.column_passive]].remove(
+            spec_or_id=spec_or_id
+        )
 
-    def topvalues(self, field, distinct=True, **kargs):
+    def topvalues(self, field, flt=None, distinct=True, **kargs):
         """This method makes use of the aggregation framework to
         produce top values for a given field.
 
@@ -2831,26 +3912,155 @@ setting values according to the keyword arguments.
         the "count" field.
 
         """
+        if flt is None:
+            flt = self.flt_empty
         if not distinct:
             kargs['countfield'] = 'count'
-        pipeline = self._topvalues(field, **kargs)
-        return self.set_limits(
-            self.db[self.colname_passive].aggregate(pipeline, cursor={})
+        outputproc = None
+        specialproj = None
+        if field == "addr":
+            if self.mongodb_32_more:
+                specialproj = {
+                    "_id": 0,
+                    "addr": ['$addr_0', '$addr_1'],
+                }
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': (None if x['_id'][0] is None else
+                                self.internal2ip(x['_id'])),
+                    }
+            else:
+                specialproj = {
+                    "_id": 0,
+                    "addr": _old_array(
+                        '$addr_0', '$addr_1',
+                        convert_to_string=True,
+                    ),
+                }
+
+                def outputproc(x):
+                    return {
+                        'count': x['count'],
+                        '_id': (None if x['_id'] == '###' else
+                                self.internal2ip([int(val) for val in
+                                                  x['_id'].split('###')])),
+                    }
+        elif field == "net" or field.startswith("net:"):
+            flt = self.flt_and(flt, self.searchipv4())
+            mask = int(field.split(':', 1)[1]) if ':' in field else 24
+            field = "addr"
+            # This should not overflow thanks to .searchipv4() filter
+            addr = {"$add": ["$addr_1", 0x7fff000100000000]}
+            if self.mongodb_32_more:
+                specialproj = {
+                    "_id": 0,
+                    "addr": {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}},
+                }
+            else:
+                specialproj = {
+                    "_id": 0,
+                    "addr": {"$subtract": [{"$divide": [addr,
+                                                        2 ** (32 - mask)]},
+                                           {"$mod": [{"$divide": [
+                                               addr,
+                                               2 ** (32 - mask),
+                                           ]}, 1]}]},
+                }
+            flt = self.flt_and(flt, self.searchipv4())
+
+            def outputproc(x):
+                return {
+                    'count': x['count'],
+                    '_id': '%s/%d' % (
+                        utils.int2ip(int(x['_id']) * 2 ** (32 - mask)),
+                        mask,
+                    ),
+                }
+        pipeline = self._topvalues(field, flt=flt, specialproj=specialproj,
+                                   **kargs)
+        cursor = self.set_limits(
+            self.db[self.columns[self.column_passive]].aggregate(
+                pipeline, cursor={},
+            )
         )
+        if outputproc is not None:
+            return (outputproc(res) for res in cursor)
+        return cursor
 
     def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
         """This method makes use of the aggregation framework to
         produce distinct values for a given field.
 
         """
-        cursor = self.set_limits(
-            self.db[self.colname_passive].aggregate(
-                self._distinct(field, flt=flt, sort=sort,
-                               limit=limit, skip=skip),
-                cursor={},
-            )
+        return self._distinct(self.columns[self.column_passive], field,
+                              flt=flt, sort=sort, limit=limit, skip=skip)
+
+    def _features_port_list_pipeline(self, flt, use_service, use_product,
+                                     use_version):
+        return (
+            [{"$match": self.flt_and(flt, {'port': {'$exists': True}})}],
+            '$port',
+            '$infos',
         )
-        return (res['_id'] for res in cursor)
+
+    def _features_port_get(self, features, flt, yieldall, use_service,
+                           use_product, use_version):
+        curaddr = None
+        currec = None
+        if use_version:
+            def _extract(rec):
+                info = rec.get('infos', {})
+                yield (rec['port'], info.get('service_name'),
+                       info.get('service_product'),
+                       info.get('service_version'))
+                if not yieldall:
+                    return
+                if info.get('service_version') is not None:
+                    yield (rec['port'], info.get('service_name'),
+                           info.get('service_product'), None)
+                if info.get('service_product') is not None:
+                    yield (rec['port'], info.get('service_name'), None, None)
+                if info.get('service_name') is not None:
+                    yield (rec['port'], None, None, None)
+        elif use_product:
+            def _extract(rec):
+                info = rec.get('infos', {})
+                yield (rec['port'], info.get('service_name'),
+                       info.get('service_product'))
+                if not yieldall:
+                    return
+                if info.get('service_product') is not None:
+                    yield (rec['port'], info.get('service_name'), None)
+                if info.get('service_name') is not None:
+                    yield (rec['port'], None, None)
+        elif use_service:
+            def _extract(rec):
+                info = rec.get('infos', {})
+                yield (rec['port'], info.get('service_name'))
+                if not yieldall:
+                    return
+                if info.get('service_name') is not None:
+                    yield (rec['port'], None)
+        else:
+            def _extract(rec):
+                yield (rec['port'], )
+        n_features = len(features)
+        for rec in self.get(self.flt_and(flt, {'port': {'$exists': True}}),
+                            sort=[('addr', 1)]):
+            # the addr aggregation could (should?) be done with an
+            # aggregation framework pipeline
+            if curaddr != rec['addr']:
+                if curaddr is not None:
+                    yield (curaddr, currec)
+                curaddr = rec['addr']
+                currec = [0] * n_features
+            for feat in _extract(rec):
+                # We could use += rec['count'] instead here
+                currec[features[feat]] = 1
+        if curaddr is not None:
+            yield (curaddr, currec)
 
     @staticmethod
     def searchrecontype(rectype):
@@ -2865,7 +4075,64 @@ setting values according to the keyword arguments.
         return {'sensor': sensor}
 
     @staticmethod
-    def searchuseragent(useragent):
+    def searchport(port, protocol='tcp', state='open', neg=False):
+        """Filters (if `neg` == True, filters out) records on the specified
+        protocol/port.
+
+        """
+        if protocol != 'tcp':
+            raise ValueError("Protocols other than TCP are not supported "
+                             "in passive")
+        if state != 'open':
+            raise ValueError("Only open ports can be found in passive")
+        return {'port': {'$ne': port} if neg else port}
+
+    @staticmethod
+    def searchservice(srv, port=None, protocol=None):
+        """Search a port with a particular service."""
+        flt = {'infos.service_name': srv}
+        if port is not None:
+            flt['port'] = port
+        if protocol is not None and protocol != 'tcp':
+            raise ValueError("Protocols other than TCP are not supported "
+                             "in passive")
+        return flt
+
+    @staticmethod
+    def searchproduct(product, version=None, service=None, port=None,
+                      protocol=None):
+        """Search a port with a particular `product`. It is (much)
+        better to provide the `service` name and/or `port` number
+        since those fields are indexed.
+
+        """
+        flt = {'infos.service_product': product}
+        if version is not None:
+            flt['infos.service_version'] = version
+        if service is not None:
+            flt['infos.service_name'] = service
+        if port is not None:
+            flt['port'] = port
+        if protocol is not None:
+            if protocol != 'tcp':
+                raise ValueError("Protocols other than TCP are not supported "
+                                 "in passive")
+        return flt
+
+    @staticmethod
+    def searchsvchostname(hostname):
+        return {'infos.service_hostname': hostname}
+
+    @staticmethod
+    def searchuseragent(useragent=None, neg=False):
+        if neg:
+            raise ValueError("searchuseragent([...], neg=True) is not "
+                             "supported in passive DB.")
+        if useragent is None:
+            return {
+                'recontype': 'HTTP_CLIENT_HEADER',
+                'source': 'USER-AGENT',
+            }
         return {
             'recontype': 'HTTP_CLIENT_HEADER',
             'source': 'USER-AGENT',
@@ -2874,6 +4141,11 @@ setting values according to the keyword arguments.
 
     @staticmethod
     def searchdns(name, reverse=False, subdomains=False):
+        if isinstance(name, list):
+            if len(name) == 1:
+                name = name[0]
+            else:
+                name = {'$in': name}
         return {
             'recontype': 'DNS_ANSWER',
             (('infos.domaintarget' if reverse else 'infos.domain')
@@ -2881,21 +4153,61 @@ setting values according to the keyword arguments.
         }
 
     @staticmethod
-    def searchcert():
-        return {'recontype': 'SSL_SERVER',
-                'source': 'cert'}
-
-    @staticmethod
-    def searchcertsubject(expr):
+    def searchcert(keytype=None):
+        if keytype is None:
+            return {'recontype': 'SSL_SERVER',
+                    'source': 'cert'}
         return {'recontype': 'SSL_SERVER',
                 'source': 'cert',
-                'infos.subject': expr}
+                'infos.pubkeyalgo': keytype + 'Encryption'}
+
+    @classmethod
+    def _searchja3(cls, value_or_hash):
+        if value_or_hash is None:
+            return {}
+        key, value = cls._ja3keyvalue(value_or_hash)
+        return {'value' if key == 'md5' else 'infos.%s' % key: value}
+
+    @classmethod
+    def searchja3client(cls, value_or_hash=None):
+        return dict(cls._searchja3(value_or_hash), recontype='SSL_CLIENT',
+                    source='ja3')
+
+    @classmethod
+    def searchja3server(cls, value_or_hash=None, client_value_or_hash=None):
+        base = dict(cls._searchja3(value_or_hash), recontype='SSL_SERVER')
+        if client_value_or_hash is None:
+            return dict(base, source=re.compile('^ja3-'))
+        key, value = cls._ja3keyvalue(client_value_or_hash)
+        if key == 'md5':
+            return dict(base, source='ja3-%s' % value)
+        return dict(base, source=re.compile('^ja3-'),
+                    **{'infos.client.%s' % key: client_value_or_hash})
+
+    @staticmethod
+    def searchsshkey(keytype=None):
+        if keytype is None:
+            return {'recontype': 'SSH_SERVER_HOSTKEY',
+                    'source': 'SSHv2'}
+        return {'recontype': 'SSH_SERVER_HOSTKEY',
+                'source': 'SSHv2',
+                'infos.algo': 'ssh-' + keytype}
+
+    @staticmethod
+    def searchcertsubject(expr, issuer=None):
+        res = {'recontype': 'SSL_SERVER',
+               'source': 'cert',
+               'infos.subject_text': expr}
+        if issuer is None:
+            return res
+        res["infos.issuer_text"] = issuer
+        return res
 
     @staticmethod
     def searchcertissuer(expr):
         return {'recontype': 'SSL_SERVER',
                 'source': 'cert',
-                'infos.issuer': expr}
+                'infos.issuer_text': expr}
 
     @staticmethod
     def searchbasicauth():
@@ -2924,311 +4236,50 @@ setting values according to the keyword arguments.
     def searchpopauth():
         return {'recontype': {'$in': ['POP_CLIENT', 'POP_SERVER']}}
 
-    def searchcountry(self, code, neg=False):
-        return {'addr': {'$nin' if neg else '$in':
-                         self.knownip_bycountry(code)}}
-
-    def searchasnum(self, asnum, neg=False):
-        return {'addr': {'$nin' if neg else '$in': self.knownip_byas(asnum)}}
+    @staticmethod
+    def searchtcpsrvbanner(banner):
+        return {'recontype': 'TCP_SERVER_BANNER', 'value': banner}
 
     @staticmethod
     def searchtimeago(delta, neg=False, new=False):
-        field = 'lastseen' if new else 'firstseen'
-        if isinstance(delta, datetime.timedelta):
-            delta = delta.total_seconds()
-        now = datetime.datetime.now()
-        now = int(now.strftime('%s')) + now.microsecond * 1e-6
-        return {field: {'$lt' if neg else '$gte': now - delta}}
+        if not isinstance(delta, datetime.timedelta):
+            delta = datetime.timedelta(seconds=delta)
+        return {'lastseen' if new else 'firstseen':
+                {'$lt' if neg else '$gte': datetime.datetime.now() - delta}}
 
-    def knownip_bycountry(self, code):
-        return self.set_limits(self.find(
-            self.colname_ipdata,
-            {'country_code': code},
-        )).distinct('addr')
-
-    def knownip_byas(self, asnum):
-        if isinstance(asnum, basestring):
-            if asnum.startswith('AS'):
-                asnum = asnum[2:]
-            asnum = int(asnum)
-        return self.set_limits(self.find(
-            self.colname_ipdata,
-            {'as_num': asnum}
-        )).distinct('addr')
-
-    def set_data(self, addr, force=False):
-        """Sets IP information in colname_ipdata."""
-        if not force and self.get_data(addr) is not None:
-            return
-        for data in [self.globaldb.data.country_byip(addr),
-                     self.globaldb.data.as_byip(addr),
-                     self.globaldb.data.location_byip(addr)]:
-            if data is not None:
-                self.db[self.colname_ipdata].update(
-                    {'addr': addr},
-                    {'$set': data},
-                    upsert=True)
-
-    def update_country(self, start, stop, code, create=False):
-        # we first update existing records
-        self.db[self.colname_ipdata].update(
-            self.searchrange(start, stop),
-            {'$set': {'country_code': code}},
-            multi=True,
-        )
-        # then (if requested), we add a record for addresses we
-        # have in database (first the active one, then the
-        # passive)
-        if create:
-            for addr in self.get_known_ips(start, stop):
-                self.db[self.colname_ipdata].update(
-                    {'addr': addr},
-                    {'$set': {'country_code': code}},
-                    upsert=True)
-
-    def update_city(self, start, stop, locid, create=False):
-        # we first update existing records
-        self.db[self.colname_ipdata].update(
-            self.searchrange(start, stop),
-            {'$set': {'location_id': locid}},
-            multi=True,
-        )
-        # then (if requested), we add a record for addresses we
-        # have in database (first the active one, then the
-        # passive)
-        if create:
-            for addr in self.get_known_ips(start, stop):
-                self.db[self.colname_ipdata].update(
-                    {'addr': addr},
-                    {'$set': {'location_id': locid}},
-                    upsert=True)
-
-    def update_as(self, start, stop, asnum, asname, create=False):
-        if asname is None:
-            updatespec = {'as_num': asnum}
-        else:
-            updatespec = {'as_num': asnum, 'as_name': asname}
-        # we first update existing records
-        self.db[self.colname_ipdata].update(
-            self.searchrange(start, stop),
-            {'$set': updatespec},
-            multi=True,
-        )
-        # then (if requested), we add a record for addresses we
-        # have in database (first the active one, then the
-        # passive)
-        if create:
-            for addr in self.get_known_ips(start, stop):
-                self.db[self.colname_ipdata].update(
-                    {'addr': addr},
-                    {'$set': updatespec},
-                    upsert=True)
-
-    def get_data(self, addr):
-        """Gets IP information in colname_ipdata."""
-        data = self.find_one(self.colname_ipdata, {'addr': addr})
-        if data is not None:
-            del data['_id']
-        return data
-
-    def get_known_ips(self, start, stop):
-        self.get(self.searchrange(start, stop)).distinct('addr')
-
-
-class MongoDBData(MongoDB, DBData):
-
-    def __init__(self, host, dbname,
-                 colname_geoip_country="geoipcountry",
-                 colname_geoip_as="geoipas",
-                 colname_geoip_city="geoipcity",
-                 colname_country_codes="countries",
-                 colname_city_locations="cities",
-                 **kargs):
-        MongoDB.__init__(self, host, dbname, **kargs)
-        DBData.__init__(self)
-        self.colname_geoip_country = colname_geoip_country
-        self.colname_geoip_as = colname_geoip_as
-        self.colname_geoip_city = colname_geoip_city
-        self.colname_country_codes = colname_country_codes
-        self.colname_city_locations = colname_city_locations
-        self.indexes = {
-            self.colname_geoip_country: [
-                ([('start', pymongo.ASCENDING)], {}),
-                ([('country_code', pymongo.ASCENDING)], {}),
-            ],
-            self.colname_geoip_as: [
-                ([('start', pymongo.ASCENDING)], {}),
-                ([('as_num', pymongo.ASCENDING)], {}),
-            ],
-            self.colname_geoip_city: [
-                ([('start', pymongo.ASCENDING)], {}),
-                ([('location_id', pymongo.ASCENDING)], {}),
-            ],
-            self.colname_city_locations: [
-                ([('location_id', pymongo.ASCENDING)], {}),
-                ([('country_code', pymongo.ASCENDING)], {}),
-                ([('region_code', pymongo.ASCENDING)], {}),
-                ([('city', pymongo.ASCENDING)], {}),
-                ([('loc', pymongo.GEOSPHERE)], {}),
-            ],
-            self.colname_country_codes: [
-                ([('country_code', pymongo.ASCENDING)],
-                 {'unique': True}),
-            ],
-        }
-
-    def init(self):
-        """Initializes the data columns, and creates the default
-        indexes.
-
-        """
-        self.db[self.colname_geoip_country].drop()
-        self.db[self.colname_geoip_as].drop()
-        self.db[self.colname_geoip_city].drop()
-        self.db[self.colname_country_codes].drop()
-        self.db[self.colname_city_locations].drop()
-        self.create_indexes()
-
-    def parse_line_country_codes(self, line):
-        data = super(MongoDBData, self).parse_line_country_codes(line)
-        if 'code' in data:
-            data['country_code'] = data.pop('code')
-        return data
-
-    def feed_country_codes(self, fname):
-        with open(fname, "rb") as fdesc:
-            self.db[self.colname_country_codes].insert(
-                self.parse_line_country_codes(line)
-                for line in fdesc
-            )
-        # Missing from iso3166.csv file but used in GeoIPCity-Location.csv
-        self.db[self.colname_country_codes].insert(
-            {'country_code': "AN", 'name': "Netherlands Antilles"}
-        )
-
-    def feed_geoip_country(self, fname, feedipdata=None,
-                           createipdata=False):
-        with open(fname, "rb") as fdesc:
-            self.db[self.colname_geoip_country].insert(
-                self.parse_line_country(line, feedipdata=feedipdata,
-                                        createipdata=createipdata)
-                for line in fdesc
-            )
-
-    def feed_geoip_city(self, fname, feedipdata=None,
-                        createipdata=False):
-        with open(fname, "rb") as fdesc:
-            # Skip the two first lines
-            fdesc.readline()
-            fdesc.readline()
-            self.db[self.colname_geoip_city].insert(
-                self.parse_line_city(line, feedipdata=feedipdata,
-                                     createipdata=createipdata)
-                for line in fdesc
-            )
-
-    def feed_city_location(self, fname):
-        with open(fname, "rb") as fdesc:
-            # Skip the two first lines
-            fdesc.readline()
-            fdesc.readline()
-            self.db[self.colname_city_locations].insert(
-                self.parse_line_city_location(line)
-                for line in fdesc
-            )
-
-    def feed_geoip_asnum(self, fname, feedipdata=None,
-                         createipdata=False):
-        with open(fname, "rb") as fdesc:
-            self.db[self.colname_geoip_as].insert(
-                self.parse_line_asnum(line, feedipdata=feedipdata,
-                                      createipdata=createipdata)
-                for line in fdesc
-            )
-
-    def country_name_by_code(self, code):
-        rec = self.find_one(self.colname_country_codes,
-                            {'country_code': code},
-                            fields=['name'])
-        if rec:
-            return rec['name']
-        return rec
-
-    def country_codes_by_name(self, name):
-        return self.set_limits(
-            self.find(self.colname_country_codes,
-                      {'name': name})).distinct('country_code')
-
-    def find_data_byip(self, addr, column):
-        try:
-            addr = utils.ip2int(addr)
-        except (TypeError, utils.socket.error):
-            pass
-        rec = self.find_one(column, {'start': {'$lte': addr}},
-                            sort=[('start', -1)])
-        if rec and addr <= rec['stop']:
-            del rec['_id'], rec['start'], rec['stop']
-            return rec
-
-    def country_byip(self, addr):
-        rec = self.find_data_byip(addr, self.colname_geoip_country)
-        if rec:
-            name = self.country_name_by_code(rec['country_code'])
-            if name:
-                rec['country_name'] = name
-        return rec
-
-    def as_byip(self, addr):
-        return self.find_data_byip(addr, self.colname_geoip_as)
-
-    def locationid_byip(self, addr):
-        return self.find_data_byip(addr, self.colname_geoip_city)
-
-    def location_byid(self, locid):
-        rec = self.find_one(self.colname_city_locations,
-                            {'location_id': locid})
-        if rec:
-            del rec['_id'], rec['location_id']
-            if 'loc' in rec:
-                if 'coordinates' in rec['loc']:
-                    rec['coordinates'] = tuple(rec['loc']['coordinates'][::-1])
-                del rec['loc']
-            if 'country_code' in rec:
-                name = self.country_name_by_code(rec['country_code'])
-                if name:
-                    rec['country_name'] = name
-        return rec
-
-    def location_byip(self, addr):
-        locid = self.locationid_byip(addr)
-        if locid:
-            return self.location_byid(locid.get('location_id'))
-
-    def ipranges_bycountry(self, code):
-        return [
-            (x['start'], x['stop']) for x in
-            self.set_limits(
-                self.find(self.colname_geoip_country,
-                          {'country_code': code},
-                          fields=['start', 'stop']))
-        ]
-
-    def ipranges_byas(self, asnum):
-        if isinstance(asnum, basestring):
-            if asnum.startswith('AS'):
-                asnum = asnum[2:]
-            asnum = int(asnum)
-        return [
-            (x['start'], x['stop']) for x in
-            self.set_limits(
-                self.find(self.colname_geoip_as,
-                          {'as_num': asnum},
-                          fields=['start', 'stop']))
-        ]
+    @staticmethod
+    def searchnewer(timestamp, neg=False, new=False):
+        if not isinstance(timestamp, datetime.datetime):
+            timestamp = datetime.datetime.fromtimestamp(timestamp)
+        return {'lastseen' if new else 'firstseen':
+                {'$lte' if neg else '$gt': timestamp}}
 
 
 class MongoDBAgent(MongoDB, DBAgent):
     """MongoDB-specific code to handle agents-in-DB"""
+
+    column_agents = 0
+    column_scans = 1
+    column_masters = 2
+    indexes = [
+        # agents
+        [
+            ([('host', pymongo.ASCENDING)], {}),
+            ([('path.remote', pymongo.ASCENDING)], {}),
+            ([('path.local', pymongo.ASCENDING)], {}),
+            ([('master', pymongo.ASCENDING)], {}),
+            ([('scan', pymongo.ASCENDING)], {}),
+        ],
+        # scans
+        [
+            ([('agents', pymongo.ASCENDING)], {}),
+        ],
+        # masters
+        [
+            ([('hostname', pymongo.ASCENDING),
+              ('path', pymongo.ASCENDING)], {}),
+        ],
+    ]
 
     def __init__(self, host, dbname,
                  colname_agents="agents",
@@ -3237,34 +4288,16 @@ class MongoDBAgent(MongoDB, DBAgent):
                  **kargs):
         MongoDB.__init__(self, host, dbname, **kargs)
         DBAgent.__init__(self)
-        self.colname_agents = colname_agents
-        self.colname_scans = colname_scans
-        self.colname_masters = colname_masters
-        self.indexes = {
-            self.colname_agents: [
-                ([('host', pymongo.ASCENDING)], {}),
-                ([('path.remote', pymongo.ASCENDING)], {}),
-                ([('path.local', pymongo.ASCENDING)], {}),
-                ([('master', pymongo.ASCENDING)], {}),
-                ([('scan', pymongo.ASCENDING)], {}),
-            ],
-            self.colname_scans: [
-                ([('agents', pymongo.ASCENDING)], {}),
-            ],
-            self.colname_masters: [
-                ([('hostname', pymongo.ASCENDING),
-                  ('path', pymongo.ASCENDING)], {}),
-            ],
-        }
+        self.columns = [colname_agents, colname_scans, colname_masters]
 
     def init(self):
         """Initializes the "agent" columns, i.e., drops those columns
         and creates the default indexes.
 
         """
-        self.db[self.colname_agents].drop()
-        self.db[self.colname_scans].drop()
-        self.db[self.colname_masters].drop()
+        self.db[self.columns[self.column_agents]].drop()
+        self.db[self.columns[self.column_scans]].drop()
+        self.db[self.columns[self.column_masters]].drop()
         self.create_indexes()
 
     def stop_agent(self, agentid):
@@ -3275,29 +4308,30 @@ class MongoDBAgent(MongoDB, DBAgent):
             self.unassign_agent(agent['_id'])
 
     def _add_agent(self, agent):
-        return self.db[self.colname_agents].insert(agent)
+        return self.db[self.columns[self.column_agents]].insert(agent)
 
     def get_agent(self, agentid):
-        return self.find_one(self.colname_agents, {"_id": agentid})
+        return self.find_one(self.columns[self.column_agents],
+                             {"_id": agentid})
 
     def get_free_agents(self):
         return (x['_id'] for x in
                 self.set_limits(
-                    self.find(self.colname_agents,
+                    self.find(self.columns[self.column_agents],
                               {"scan": None},
                               fields=["_id"])))
 
     def get_agents_by_master(self, masterid):
         return (x['_id'] for x in
                 self.set_limits(
-                    self.find(self.colname_agents,
+                    self.find(self.columns[self.column_agents],
                               {"master": masterid},
                               fields=["_id"])))
 
     def get_agents(self):
         return (x['_id'] for x in
                 self.set_limits(
-                    self.find(self.colname_agents,
+                    self.find(self.columns[self.column_agents],
                               fields=["_id"])))
 
     def assign_agent(self, agentid, scanid,
@@ -3308,14 +4342,14 @@ class MongoDBAgent(MongoDB, DBAgent):
             flt.update({"scan": None})
         elif not force:
             flt.update({"scan": {"$ne": False}})
-        self.db[self.colname_agents].update(
+        self.db[self.columns[self.column_agents]].update(
             flt,
             {"$set": {"scan": scanid}}
         )
         agent = self.get_agent(agentid)
         if scanid is not None and scanid is not False \
            and scanid == agent["scan"]:
-            self.db[self.colname_scans].update(
+            self.db[self.columns[self.column_scans]].update(
                 {"_id": scanid, "agents": {"$ne": agentid}},
                 {"$push": {"agents": agentid}}
             )
@@ -3324,7 +4358,7 @@ class MongoDBAgent(MongoDB, DBAgent):
         agent = self.get_agent(agentid)
         scanid = agent["scan"]
         if scanid is not None:
-            self.db[self.colname_scans].update(
+            self.db[self.columns[self.column_scans]].update(
                 {"_id": scanid, "agents": agentid},
                 {"$pull": {"agents": agentid}}
             )
@@ -3334,13 +4368,15 @@ class MongoDBAgent(MongoDB, DBAgent):
             self.assign_agent(agentid, None, force=True)
 
     def _del_agent(self, agentid):
-        return self.db[self.colname_agents].remove(spec_or_id=agentid)
+        return self.db[self.columns[self.column_agents]].remove(
+            spec_or_id=agentid
+        )
 
     def _add_scan(self, scan):
-        return self.db[self.colname_scans].insert(scan)
+        return self.db[self.columns[self.column_scans]].insert(scan)
 
     def get_scan(self, scanid):
-        scan = self.find_one(self.colname_scans, {"_id": scanid},
+        scan = self.find_one(self.columns[self.column_scans], {"_id": scanid},
                              fields={'target': 0})
         if scan.get('lock') is not None:
             scan['lock'] = uuid.UUID(bytes=scan['lock'])
@@ -3348,7 +4384,7 @@ class MongoDBAgent(MongoDB, DBAgent):
             target = self.get_scan_target(scanid)
             if target is not None:
                 target_info = target.target.infos
-                self.db[self.colname_scans].update(
+                self.db[self.columns[self.column_scans]].update(
                     {"_id": scanid},
                     {"$set": {"target_info": target_info}},
                 )
@@ -3356,7 +4392,8 @@ class MongoDBAgent(MongoDB, DBAgent):
         return scan
 
     def _get_scan_target(self, scanid):
-        scan = self.find_one(self.colname_scans, {"_id": scanid}, fields={'target': 1, '_id': 0})
+        scan = self.find_one(self.columns[self.column_scans], {"_id": scanid},
+                             fields={'target': 1, '_id': 0})
         return None if scan is None else scan['target']
 
     def _lock_scan(self, scanid, oldlockid, newlockid):
@@ -3368,7 +4405,7 @@ scan object on success, and raises a LockError on failure.
             oldlockid = bson.Binary(oldlockid)
         if newlockid is not None:
             newlockid = bson.Binary(newlockid)
-        scan = self.db[self.colname_scans].find_and_modify({
+        scan = self.db[self.columns[self.column_scans]].find_and_modify({
             "_id": scanid,
             "lock": oldlockid,
         }, {
@@ -3385,7 +4422,7 @@ scan object on success, and raises a LockError on failure.
             target = self.get_scan_target(scanid)
             if target is not None:
                 target_info = target.target.infos
-                self.db[self.colname_scans].update(
+                self.db[self.columns[self.column_scans]].update(
                     {"_id": scanid},
                     {"$set": {"target_info": target_info}},
                 )
@@ -3397,25 +4434,26 @@ scan object on success, and raises a LockError on failure.
     def get_scans(self):
         return (x['_id'] for x in
                 self.set_limits(
-                    self.find(self.colname_scans,
+                    self.find(self.columns[self.column_scans],
                               fields=["_id"])))
 
     def _update_scan_target(self, scanid, target):
-        return self.db[self.colname_scans].update(
+        return self.db[self.columns[self.column_scans]].update(
             {"_id": scanid}, {"$set": {"target": target}})
 
     def incr_scan_results(self, scanid):
-        return self.db[self.colname_scans].update(
+        return self.db[self.columns[self.column_scans]].update(
             {"_id": scanid}, {"$inc": {"results": 1}})
 
     def _add_master(self, master):
-        return self.db[self.colname_masters].insert(master)
+        return self.db[self.columns[self.column_masters]].insert(master)
 
     def get_master(self, masterid):
-        return self.find_one(self.colname_masters, {"_id": masterid})
+        return self.find_one(self.columns[self.column_masters],
+                             {"_id": masterid})
 
     def get_masters(self):
         return (x['_id'] for x in
                 self.set_limits(
-                    self.find(self.colname_masters,
+                    self.find(self.columns[self.column_masters],
                               fields=["_id"])))

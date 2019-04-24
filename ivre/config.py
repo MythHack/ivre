@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -31,8 +31,10 @@ import stat
 
 # Default values:
 DB = "mongodb:///ivre"
+DB_DATA = None  # specific: maxmind:///<ivre_share_path>/geoip
 DB_FLOW = "neo4j://neo4j:neo4j@localhost:7474/"
-BULK_UPSERTS_MAXSIZE = 100
+LOCAL_BATCH_SIZE = 10000
+MONGODB_BATCH_SIZE = 100
 NEO4J_BATCH_SIZE = 1000
 POSTGRES_BATCH_SIZE = 10000
 DEBUG = False
@@ -43,6 +45,8 @@ DEBUG_DB = False
 DATA_PATH = None
 GEOIP_PATH = None
 HONEYD_IVRE_SCRIPTS_PATH = None
+WEB_STATIC_PATH = None
+WEB_DOKU_PATH = None
 AGENT_MASTER_PATH = "/var/lib/ivre/master"
 TESSERACT_CMD = "tesseract"
 GZ_CMD = "zcat"
@@ -50,6 +54,7 @@ BZ2_CMD = "bzcat"
 MD5_CMD = "md5sum"
 SHA1_CMD = "sha1sum"
 SHA256_CMD = "sha256sum"
+OPENSSL_CMD = "openssl"
 # specific: if no value is specified, tries /usr/local/share/<soft>,
 # /opt/<soft>/share/<soft>, then /usr/share/<soft>.
 NMAP_SHARE_PATH = None
@@ -57,32 +62,36 @@ NMAP_SHARE_PATH = None
 # Default Nmap scan template, see below how to add templates:
 NMAP_SCAN_TEMPLATES = {
     "default": {
-        ## Commented values are default values and to not need to be
-        ## specified
-        #"nmap": "nmap",
-        #"pings": "SE",
-        #"scans": "SV",
-        #"osdetect": True,
-        #"traceroute": True,
-        #"resolve": 1,
-        #"verbosity": 2,
-        #"ports": None,
-        "host_timeout": "15m", # default value: None
-        "script_timeout": "2m", # default value: None
+        # Commented values are default values and to not need to be
+        # specified:
+        # "nmap": "nmap",
+        # "pings": "SE",
+        # "scans": "SV",
+        # "osdetect": True,
+        # "traceroute": True,
+        # "resolve": 1,
+        # "verbosity": 2,
+        # "ports": None,
+        "host_timeout": "15m",  # default value: None
+        "script_timeout": "2m",  # default value: None
         "scripts_categories": ['default', 'discovery',
-                               'auth'], # default value: None
+                               'auth'],  # default value: None
         "scripts_exclude": ['broadcast', 'brute', 'dos',
                             'exploit', 'external', 'fuzzer',
-                            'intrusive'], # default value: None
-        #"scripts_force": None,
-        #"extra_options": None,
+                            'intrusive'],  # default value: None
+        # "scripts_force": None,
+        # "extra_options": None,
     }
 }
 
-## Example: to define an "aggressive" template that "inherits" from
-## the default template and runs more scripts with a more important
-## host timeout value, add the following lines to your ivre.conf,
-## uncommented of course.
+DNS_BLACKLIST_DOMAINS = set([
+    'zen.spamhaus.org',
+])
+
+# Example: to define an "aggressive" template that "inherits" from
+# the default template and runs more scripts with a more important
+# host timeout value, add the following lines to your ivre.conf,
+# uncommented of course.
 # NMAP_SCAN_TEMPLATES["aggressive"] = NMAP_SCAN_TEMPLATES["default"].copy()
 # NMAP_SCAN_TEMPLATES["aggressive"].update({
 #     "host_timeout": "30m",
@@ -92,13 +101,13 @@ NMAP_SCAN_TEMPLATES = {
 #     "scripts_exclude": ['broadcast', 'external']
 # })
 
-## Dictionary that helps determine server ports of communications. Each entry is
-## {proto: {port: proba}}. The when two ports are known, the port with the
-## highest probability is used.
-## When /usr/share/nmap/nmap-services is available, these probas are taken,
-## otherwise /etc/services is used with proba=0.5 for each entry.
-## KNOWN_PORTS entries have the highest priority.
-## Example:
+# Dictionary that helps determine server ports of communications. Each entry
+# is {proto: {port: proba}}. The when two ports are known, the port with the
+# highest probability is used.
+# When /usr/share/nmap/nmap-services is available, these probas are taken,
+# otherwise /etc/services is used with proba=0.5 for each entry.
+# KNOWN_PORTS entries have the highest priority.
+# Example:
 #  KNOWN_PORTS = {
 #      "udp": {
 #          9999: 1.0,
@@ -120,41 +129,26 @@ FLOW_TIME_PRECISION = 3600
 FLOW_TIME_FULL_RANGE = False
 
 IPDATA_URLS = {
-    # 'GeoIPCountry.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCountry/'
-    # 'GeoIP.dat.gz',
-    'GeoIPCountryCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/GeoIPCountryCSV.zip',
-    # 'GeoIPCity.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity.dat.gz',
-    'GeoIPCityCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity_CSV/'
-    'GeoLiteCity-latest.zip',
-    # 'GeoIPASNum.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNum.dat.gz',
-    'GeoIPASNumCSV.zip':
-    'http://geolite.maxmind.com/download/geoip/database/asnum/GeoIPASNum2.zip',
-    # 'GeoIPCountryIPv6.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.dat.gz',
-    # 'GeoIPCountryIPv6.csv':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoIPv6.csv.gz',
-    # 'GeoIPCityIPv6.dat':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
-    # 'GeoLiteCityv6.dat.gz',
-    # 'GeoIPCityIPv6.csv':
-    # 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCityv6-beta/'
-    # 'GeoLiteCityv6.csv.gz',
-    # 'GeoIPASNumIPv6.dat':
-    # 'http://download.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNumv6.dat.gz',
-    # 'GeoIPASNumIPv6.csv':
-    # 'http://download.maxmind.com/download/geoip/database/asnum/'
-    # 'GeoIPASNum2v6.zip',
+    'GeoLite2-City.tar.gz':
+    'http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.tar.gz',
+    'GeoLite2-City-CSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/GeoLite2-City-CSV.zip',
+    'GeoLite2-Country.tar.gz':
+    'http://geolite.maxmind.com/download/geoip/database/'
+    'GeoLite2-Country.tar.gz',
+    'GeoLite2-Country-CSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/'
+    'GeoLite2-Country-CSV.zip',
+    'GeoLite2-ASN.tar.gz':
+    'http://geolite.maxmind.com/download/geoip/database/GeoLite2-ASN.tar.gz',
+    'GeoLite2-ASN-CSV.zip':
+    'http://geolite.maxmind.com/download/geoip/database/GeoLite2-ASN-CSV.zip',
     'iso3166.csv': 'http://dev.maxmind.com/static/csv/codes/iso3166.csv',
     # This one is not from maxmind -- see http://thyme.apnic.net/
     'BGP.raw': 'http://thyme.apnic.net/current/data-raw-table',
 }
+
+GEOIP_LANG = "en"
 
 WEB_ALLOWED_REFERERS = None
 WEB_NOTES_BASE = "/dokuwiki/#IP#"
@@ -170,17 +164,17 @@ WEB_DEFAULT_INIT_QUERY = None
 # upload disabled by default
 WEB_UPLOAD_OK = False
 # Is this a public server? This setting affects result uploading and
-# access control
-## When this is set to True:
-### 1. The user will, by default, only access to results that are either
-###    in the "Shared" category or that he has uploaded.
-### 2. The upload page, if enabled, is modified to explain that
+# access control.
+# When this is set to True:
+#   1. The user will, by default, only access to results that are either
+#      in the "Shared" category or that he has uploaded.
+#   2. The upload page, if enabled, is modified to explain that
 WEB_PUBLIC_SRV = False
 # Feed with a random value, like `openssl rand -base64 42`.
 # *Mandatory* when WEB_PUBLIC_SRV == True
 WEB_SECRET = None
 
-## Basic ACL example
+# Basic ACL example
 # WEB_INIT_QUERIES = {
 #     'admin': 'full',
 #     'admin-site-a': 'category:site-a',
@@ -188,12 +182,13 @@ WEB_SECRET = None
 # }
 # WEB_DEFAULT_INIT_QUERY = 'noaccess'
 
-## More complex ACL example with realm handling
+# More complex ACL example with realm handling
 # WEB_INIT_QUERIES = {
 #     "admin": 'full',
 #     "@admin.sitea": 'category:sitea',
 # )
 # WEB_DEFAULT_INIT_QUERY = 'noaccess'
+
 
 def get_config_file(paths=None):
     """Generates (yields) the available config files, in the correct order."""
@@ -208,8 +203,10 @@ def get_config_file(paths=None):
         if os.path.isfile(path):
             yield path
 
+
 for fname in get_config_file():
     exec(compile(open(fname, "rb").read(), fname, 'exec'))
+
 
 def guess_prefix(directory=None):
     """Attempts to find the base directory where IVRE components are
@@ -217,8 +214,8 @@ def guess_prefix(directory=None):
 
     """
     def check_candidate(path, directory=None):
-        """Auxilliary function that checks whether a particular
-        path is a good candidate.
+        """Auxiliary function that checks whether a particular path is a good
+        candidate.
 
         """
         candidate = os.path.join(path, 'share', 'ivre')
@@ -243,6 +240,7 @@ def guess_prefix(directory=None):
         if candidate is not None:
             return candidate
 
+
 def guess_share(soft):
     for path in ['/usr/local/share/%s' % soft,
                  '/opt/%s/share/%s' % (soft, soft),
@@ -250,14 +248,30 @@ def guess_share(soft):
         if os.path.isdir(path):
             return path
 
+
 if GEOIP_PATH is None:
     GEOIP_PATH = guess_prefix('geoip')
+
+
+if DB_DATA is None and GEOIP_PATH is not None:
+    DB_DATA = "maxmind:///%s" % GEOIP_PATH
+
 
 if DATA_PATH is None:
     DATA_PATH = guess_prefix('data')
 
+
+if WEB_STATIC_PATH is None:
+    WEB_STATIC_PATH = guess_prefix(directory='web/static')
+
+
+if WEB_DOKU_PATH is None:
+    WEB_DOKU_PATH = guess_prefix(directory='dokuwiki')
+
+
 if HONEYD_IVRE_SCRIPTS_PATH is None and DATA_PATH is not None:
     HONEYD_IVRE_SCRIPTS_PATH = os.path.join(DATA_PATH, 'honeyd')
+
 
 if NMAP_SHARE_PATH is None:
     NMAP_SHARE_PATH = guess_share('nmap')

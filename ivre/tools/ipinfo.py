@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,17 +18,18 @@
 
 
 from __future__ import print_function
-import datetime
 import functools
+import json
 import os
-import struct
 import time
 try:
     import argparse
-    USING_ARGPARSE = True
 except ImportError:
+    from itertools import chain
     import optparse
     USING_ARGPARSE = False
+else:
+    USING_ARGPARSE = True
 import sys
 try:
     reload(sys)
@@ -42,7 +43,7 @@ from builtins import input
 
 
 from ivre.db import db
-import ivre.utils
+from ivre import utils
 
 
 def disp_rec(rec):
@@ -56,24 +57,28 @@ def disp_rec(rec):
             print(rec['recontype'], end=' ')
     if 'source' in rec:
         print(rec['source'], end=' ')
-    if 'infos' not in rec and 'value' in rec:
-        if 'fullvalue' in rec:
-            rec['value'] = rec['fullvalue']
-        print(rec['value'], end=' ')
+    if 'value' in rec:
+        value = utils.printable(rec['value'])
+        if isinstance(value, bytes):
+            value = value.decode()
+        print(value, end=' ')
     if 'version' in rec:
         print(rec['version'], end=' ')
     if 'signature' in rec:
         print('[%s]' % rec['signature'], end=' ')
     if 'distance' in rec:
-        print("at %s hop%s" % (rec['distance'], rec['distance'] > 1 and 's' or ''), end=' ')
+        print("at %s hop%s" % (rec['distance'],
+                               's' if rec['distance'] > 1 else ''), end=' ')
     if 'count' in rec:
-        print("(%d time%s)" % (rec['count'], rec['count'] > 1 and 's' or ''), end=' ')
+        print("(%d time%s)" % (rec['count'], 's' if rec['count'] > 1 else ''),
+              end=' ')
     if 'firstseen' in rec and 'lastseen' in rec:
-        if isinstance(rec['firstseen'], datetime.datetime):
-            print(rec['firstseen'], '-', rec['lastseen'], end=' ')
-        else:
-            print(datetime.datetime.fromtimestamp(int(rec['firstseen'])), '-', end=' ')
-            print(datetime.datetime.fromtimestamp(int(rec['lastseen'])), end=' ')
+        print(
+            rec['firstseen'].replace(microsecond=0),
+            '-',
+            rec['lastseen'].replace(microsecond=0),
+            end=' '
+        )
     if 'sensor' in rec:
         print(rec['sensor'], end=' ')
     print()
@@ -86,80 +91,100 @@ def disp_rec(rec):
                 print(rec['infos'][i])
 
 
-def disp_recs_std(flt):
-    oa = None
-    c = db.passive.get(flt, sort=[('addr', 1), ('recontype', 1), ('source', 1),
-                                  ('port', 1)])
-    for rec in c:
-        if not 'addr' in rec or rec['addr'] == 0:
+def disp_recs_std(flt, sort, limit, skip):
+    old_addr = None
+    sort = sort or [('addr', 1), ('port', 1), ('recontype', 1), ('source', 1)]
+    for rec in db.passive.get(flt, sort=sort, limit=limit, skip=skip):
+        if 'addr' not in rec or not rec['addr']:
             continue
-        if oa != rec['addr']:
-            if oa is not None:
+        if old_addr != rec['addr']:
+            if old_addr is not None:
                 print()
-            oa = rec['addr']
-            try:
-                print(ivre.utils.int2ip(oa))
-            except (struct.error, TypeError):
-                print(oa)
-            c = db.data.infos_byip(oa)
-            if c:
-                if 'country_code' in c:
+            old_addr = rec['addr']
+            print(utils.force_int2ip(old_addr))
+            ipinfo = db.data.infos_byip(old_addr)
+            if ipinfo:
+                if 'country_code' in ipinfo:
                     print('\t', end=' ')
-                    print(c['country_code'], end=' ')
-                    try:
-                        print('[%s]' % db.data.country_name_by_code(
-                            c['country_code']
-                        ), end=' ')
-                    except:
-                        pass
+                    print(ipinfo['country_code'], end=' ')
+                    if 'country_name' in ipinfo:
+                        cname = ipinfo['country_name']
+                    else:
+                        try:
+                            cname = db.data.country_name_by_code(
+                                ipinfo['country_code']
+                            )
+                        except AttributeError:
+                            cname = None
+                    if cname:
+                        print('[%s]' % cname, end=' ')
                     print()
-                if 'as_num' in c:
+                if 'as_num' in ipinfo:
                     print('\t', end=' ')
-                    print('AS%d' % c['as_num'], end=' ')
-                    if 'as_name' in c:
-                        print('[%s]' % c['as_name'], end=' ')
+                    print('AS%d' % ipinfo['as_num'], end=' ')
+                    if 'as_name' in ipinfo:
+                        print('[%s]' % ipinfo['as_name'], end=' ')
                     print()
-                elif 'as_name' in c:
+                elif 'as_name' in ipinfo:
                     print('\t', end=' ')
-                    print('AS???? [%s]' % c['as_name'], end=' ')
+                    print('AS???? [%s]' % ipinfo['as_name'], end=' ')
         disp_rec(rec)
 
 
-def disp_recs_short(flt):
+def disp_recs_json(flt, sort, limit, skip):
+    if os.isatty(sys.stdout.fileno()):
+        indent = 4
+    else:
+        indent = None
+    for rec in db.passive.get(flt, sort=sort, limit=limit, skip=skip):
+        for fld in ['_id', 'scanid']:
+            try:
+                del rec[fld]
+            except KeyError:
+                pass
+        if rec.get('recontype') == 'SSL_SERVER' and \
+           rec.get('source') == 'cert':
+            rec['value'] = utils.encode_b64(rec['value']).decode()
+        print(json.dumps(rec, indent=indent, default=db.passive.serialize))
+
+
+def disp_recs_short(flt, *_):
     for addr in db.passive.distinct('addr', flt=flt):
-        print(db.passive.convert_ip(addr))
+        print(db.passive.internal2ip(addr) if addr else None)
 
 
-def disp_recs_distinct(field, flt):
+def disp_recs_distinct(field, flt, *_):
     for value in db.passive.distinct(field, flt=flt):
         print(value)
 
 
-def disp_recs_count(flt):
+def disp_recs_top(top):
+    return lambda flt, sort, limit, _: utils.display_top(db.passive, top, flt,
+                                                         limit)
+
+
+def disp_recs_count(flt, sort, limit, skip):
     print(db.passive.count(flt))
 
 
-def _disp_recs_tail(flt, field, n):
+def _disp_recs_tail(flt, field, nbr):
     recs = list(db.passive.get(
-        flt, sort=[(field, -1)], limit=n))
+        flt, sort=[(field, -1)], limit=nbr))
     recs.reverse()
     for r in recs:
         if 'addr' in r:
-            print(ivre.utils.int2ip(r['addr']), end=' ')
+            print(utils.force_int2ip(r['addr']), end=' ')
         else:
-            if 'fulltargetval' in r:
-                print(r['fulltargetval'], end=' ')
-            else:
-                print(r['targetval'], end=' ')
+            print(r['targetval'], end=' ')
         disp_rec(r)
 
 
-def disp_recs_tail(n):
-    return lambda flt: _disp_recs_tail(flt, 'firstseen', n)
+def disp_recs_tail(nbr):
+    return lambda flt, *_: _disp_recs_tail(flt, 'firstseen', nbr)
 
 
-def disp_recs_tailnew(n):
-    return lambda flt: _disp_recs_tail(flt, 'lastseen', n)
+def disp_recs_tailnew(nbr):
+    return lambda flt, *_: _disp_recs_tail(flt, 'lastseen', nbr)
 
 
 def _disp_recs_tailf(flt, field):
@@ -171,13 +196,11 @@ def _disp_recs_tailf(flt, field):
     r = {'firstseen': 0, 'lastseen': 0}
     for r in firstrecs:
         if 'addr' in r:
-            print(ivre.utils.int2ip(r['addr']), end=' ')
+            print(utils.force_int2ip(r['addr']), end=' ')
         else:
-            if 'fulltargetval' in r:
-                print(r['fulltargetval'], end=' ')
-            else:
-                print(r['targetval'], end=' ')
+            print(r['targetval'], end=' ')
         disp_rec(r)
+        sys.stdout.flush()
     # 2. loop
     try:
         while True:
@@ -185,40 +208,50 @@ def _disp_recs_tailf(flt, field):
             time.sleep(1)
             for r in db.passive.get(
                     db.passive.flt_and(
-                        baseflt, {field: {'$gt': prevtime}}),
+                        baseflt,
+                        db.passive.searchnewer(prevtime,
+                                               new=field == 'lastseen'),
+                    ),
                     sort=[(field, 1)]):
                 if 'addr' in r:
-                    print(ivre.utils.int2ip(r['addr']), end=' ')
+                    print(utils.force_int2ip(r['addr']), end=' ')
                 else:
-                    if 'fulltargetval' in r:
-                        print(r['fulltargetval'], end=' ')
-                    else:
-                        print(r['targetval'], end=' ')
+                    print(r['targetval'], end=' ')
                 disp_rec(r)
+                sys.stdout.flush()
     except KeyboardInterrupt:
         pass
 
 
 def disp_recs_tailfnew():
-    return lambda flt: _disp_recs_tailf(flt, 'firstseen')
+    return lambda flt, *_: _disp_recs_tailf(flt, 'firstseen')
 
 
 def disp_recs_tailf():
-    return lambda flt: _disp_recs_tailf(flt, 'lastseen')
+    return lambda flt, *_: _disp_recs_tailf(flt, 'lastseen')
 
 
-def disp_recs_explain(flt):
-    print(db.passive.explain(db.passive.get(flt), indent=4))
+def disp_recs_explain(flt, sort, limit, skip):
+    print(db.passive.explain(db.passive._get(flt, sort=sort, limit=limit,
+                                             skip=skip), indent=4))
+
 
 def main():
     global baseflt
     if USING_ARGPARSE:
         parser = argparse.ArgumentParser(
-            description='Access and query the passive database.')
+            description='Access and query the passive database.',
+            parents=[db.passive.argparser, utils.CLI_ARGPARSER],
+        )
     else:
         parser = optparse.OptionParser(
-            description='Access and query the passive database.')
+            description='Access and query the passive database.',
+        )
+        for args, kargs in chain(db.passive.argparser.args,
+                                 utils.CLI_ARGPARSER):
+            parser.add_option(*args, **kargs)
         parser.parse_args_orig = parser.parse_args
+
         def my_parse_args():
             res = parser.parse_args_orig()
             res[0].ensure_value('ips', res[1])
@@ -227,30 +260,7 @@ def main():
         parser.add_argument = parser.add_option
     baseflt = db.passive.flt_empty
     disp_recs = disp_recs_std
-    # DB
-    parser.add_argument('--init', '--purgedb', action='store_true',
-                        help='Purge or create and initialize the database.')
-    parser.add_argument('--ensure-indexes', action='store_true',
-                        help='Create missing indexes (will lock the database).')
-    # filters
-    parser.add_argument('--sensor')
-    parser.add_argument('--country')
-    parser.add_argument('--asnum')
-    parser.add_argument('--torcert', action='store_true')
-    parser.add_argument('--dns')
-    parser.add_argument('--dnssub')
-    parser.add_argument('--cert')
-    parser.add_argument('--basicauth', action='store_true')
-    parser.add_argument('--auth', action='store_true')
-    parser.add_argument('--java', action='store_true')
-    parser.add_argument('--ua')
-    parser.add_argument('--ftp', action='store_true')
-    parser.add_argument('--pop', action='store_true')
-    parser.add_argument('--timeago', type=int)
-    parser.add_argument('--timeagonew', type=int)
     # display modes
-    parser.add_argument('--short', action='store_true',
-                        help='Output only IP addresses, one per line.')
     parser.add_argument('--tail', metavar='COUNT', type=int,
                         help='Output latest COUNT results.')
     parser.add_argument('--tailnew', metavar='COUNT', type=int,
@@ -259,21 +269,18 @@ def main():
                         help='Output continuously latest results.')
     parser.add_argument('--tailfnew', action='store_true',
                         help='Output continuously latest results.')
-    parser.add_argument('--count', action='store_true',
-                        help='Count matched results.')
-    parser.add_argument('--explain', action='store_true',
-                        help='MongoDB specific: .explain() the query.')
-    parser.add_argument('--distinct', metavar='FIELD',
-                        help='Output only unique FIELD part of the '
-                        'results, one per line.')
-    parser.add_argument('--delete', action='store_true',
-                        help='DELETE the matched results instead of '
-                        'displaying them.')
+    parser.add_argument('--top', metavar='FIELD / ~FIELD',
+                        help='Output most common (least common: ~) values for '
+                        'FIELD, by default 10, use --limit to change that, '
+                        '--limit 0 means unlimited.')
+    parser.add_argument('--dnsbl-update', action='store_true',
+                        help='Update the current database with DNS Blacklist')
     if USING_ARGPARSE:
         parser.add_argument('ips', nargs='*',
                             help='Display results for specified IP addresses'
                             ' or ranges.')
     args = parser.parse_args()
+    baseflt = db.passive.parse_args(args, baseflt)
     if args.init:
         if os.isatty(sys.stdin.fileno()):
             sys.stdout.write(
@@ -295,74 +302,20 @@ def main():
                 exit(0)
         db.passive.ensure_indexes()
         exit(0)
-    if args.sensor is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchsensor(args.sensor)
-        )
-    if args.asnum is not None:
-        if args.asnum.startswith('!') or args.asnum.startswith('-'):
-            baseflt = db.passive.flt_and(
-                baseflt,
-                db.passive.searchasnum(int(args.asnum[1:]), neg=True)
-            )
-        else:
-            baseflt = db.passive.flt_and(
-                baseflt,
-                db.passive.searchasnum(int(args.asnum))
-            )
-    if args.country is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchcountry(args.country)
-        )
-    if args.torcert:
-        baseflt = db.passive.flt_and(baseflt, db.passive.searchtorcert())
-    if args.basicauth:
-        baseflt = db.passive.flt_and(baseflt, db.passive.searchbasicauth())
-    if args.auth:
-        baseflt = db.passive.flt_and(baseflt, db.passive.searchhttpauth())
-    if args.ua is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchuseragent(ivre.utils.str2regexp(args.ua))
-        )
-    if args.java:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchjavaua()
-        )
-    if args.ftp:
-        baseflt = db.passive.flt_and(baseflt, db.passive.searchftpauth())
-    if args.pop:
-        baseflt = db.passive.flt_and(baseflt, db.passive.searchpopauth())
-    if args.dns is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchdns(
-                ivre.utils.str2regexp(args.dns),
-                subdomains=False))
-    if args.dnssub is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchdns(
-                ivre.utils.str2regexp(args.dnssub),
-                subdomains=True))
-    if args.cert is not None:
-        baseflt = db.passive.flt_and(
-            baseflt,
-            db.passive.searchcertsubject(
-                ivre.utils.str2regexp(args.cert)))
-    if args.timeago is not None:
-        baseflt = db.passive.flt_and(db.passive.searchtimeago(args.timeago,
-                                                              new=False))
-    if args.timeagonew is not None:
-        baseflt = db.passive.flt_and(db.passive.searchtimeago(args.timeagonew,
-                                                              new=True))
+    if args.update_schema:
+        db.passive.migrate_schema(None)
+        exit(0)
+    if args.dnsbl_update:
+        db.passive.update_dns_blacklist()
+        exit(0)
     if args.short:
         disp_recs = disp_recs_short
     elif args.distinct is not None:
         disp_recs = functools.partial(disp_recs_distinct, args.distinct)
+    elif args.json:
+        disp_recs = disp_recs_json
+    elif args.top is not None:
+        disp_recs = disp_recs_top(args.top)
     elif args.tail is not None:
         disp_recs = disp_recs_tail(args.tail)
     elif args.tailnew is not None:
@@ -377,11 +330,17 @@ def main():
         disp_recs = db.passive.remove
     elif args.explain:
         disp_recs = disp_recs_explain
+    if args.sort is None:
+        sort = []
+    else:
+        sort = [(field[1:], -1) if field.startswith('~') else (field, 1)
+                for field in args.sort]
     if not args.ips:
-        if not baseflt and disp_recs == disp_recs_std:
+        if not baseflt and not args.limit and disp_recs == disp_recs_std:
             # default to tail -f mode
             disp_recs = disp_recs_tailfnew()
-        disp_recs(baseflt)
+        disp_recs(baseflt, sort, args.limit or db.passive.no_limit,
+                  args.skip or 0)
         exit(0)
     first = True
     for a in args.ips:
@@ -390,13 +349,8 @@ def main():
         else:
             print()
         flt = baseflt.copy()
-        if ':' in a:
-            a = a.split(':', 1)
-            if a[0].isdigit():
-                a[0] = int(a[0])
-            if a[1].isdigit():
-                a[1] = int(a[1])
-            flt = db.passive.flt_and(flt, db.passive.searchrange(a[0], a[1]))
+        if '/' in a:
+            flt = db.passive.flt_and(flt, db.passive.searchnet(a))
         elif '-' in a:
             a = a.split('-', 1)
             if a[0].isdigit():
@@ -404,10 +358,8 @@ def main():
             if a[1].isdigit():
                 a[1] = int(a[1])
             flt = db.passive.flt_and(flt, db.passive.searchrange(a[0], a[1]))
-        elif '/' in a:
-            flt = db.passive.flt_and(flt, db.passive.searchnet(a))
         else:
             if a.isdigit():
-                a = ivre.utils.int2ip(int(a))
+                a = utils.force_int2ip(int(a))
             flt = db.passive.flt_and(flt, db.passive.searchhost(a))
-        disp_recs(flt)
+        disp_recs(flt, sort, args.limit or db.passive.no_limit, args.skip or 0)

@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,36 +18,27 @@
 
 """Update the flow database from ARP requests in PCAP files"""
 
+from datetime import datetime
 import subprocess
 
-from scapy.utils import PcapReader
+from scapy.all import PcapReader
 
-from ivre import config
+from ivre import config, utils
 from ivre.db import db
+
 
 def reader(fname):
     proc = subprocess.Popen(['tcpdump', '-n', '-r', fname, '-w', '-', 'arp'],
                             stdout=subprocess.PIPE)
     return PcapReader(proc.stdout)
 
+
 def main():
-    """Update the flow database from Airodump CSV files"""
-    try:
-        import argparse
-        parser = argparse.ArgumentParser(description=__doc__)
+    """Update the flow database from ARP requests in PCAP files"""
+    parser, use_argparse = utils.create_argparser(__doc__, extraargs='files')
+    if use_argparse:
         parser.add_argument('files', nargs='*', metavar='FILE',
                             help='PCAP files')
-    except ImportError:
-        import optparse
-        parser = optparse.OptionParser(description=__doc__)
-        parser.parse_args_orig = parser.parse_args
-        def my_parse_args():
-            res = parser.parse_args_orig()
-            res[0].ensure_value('files', res[1])
-            return res[0]
-        parser.parse_args = my_parse_args
-        parser.add_argument = parser.add_option
-
     parser.add_argument("-v", "--verbose", help="verbose mode",
                         action="store_true")
     args = parser.parse_args()
@@ -56,14 +47,13 @@ def main():
         config.DEBUG = True
 
     bulk = db.flow.start_bulk_insert()
+    query_cache = db.flow.add_flow(["Flow"], ('proto',))
     for fname in args.files:
         for pkt in reader(fname):
-            for rec in [{"dst": pkt.hwsrc, "src": pkt.psrc},
-                        {"dst": pkt.hwdst, "src": pkt.pdst}]:
-                if rec["dst"] != "00:00:00:00:00:00" and rec["src"] != "0.0.0.0":
-                    db.flow.bulk_add_flow(
-                        bulk, rec, "ARP", {},
-                        srcnode=("Host", {"addr": "{src}"}),
-                        dstnode=("Intel:Mac", {"addr": "{dst}"}),
-                    )
+            rec = {"dst": pkt.pdst, "src": pkt.psrc,
+                   "start_time": datetime.fromtimestamp(pkt.time),
+                   "end_time": datetime.fromtimestamp(pkt.time),
+                   "proto": "arp"}
+            if rec["dst"] != "0.0.0.0" and rec["src"] != "0.0.0.0":
+                bulk.append(query_cache, rec)
     bulk.close()

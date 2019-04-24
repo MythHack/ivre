@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2019 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 
 """
 This module is part of IVRE.
-Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+Copyright 2011 - 2019 Pierre LALET <pierre.lalet@cea.fr>
 
 Standard setup.py file. Run
 
@@ -26,17 +26,19 @@ $ python setup.py build
 # python setup.py install
 """
 
+
 from distutils.core import setup
 from distutils.command.install_data import install_data
 from distutils.command.install_lib import install_lib
 import os
-import sys
+
 
 VERSION = __import__('ivre').VERSION
 
+
 class smart_install_data(install_data):
     """Replacement for distutils.command.install_data to handle
-    configuration files location and CGI files shebang lines.
+    configuration files location.
 
     """
     def run(self):
@@ -47,27 +49,8 @@ class smart_install_data(install_data):
                 ("/%s" % path if path.startswith('etc/') else path, files)
                 for path, files in self.data_files
             ]
-        result = install_data.run(self)
-        # handle CGI files like files in [PREFIX]/bin, replace first
-        # line based on sys.executable
-        for path, files in self.data_files:
-            for fname in files:
-                if fname.startswith('web/cgi-bin/') and fname.endswith('.py'):
-                    fullfname = os.path.join(self.install_dir, path,
-                                             os.path.basename(fname))
-                    tmpfname = "%s.tmp" % fullfname
-                    stat = os.stat(fullfname)
-                    os.rename(fullfname, tmpfname)
-                    with open(fullfname, 'w') as newf:
-                        with open(tmpfname) as oldf:
-                            oldf.readline()
-                            newf.write("#!%s\n" % sys.executable)
-                            for line in oldf:
-                                newf.write(line)
-                    os.chown(fullfname, stat.st_uid, stat.st_gid)
-                    os.chmod(fullfname, stat.st_mode)
-                    os.unlink(tmpfname)
-        return result
+        return install_data.run(self)
+
 
 class smart_install_lib(install_lib):
     """Replacement for distutils.command.install_lib to handle
@@ -91,6 +74,7 @@ class smart_install_lib(install_lib):
         os.chmod(fullfname, stat.st_mode)
         os.unlink(tmpfname)
         return result
+
 
 setup(
     name='ivre',
@@ -129,19 +113,22 @@ specialized scripts.
         "Programming Language :: Python :: 3.4",
         "Programming Language :: Python :: 3.5",
         "Programming Language :: Python :: 3.6",
+        "Programming Language :: Python :: 3.7",
         "Topic :: Scientific/Engineering :: Information Analysis",
         "Topic :: Security",
         "Topic :: System :: Networking",
         "Topic :: System :: Networking :: Monitoring",
         "Topic :: System :: Software Distribution",
     ],
+    python_requires='>=2.6, !=3.0.*, !=3.1.*, !=3.2.*, <4',
     install_requires=[
         'pycrypto',
         'pymongo>=2.7.2',
         'future',
+        'bottle',
     ],
     extras_require={
-        'Flow':  ["py2neo>=3"],
+        'Flow': ["py2neo>=3,<4"],
         'PostgreSQL': ["sqlalchemy", "psycopg2"],
         'GSSAPI authentication': ["python-krbV"],
         'Screenshots': ["PIL"],
@@ -149,19 +136,20 @@ specialized scripts.
         '3D traceroute graphs': ["dbus-python"],
         'Plots': ["matplotlib"],
     },
-    packages=['ivre', 'ivre/tools', 'ivre/db', 'ivre/parser', 'ivre/analyzer'],
+    packages=['ivre', 'ivre/analyzer', 'ivre/db', 'ivre/db/sql', 'ivre/parser',
+              'ivre/tools', 'ivre/web'],
     scripts=['bin/ivre'],
     data_files=[
-        ('share/ivre/passiverecon',
-         ['passiverecon/passiverecon.bro',
-          'passiverecon/passiverecon2db-ignore.example']),
-        ('share/ivre/bro/flow',
-         ['bro/flow/__load__.bro',
-          'bro/flow/dhcp_names.bro',
-          'bro/flow/rpc.bro',
-          'bro/flow/settings.bro']),
-        ('share/ivre/honeyd', []),
-        ('share/ivre/geoip', []),
+        ('share/ivre/bro',
+         ['bro/passiverecon2db-ignore.example']),
+        ('share/ivre/bro/ivre',
+         ['bro/ivre/__load__.bro']),
+        ('share/ivre/bro/ivre/passiverecon',
+         ['bro/ivre/passiverecon/__load__.bro',
+          'bro/ivre/passiverecon/bare.bro',
+          'bro/ivre/passiverecon/ja3.bro']),
+        ('share/ivre/honeyd', ['data/.empty']),
+        ('share/ivre/geoip', ['data/.empty']),
         ('share/ivre/data', ['data/ike-vendor-ids']),
         ('share/ivre/data/honeyd', ['data/honeyd/sshd']),
         ('share/ivre/docker', ['docker/Vagrantfile']),
@@ -203,6 +191,9 @@ specialized scripts.
           'web/static/templates/view-hosts.html',
           'web/static/templates/view-screenshots-only.html',
           'web/static/templates/view-scripts-only.html',
+          'web/static/templates/view-ports-only.html',
+          'web/static/templates/view-services-only.html',
+          'web/static/templates/view-vulnerabilities-only.html',
           'web/static/templates/subview-cpes.html',
           'web/static/templates/subview-graph-elt-details.html',
           'web/static/templates/subview-host-summary.html',
@@ -257,6 +248,9 @@ specialized scripts.
         ('share/ivre/web/static/fi/flags/4x3',
          [os.path.join('web/static/fi/flags/4x3/', x)
           for x in os.listdir('web/static/fi/flags/4x3/')]),
+        # WSGI application
+        ('share/ivre/web/wsgi',
+         ['web/wsgi/app.wsgi']),
         # Dokuwiki
         ('share/ivre/dokuwiki',
          ['web/dokuwiki/backlinks.patch']),
@@ -278,11 +272,6 @@ specialized scripts.
         ('share/ivre/dokuwiki/media/doc/screenshots',
          [os.path.join('doc/screenshots', x)
           for x in os.listdir('doc/screenshots')]),
-        ('share/ivre/web/cgi-bin',
-         ['web/cgi-bin/flowjson.py',
-          'web/cgi-bin/jsconfig.py',
-          'web/cgi-bin/scanjson.py',
-          'web/cgi-bin/scanupload.py']),
         ('share/ivre/nmap_scripts',
          ['nmap_scripts/http-screenshot.nse',
           'nmap_scripts/mainframe-banner.nse',

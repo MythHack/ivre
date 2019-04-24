@@ -38,9 +38,7 @@ They are licensed under [[https://www.gnu.org/licenses/gpl-3.0.en.html|GPL v3 li
 
 Files under the ''%%web/static/fi%%'' directory come from the [[https://lipis.github.io/flag-icon-css/|flag-icon-css]] project.
 
-It includes the European flag from [pull request
-
-====== 71](https:%%//%%github.com/lipis/flag-icon-css/pull/71/). ======
+It includes the European flag from [[https://github.com/lipis/flag-icon-css/pull/71/|pull request #71]].
 
 These files are licensed under [[https://en.wikipedia.org/wiki/MIT_License|MIT license]].
 
@@ -52,7 +50,7 @@ It includes new fingerprints discovered during Internet-wide ISAKMP scans. Those
 
 This file is licensed under [[https://www.gnu.org/licenses/gpl-3.0.en.html|GPL v3 license]].
 
-See also [[https://github.com/royhills/ike-scan/issues/19|Use of ike-vendor-ids in other (open-source) softwares]].
+See also [[https://github.com/royhills/ike-scan/issues/19|Use of ike-vendor-ids in other (open-source) programs]].
 
 ===== Natural Earth =====
 
@@ -65,5 +63,5 @@ The file ''%%web/static/cea.png%%'' and ''%%web/static/cea-white.png%%'' are the
 
 ----
 
-This file is part of IVRE. Copyright 2011 - 2016 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
+This file is part of IVRE. Copyright 2011 - 2018 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
 

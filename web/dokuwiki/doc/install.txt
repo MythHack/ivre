@@ -10,13 +10,14 @@ If you want to use the "flow" module, you also need to install [[http://neo4j.co
 
 If you plan to run scans from a machine, install [[http://nmap.org/|Nmap]] and optionally [[https://zmap.io/|ZMap]] and [[https://github.com/robertdavidgraham/masscan|Masscan]]. If you want to integrate screenshots, install [[https://github.com/tesseract-ocr/tesseract|Tesseract]], [[https://www.imagemagick.org/|ImageMagick]], [[http://ffmpeg.org/|FFmpeg]] and [[http://phantomjs.org/|PhantomJS]].
 
-If you plan to analyze PCAP file on a machine, install, depending on your needs, [[http://www.bro.org/|Bro]] (version 2.3 minimum), [[http://lcamtuf.coredump.cx/p0f/|p0f]] (version 2, will not work with version 3), [[http://qosient.com/argus/|Argus]] and/or [[http://nfdump.sourceforge.net/|Nfdump]].
+If you plan to analyze PCAP file on a machine, install, depending on your needs, [[http://www.bro.org/|Bro]] (version 2.5 minimum), [[http://lcamtuf.coredump.cx/p0f/|p0f]] (version 2, will not work with version 3), [[http://qosient.com/argus/|Argus]] and/or [[http://nfdump.sourceforge.net/|Nfdump]].
 
 To install IVRE, you'll need [[http://www.python.org/|Python]] 2 (version 2.6 minimum, prefer 2.7) or 3 (version 3.3 minimum), with the following modules:
 
+  * [[https://bottlepy.org/|Bottle]]
   * [[http://www.pycrypto.org/|Crypto]]
   * [[http://api.mongodb.org/python/|pymongo]] version 2.7.2 minimum.
-  * [[http://py2neo.org/v3/|py2neo]] version 3 minimum, optional, to use the flow module.
+  * [[http://py2neo.org/v3/|py2neo]] version 3, optional, to use the flow module.
   * [[http://www.sqlalchemy.org/|sqlalchemy]] and [[http://initd.org/psycopg/|psycopg2]] to use the experimental PostgreSQL backend.
   * [[http://www.pythonware.com/products/pil/|PIL]] optional, to trim screenshots.
 
@@ -41,6 +42,8 @@ You can override default values in three files:
     * ''%%/usr/local/etc/ivre.conf%%'' (read after, so higher priority)
   * one user-specific:
     * ''%%~/.ivre.conf%%'' (the last to be read, so highest priority)
+  * one environment based:
+    * ''%%IVRE_CONF%%'', set it to the path of the configuration file to read
 
 The file should contain lines of type ''%%key = value%%''. Empty lines and comments (starting with the ''%%#%%'' character) are ignored. The following values can be changed:
 
@@ -56,7 +59,7 @@ It might be a good idea to have a read-only account everywhere except for some s
 
 Once IVRE has been properly configured, it's time to initialize its databases.
 
-For that, the command-line tools (namely ''%%ivre ipdata%%'', ''%%ivre ipinfo%%'', ''%%ivre scancli%%'' and ''%%ivre runscansagentdb%%'', respectively for information about IP addresses, passive information, active information and running scans through agents) have a ''%%--init%%'' option.
+For that, the command-line tools (namely ''%%ivre ipinfo%%'', ''%%ivre scancli%%'' and ''%%ivre runscansagentdb%%'', respectively for information about IP addresses, passive information, active information and running scans through agents) have a ''%%--init%%'' option.
 
 So you can run, with a user or from a host where the configuration has a write access to the database (add ''%%< /dev/null%%'' to skip the confirmation):
 
@@ -65,32 +68,33 @@ $ ivre scancli --init
 This will remove any scan result in your database. Process ? [y/N] y
 $ ivre ipinfo --init
 This will remove any passive information in your database. Process ? [y/N] y
-$ ivre ipdata --init
-This will remove any country/AS information in your database. Process ? [y/N] y
 # ivre runscansagentdb --init
 This will remove any agent and/or scan in your database and files. Process ? [y/N] y
+
 </code>
 ==== Getting IP data ====
 
 <code>
 # ivre ipdata --download
-$ ivre ipdata --import-all --no-update-passive-db
+$ ivre ipdata --import-all
+
 </code>
 ==== Web Server ====
 
 Once IVRE has been installed, to also install the web interface, you have to copy or symlink IVRE files to your web server directories, or configure your web server to use IVRE files directly.
 
-The files the web server should serve statically are located in ''%%[PREFIX]/share/ivre/web/static%%'', the folder the web server should serve as CGI is located in ''%%[PREFIX]/share/ivre/web/cgi-bin%%'', and the (optional) folders to use as Dokuwiki content are located in ''%%[PREFIX]/share/ivre/dokuwiki/doc%%'' and ''%%[PREFIX]/share/ivre/dokuwiki/media%%''. Make sure your Dokuwiki has been configured with server-side URL rewriting; this means using proper rewrite in your Web server configuration (with ''%%mod_rewrite%%'' when using Apache; you can use the provided ''%%Dockerfile%%''s as examples on how to configure Apache or Nginx) and adding ''%%$conf['userewrite'] = 1%%'' in your Dokuwiki config file.
+The files the web server should serve statically are located in ''%%[PREFIX]/share/ivre/web/static%%'', the WSGI application the web server should forward ''%%/cgi%%'' requests is located in ''%%[PREFIX]/share/ivre/web/wsgi/app.wsgi%%'', and the (optional) folders to use as Dokuwiki content are located in ''%%[PREFIX]/share/ivre/dokuwiki/doc%%'' and ''%%[PREFIX]/share/ivre/dokuwiki/media%%''. Make sure your Dokuwiki has been configured with server-side URL rewriting; this means using proper rewrite in your Web server configuration (with ''%%mod_rewrite%%'' when using Apache; you can use the provided ''%%Dockerfile%%''s as examples on how to configure Apache or Nginx) and adding ''%%$conf['userewrite'] = 1%%'' in your Dokuwiki config file.
 
 You may want to change some values, by creating or modifying ''%%/etc/ivre.conf%%''.
 
 On a typical Debian/Ubuntu installation with Apache and Dokuwiki installed with the distribution packages, these files should be copied or (sym)linked at these locations:
 
   * ''%%[PREFIX]/share/ivre/web/static/*%%'' -> ''%%/var/www%%'' or ''%%/var/www/html%%''
-  * ''%%[PREFIX]/share/ivre/web/cgi-bin/*%%'' -> ''%%/usr/lib/cgi-bin/%%''
   * ''%%[PREFIX]/share/ivre/dokuwiki/doc%%'' -> ''%%/var/lib/dokuwiki/data/pages/%%''
   * ''%%[PREFIX]/share/ivre/dokuwiki/media/logo.png%%'' -> ''%%/var/lib/dokuwiki/data/media/%%''
   * ''%%[PREFIX]/share/ivre/dokuwiki/media/doc%%'' -> ''%%/var/lib/dokuwiki/data/media/%%''
+
+A specific configuration should also be done to serve the WSGI application. You can have a look at the file ''%%pkg/apache/ivre.conf%%'' as an example.
 
 ==== Getting screenshots ====
 
@@ -99,13 +103,15 @@ Nmap does not take application screenshots by default. To do so, you have to ins
 <code>
 # cp /usr/share/ivre/nmap_scripts/*.nse /usr/share/nmap/scripts/
 # patch /usr/share/nmap/scripts/rtsp-url-brute.nse \
-> /usr/share/ivre/nmap_scripts/patches/rtsp-url-brute.patch
+< /usr/share/ivre/nmap_scripts/patches/rtsp-url-brute.patch
 # nmap --script-updatedb
+
 </code>
 And now, you can play:
 
 <code>
 # nmap -sV --script screenshot [targets]
+
 </code>
 ====== Agent ======
 
@@ -120,5 +126,5 @@ It requires a POSIX environment, and the commands ''%%screen%%'', ''%%rsync%%'' 
 
 ----
 
-This file is part of IVRE. Copyright 2011 - 2017 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
+This file is part of IVRE. Copyright 2011 - 2018 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
 

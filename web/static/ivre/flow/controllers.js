@@ -1,6 +1,6 @@
 /*
  * This file is part of IVRE.
- * Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+ * Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
  *
  * IVRE is free software: you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by
@@ -73,7 +73,7 @@ ivreWebUi.directive("sigmaGraph", function () {
                 settings: default_sigma_settings,
             });
 
-            // Instanciate the ActiveState plugin:
+            // Instantiate the ActiveState plugin:
             var activeState = sigma.plugins.activeState(s);
 
             // Initialize the dragNodes plugin:
@@ -122,7 +122,7 @@ ivreWebUi.factory("graphService", function () {
             a=((a<<5)-a)+b.charCodeAt(0);
             return a&a
         },0);
-    };
+    }
 
     function hex_color_to_rgba(hex, opacity){
         if (opacity === undefined) {
@@ -136,11 +136,11 @@ ivreWebUi.factory("graphService", function () {
 
         result = 'rgba('+r+','+g+','+b+','+opacity+')';
         return result;
-    };
+    }
 
     function _hex_color_to_rgba_wrapper(value) {
         return hex_color_to_rgba(value, 1);
-    };
+    }
 
     var NC = 8;
     var EDGE_PALETTE = {
@@ -151,7 +151,7 @@ ivreWebUi.factory("graphService", function () {
 
     function str_to_color(str) {
         return EDGE_PALETTE.other[hashCode(str) % 8];
-    };
+    }
 
     function edge_color(s, edge) {
         // s is unused here
@@ -173,7 +173,7 @@ ivreWebUi.factory("graphService", function () {
         } else {
             edge.color = str_to_color(edge.labels[0]);
         }
-    };
+    }
 
     function node_color(s, node, hidden) {
         in_degree = s.graph.degree(node.id, "in");
@@ -183,7 +183,7 @@ ivreWebUi.factory("graphService", function () {
         } else {
             node.color = hidden ? "#111" : str_to_color(node.labels[0] || "");
         }
-    };
+    }
 
     // formatters is an object:
     // { edges: { attr: function }, nodes: { attr: function }}
@@ -221,7 +221,7 @@ ivreWebUi.factory("graphService", function () {
         });
         sigma.canvas.edges.autoCurve(s);
         s.refresh();
-    };
+    }
 
     function update_layout(s) {
         // Possible layouts and config
@@ -255,7 +255,7 @@ ivreWebUi.factory("graphService", function () {
         sigma.layouts.fruchtermanReingold.start(s);
     }
 
-    // Post instanciation sigma conf
+    // Post instantiation sigma conf
     function setup(s, formatters) {
         update_display(s, formatters);
         console.log("Nodes: " + s.graph.nodes().length);
@@ -268,7 +268,7 @@ ivreWebUi.factory("graphService", function () {
       s.renderers[0].halo({
         nodes: s.graph.nodes()
       });
-    };
+    }
 
     function expand_to_neighbors(s, nodes, edges) {
         var adjacentNodes = nodes,
@@ -299,18 +299,18 @@ ivreWebUi.factory("graphService", function () {
 
         // Render halo
         s.renderers[0].halo(to_halo);
-    };
+    }
 
     function enable_halo(s) {
         s.bind('hovers', function(e) {
             set_halo(s, e.data.enter.nodes, e.data.enter.edges);
         });
-    };
+    }
 
     function set_opacity(elt, alpha) {
         // Change alpha component of rgba(r,g,b,a)
         elt.color = elt.color.replace(/, *[\d.]+\)/, "," + alpha + ")");
-    };
+    }
 
     function set_visible(s, nodes, edges, min, max) {
         var min = min === undefined ? 0 : min;
@@ -331,11 +331,11 @@ ivreWebUi.factory("graphService", function () {
             set_opacity(edge, max);
         });
         s.refresh();
-    };
+    }
 
     function has_details(s, elt) {
         return elt === undefined || elt.has_details === true;
-    };
+    }
 
     function add_details(s, elt, data) {
         elt.has_details = true;
@@ -348,7 +348,7 @@ ivreWebUi.factory("graphService", function () {
         } else {
             console.log("Unsupported details format for " + elt.labels);
         }
-    };
+    }
 
     return {
         update_display: update_display,
@@ -389,7 +389,7 @@ ivreWebUi
                     labels: elt.labels,
                     type: type,
                 };
-                url = "cgi-bin/flowjson.py?action=details&q=" +
+                url = "cgi/flows?action=details&q=" +
                          encodeURIComponent(angular.toJson(q));
                 $http.get(url).success(function (data) {
                     graphService.add_details($scope.sigma, elt, data);
@@ -549,7 +549,7 @@ ivreWebUi
             var vis = d3.select("#timeline")
                 .append("svg:svg")
                 .attr("viewBox", [0, 0, dr_w, dr_h])
-                .attr("class", "fullfill")
+                .attr("class", "fulfill")
                 .attr("preserveAspectRatio", "none")
                 .append("svg:g");
 
@@ -729,10 +729,10 @@ ivreWebUi
             r = $scope.query_ready;
             if (r.nodes && r.edges) {
                 $scope.query.count = false;
-                $scope.load_json_url("cgi-bin/flowjson.py?q=" +
+                $scope.load_json_url("cgi/flows?q=" +
                              encodeURIComponent(angular.toJson($scope.query)));
                 $scope.query.count = true;
-                $http.get("cgi-bin/flowjson.py?q=" +
+                $http.get("cgi/flows?q=" +
                           encodeURIComponent(angular.toJson($scope.query)))
                      .success(function (data) {
                          $scope.counts = data;

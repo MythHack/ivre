@@ -29,7 +29,7 @@ from ivre.parser import Parser
 from ivre.utils import LOGGER, decode_hex
 
 
-CONTAINER_TYPE = re.compile(b"^(table|set|vector)\[([a-z]+)\]$")
+CONTAINER_TYPE = re.compile(b"^(table|set|vector)\\[([a-z]+)\\]$")
 
 
 class BroFile(Parser):
@@ -59,7 +59,7 @@ class BroFile(Parser):
     def __next__(self):
         return self.parse_line(self.nextlines.pop(0)
                                if self.nextlines else
-                               next(self.fdesc))
+                               next(self.fdesc).strip())
 
     def parse_header_line(self, line):
         if not line:
@@ -70,7 +70,11 @@ class BroFile(Parser):
 
         keyval = line[1:].split(self.sep, 1)
         if len(keyval) < 2:
-            LOGGER.warn("Invalid header line")
+            if line.startswith(b'#separator '):
+                keyval = [b'separator', line[11:]]
+            else:
+                LOGGER.warn("Invalid header line")
+                return
 
         directive = keyval[0]
         arg = keyval[1]
@@ -92,37 +96,39 @@ class BroFile(Parser):
         elif directive == b"types":
             self.types = arg.split(self.sep)
 
-        return None
-
     def parse_line(self, line):
         if line.startswith(b'#'):
+            self.parse_header_line(line)
             return next(self)
         res = {}
-        fields = line.strip().split(self.sep)
+        fields = line.split(self.sep)
 
         for field, name, typ in zip(fields, self.fields, self.types):
             name = name.replace(b".", b"_").decode()
-            res[name] = self.bro2neo(field, typ)
+            res[name] = self.fix_value(field, typ)
         return res
 
-    def bro2neo(self, val, typ):
-        if val in [self.unset_field, self.empty_field]:
+    def fix_value(self, val, typ):
+        if val == self.unset_field:
             return None
         if typ == b"bool":
             return val == b"T"
         container_type = CONTAINER_TYPE.search(typ)
         if container_type is not None:
+            if val == self.empty_field:
+                return []
             _, elt_type = container_type.groups()
-            return [self.bro2neo(x, elt_type)
+            return [self.fix_value(x, elt_type)
                     for x in val.split(self.set_sep)]
-        elif typ in self.int_types:
+        if typ in self.int_types:
             return int(val)
-        elif typ in self.float_types:
+        if typ in self.float_types:
             return float(val)
-        elif typ in self.time_types:
+        if typ in self.time_types:
             return datetime.datetime.fromtimestamp(float(val))
-        else:
-            return val.decode()
+        if val == self.empty_field:
+            return ""
+        return val.decode()
 
     @property
     def field_types(self):

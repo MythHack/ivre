@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -24,22 +24,14 @@
 import pipes
 
 
-from ivre import config
+from ivre import config, utils
 
 
-try:
-    import argparse
-    argparser = argparse.ArgumentParser(add_help=False)
-    USING_ARGPARSE = True
-except ImportError:
-    from ivre import utils
-    argparser = utils.FakeArgparserParent()
-    USING_ARGPARSE = False
+ARGPARSER = utils.ArgparserParent()
 
-if USING_ARGPARSE:
-    argparser.add_argument('--nmap-template', help="Select Nmap scan template",
-                           choices=config.NMAP_SCAN_TEMPLATES,
-                           default="default")
+ARGPARSER.add_argument('--nmap-template', help="Select Nmap scan template",
+                       choices=config.NMAP_SCAN_TEMPLATES,
+                       default="default")
 
 NMAP_OPT_PORTS = {
     None: [],
@@ -83,9 +75,11 @@ class Scan(object):
     def options(self):
         options = [self.nmap]
         # use -A instead of many options when possible
-        if (('C' in self.scans or self.scripts_categories or
-             self.scripts_exclude or self.scripts_force) and
-            'V' in self.scans and self.osdetect and self.traceroute):
+        if (
+                ('C' in self.scans or self.scripts_categories or
+                 self.scripts_exclude or self.scripts_force) and
+                'V' in self.scans and self.osdetect and self.traceroute
+        ):
             options.append('-A')
             self.scans.difference_update('CV')
             self.osdetect = False

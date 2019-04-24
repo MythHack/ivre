@@ -124,8 +124,6 @@ single or double quotes.
 
 ### Filters ###
 
-  - `[!]archives` show results from the archives database (and
-    `!archives` has no effect since it is the default behavior).
   - `[!]host:[IP address]` filter a specific IP address. Using the IP
     address directly (without `host:`) is equivalent.
   - `[!]net:[IP address/netmask]` filter a specific network (CIDR
@@ -177,6 +175,8 @@ single or double quotes.
     the `sa` account.
   - `mysqlemptypwd` look for MySQL servers with an empty password for
     the `root` account.
+  - `httphdr`, `httphdr:[header]`, `httphdr:[header]:[value]` look for
+    HTTP headers.
   - `owa` look for OWA (Outlook Web App) servers.
   - `phpmyadmin` look for phpMyAdmin servers.
   - `smb.dnsdomain:[FQDN]` search results with SMB service in a
@@ -203,12 +203,19 @@ single or double quotes.
   - `x11open` look for open X11 servers.
   - `x11srv` look for X11 servers.
   - `xp445` look for Windows XP machines with TCP/445 port open.
+  - `[!]ssl-ja3-client[:JA3]` look for hosts with a JA3 client or with the
+    given JA3 client.
+  - `[!]ssl-ja3-server[:[JA3S][:JA3C]]` look for hosts with a JA3
+    server, with the given JA3 server (optionally corresponding to the
+    given JA3 client).
+  - `[!]useragent[:USERAGENT]` look for hosts with a User-Agent.
   - `os:` look for a specific value in the OS discovery results.
   - `devtype:`, `devicetype:` look for a type of devices.
   - `netdev`, `networkdevice` look for network devices (firewalls,
     routers, ...).
   - `phonedev` look for telephony devices.
-  - `cpe(:[type](:[vendor](:[product](:[version]))))` look for a given cpe. Each field can be a /regex/.
+  - `cpe(:[type](:[vendor](:[product](:[version]))))` look for a given
+    cpe. Each field can be a /regex/.
   - `[!]hop:[IP]`, `[!]hop:[IP]:[TTL]` look for a particular IP
     address in the traceroute results.
   - `[!]hopname:` look for a matching hostname in the traceroute
@@ -240,9 +247,10 @@ single or double quotes.
     `display:script:[script id],[script id],...` only display (a
     particular) script outputs.
   - `display:screenshot` only display screenshots.
+  - `display:vulnerability` only display vulnerabilities.
 
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2015
+This file is part of IVRE. Copyright 2011 - 2018
 [Pierre LALET](mailto:pierre.lalet@cea.fr)

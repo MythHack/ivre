@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,19 +17,29 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
-"""
-This sub-module contains functions that might be usefull to any other
+
+"""This sub-module contains functions that might be useful to any other
 sub-module or script.
+
 """
 
+
 import ast
+try:
+    import argparse
+    USE_ARGPARSE = True
+except ImportError:
+    import optparse
+    USE_ARGPARSE = False
+from bisect import bisect_left
 import bz2
 import codecs
 import datetime
 import errno
-from functools import reduce
+import functools
 import gzip
 import hashlib
+import json
 from io import BytesIO
 import logging
 import math
@@ -39,6 +49,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import time
 try:
     import PIL.Image
     import PIL.ImageChops
@@ -47,8 +58,8 @@ except ImportError:
     USE_PIL = False
 
 
-from builtins import bytes, int, object, range, str
-from future.utils import viewitems
+from builtins import bytes, int as int_types, object, range, str
+from future.utils import PY3, viewitems
 from past.builtins import basestring
 
 
@@ -68,6 +79,18 @@ MAXVALLEN = 1000
 
 LOGGER = logging.getLogger("ivre")
 REGEXP_T = type(re.compile(''))
+HEX = re.compile('^[a-f0-9]+$', re.IGNORECASE)
+
+
+NMAP_FINGERPRINT_IVRE_KEY = {
+    # TODO: cpe
+    'd': 'service_devicetype',
+    'h': 'service_hostname',
+    'i': 'service_extrainfo',
+    'o': 'service_ostype',
+    'p': 'service_product',
+    'v': 'service_version',
+}
 
 
 logging.basicConfig()
@@ -75,34 +98,155 @@ logging.basicConfig()
 
 def ip2int(ipstr):
     """Converts the classical decimal, dot-separated, string
-    representation of an IP address to an integer, suitable for
-    database storage.
+    representation of an IPv4 address, or the hexadecimal,
+    colon-separated, string representation of an IPv6 address, to an
+    integer.
 
     """
     try:
         ipstr = ipstr.decode()
     except AttributeError:
         pass
-    return struct.unpack('!I', socket.inet_aton(ipstr))[0]
+    try:
+        return struct.unpack('!I', socket.inet_aton(ipstr))[0]
+    except socket.error:
+        val1, val2 = struct.unpack(
+            '!QQ', socket.inet_pton(socket.AF_INET6, ipstr),
+        )
+        return (val1 << 64) + val2
+
+
+def force_ip2int(ipstr):
+    """Same as ip2int(), but works when ipstr is already an int"""
+    try:
+        return ip2int(ipstr)
+    except (TypeError, socket.error, struct.error):
+        return ipstr
 
 
 def int2ip(ipint):
     """Converts the integer representation of an IP address to its
-    classical decimal, dot-separated, string representation.
+    classical decimal, dot-separated (for IPv4) or hexadecimal,
+    colon-separated (for IPv6) string representation.
 
     """
-    return socket.inet_ntoa(struct.pack('!I', ipint))
+    try:
+        if ipint > 0xffffffff:  # Python 2.6 would handle the overflow
+            raise struct.error()
+        return socket.inet_ntoa(struct.pack('!I', ipint))
+    except struct.error:
+        return socket.inet_ntop(
+            socket.AF_INET6,
+            struct.pack('!QQ', ipint >> 64, ipint & 0xffffffffffffffff),
+        )
+
+
+def int2ip6(ipint):
+    """Converts the integer representation of an IPv6 address to its
+    classical decimal, hexadecimal, colon-separated string
+    representation.
+
+    """
+    return socket.inet_ntop(
+        socket.AF_INET6,
+        struct.pack('!QQ', ipint >> 64, ipint & 0xffffffffffffffff),
+    )
+
+
+def force_int2ip(ipint):
+    """Same as int2ip(), but works when ipint is already a atring"""
+    try:
+        return int2ip(ipint)
+    except (TypeError, socket.error, struct.error):
+        return ipint
+
+
+def ip2bin(ipval):
+    """Attempts to convert any IP address representation (both IPv4 and
+IPv6) to a 16-bytes binary blob.
+
+IPv4 addresses are converted to IPv6 using the standard ::ffff:A.B.C.D
+mapping.
+
+    """
+    try:
+        return struct.pack('!QQ', ipval >> 64, ipval & 0xffffffffffffffff)
+    except TypeError:
+        pass
+    raw_ipval = ipval
+    try:
+        ipval = ipval.decode()
+    except UnicodeDecodeError:
+        # Probably already a binary representation
+        if len(ipval) == 16:
+            return ipval
+        if len(ipval) == 4:
+            return b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff' + ipval
+        raise ValueError('Invalid IP address %r' % ipval)
+    except AttributeError:
+        pass
+    try:
+        return (b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff' +
+                socket.inet_aton(ipval))
+    except socket.error:
+        pass
+    try:
+        return socket.inet_pton(socket.AF_INET6, ipval)
+    except socket.error:
+        pass
+    # Probably already a binary representation
+    if len(ipval) == 16:
+        return raw_ipval
+    if len(ipval) == 4:
+        return b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff' + raw_ipval
+    raise ValueError('Invalid IP address %r' % ipval)
+
+
+def bin2ip(ipval):
+    """Converts a 16-bytes binary blob to an IPv4 or IPv6 standard
+representation. See ip2bin().
+
+    """
+    try:
+        socket.inet_aton(ipval)
+        return ipval
+    except (TypeError, socket.error):
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, ipval)
+        return ipval
+    except (TypeError, socket.error):
+        pass
+    try:
+        return int2ip(ipval)
+    except TypeError:
+        pass
+    if ipval[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff':
+        return socket.inet_ntoa(ipval[12:])
+    return socket.inet_ntop(socket.AF_INET6, ipval)
 
 
 def int2mask(mask):
     """Converts the number of bits set to 1 in a mask (the 24 in
-    10.0.0.0/24) to the integer corresponding to the IP address of the
-    mask (ip2int("255.255.255.0") for 24)
+    10.0.0.0/24) to the 32-bit integer corresponding to the IP address
+    of the mask (ip2int("255.255.255.0") for 24)
 
     From scapy:utils.py:itom(x).
 
     """
     return (0xffffffff00000000 >> mask) & 0xffffffff
+
+
+def int2mask6(mask):
+    """Converts the number of bits set to 1 in a mask (the 48 in
+    2001:db8:1234::/48) to the 128-bit integer corresponding to the IP address
+    of the mask (ip2int("ffff:ffff:ffff::") for 48)
+
+    """
+    return (
+        0xffffffffffffffffffffffffffffffff00000000000000000000000000000000 >>
+        mask
+    ) & 0xffffffffffffffffffffffffffffffff
 
 
 def net2range(network):
@@ -112,24 +256,29 @@ def net2range(network):
     except AttributeError:
         pass
     addr, mask = network.split('/')
+    ipv6 = ':' in addr
     addr = ip2int(addr)
-    if '.' in mask:
+    if (not ipv6 and '.' in mask) or (ipv6 and ':' in mask):
         mask = ip2int(mask)
+    elif ipv6:
+        mask = int2mask6(int(mask))
     else:
         mask = int2mask(int(mask))
     start = addr & mask
-    stop = int2ip(start + 0xffffffff - mask)
-    start = int2ip(start)
+    if ipv6:
+        stop = int2ip6(
+            start + 0xffffffffffffffffffffffffffffffff - mask
+        )
+        start = int2ip6(start)
+    else:
+        stop = int2ip(start + 0xffffffff - mask)
+        start = int2ip(start)
     return start, stop
 
 
 def range2nets(rng):
     """Converts a (start, stop) tuple to a list of networks."""
-    start, stop = rng
-    if isinstance(start, basestring):
-        start = ip2int(start)
-    if isinstance(stop, basestring):
-        stop = ip2int(stop)
+    start, stop = (force_ip2int(addr) for addr in rng)
     if stop < start:
         raise ValueError()
     res = []
@@ -139,6 +288,8 @@ def range2nets(rng):
     while True:
         while cur & mask == cur and cur | (~mask & 0xffffffff) <= stop:
             maskint -= 1
+            if maskint < 0:
+                break
             mask = int2mask(maskint)
         res.append('%s/%d' % (int2ip(cur), maskint + 1))
         mask = int2mask(maskint + 1)
@@ -155,29 +306,58 @@ def get_domains(name):
     return ('.'.join(name[i:]) for i in range(len(name)))
 
 
+def _espace_slash(string):
+    """This function transforms '\\/' in '/' but leaves '\\\\/' unchanged. This
+    is useful to parse regexp from Javascript style (/regexp/).
+
+    """
+    escaping = False
+    new_string = ""
+    for char in string:
+        if not escaping and char == '\\':
+            escaping = True
+        elif escaping and char != '/':
+            new_string += '\\' + char
+            escaping = False
+        else:
+            new_string += char
+            escaping = False
+    return new_string
+
+
+def _escape_first_slash(string):
+    """This function removes the first '\\' if the string starts with '\\/'."""
+    if string.startswith('\\/'):
+        string = string[1:]
+    return string
+
+
 def str2regexp(string):
     """This function takes a string and returns either this string or
     a python regexp object, when the string is using the syntax
     /regexp[/flags].
-
     """
     if string.startswith('/'):
-        string = string.split('/', 2)[1:]
+        string = string[1:].rsplit('/', 1)
+        # Enable slash-escape even if it is not necessary
+        string[0] = _espace_slash(string[0])
         if len(string) == 1:
             string.append('')
         string = re.compile(
             string[0],
             sum(getattr(re, f.upper()) for f in string[1])
         )
+    else:
+        string = _escape_first_slash(string)
     return string
 
 
 def regexp2pattern(string):
-    """This function takes a regexp or a string and returns a pattern
-    and some flags, suitable for use with re.compile(), combined with
-    another pattern before. Usefull, for example, if you want to
-    create a regexp like '^ *Set-Cookie: *[name]=[value]' where name
-    and value are regexp.
+    """This function takes a regexp or a string and returns a pattern and
+    some flags, suitable for use with re.compile(), combined with
+    another pattern before. Useful, for example, if you want to create
+    a regexp like '^ *Set-Cookie: *[name]=[value]' where name and
+    value are regexp.
 
     """
     if isinstance(string, REGEXP_T):
@@ -275,6 +455,24 @@ def nmapspec2ports(string):
     return result
 
 
+def all2datetime(arg):
+    """Return a datetime object from an int (timestamp) or an iso
+    formatted string '%Y-%m-%d %H:%M:%S'.
+
+    """
+    if isinstance(arg, datetime.datetime):
+        return arg
+    if isinstance(arg, basestring):
+        try:
+            return datetime.datetime.strptime(arg, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return datetime.datetime.strptime(arg, '%Y-%m-%d %H:%M:%S.%f')
+    if isinstance(arg, int_types) or isinstance(arg, float):
+        return datetime.datetime.fromtimestamp(arg)
+    else:
+        raise TypeError("%s is of unknown type." % repr(arg))
+
+
 def makedirs(dirname):
     """Makes directories like mkdir -p, raising no exception when
     dirname already exists.
@@ -304,7 +502,7 @@ def isfinal(elt):
     that does not contain other elements)
 
     """
-    return isinstance(elt, (basestring, int, float, datetime.datetime,
+    return isinstance(elt, (basestring, int_types, float, datetime.datetime,
                             REGEXP_T))
 
 
@@ -351,7 +549,7 @@ def diff(doc1, doc2):
 
 
 def fields2csv_head(fields, prefix=''):
-    """Given an (ordered) dictionnary `fields`, returns a list of the
+    """Given an (ordered) dictionary `fields`, returns a list of the
     fields. NB: recursive function, hence the `prefix` parameter.
 
     """
@@ -366,7 +564,7 @@ def fields2csv_head(fields, prefix=''):
 
 
 def doc2csv(doc, fields, nastr="NA"):
-    """Given a document and an (ordered) dictionnary `fields`, returns
+    """Given a document and an (ordered) dictionary `fields`, returns
     a list of CSV lines. NB: recursive function.
 
     """
@@ -536,12 +734,14 @@ config.DEBUG_DB) is True.
 
     """
     MAX_WARNINGS_STORED = 100
+
     def __init__(self):
         # Python 2.6: logging.Filter is an old-style class, super()
         # cannot be used.
         # super(LogFilter, self).__init__()
         logging.Filter.__init__(self)
         self.warnings = set()
+
     def filter(self, record):
         """Decides whether we should log a record"""
         if record.levelno < logging.INFO:
@@ -562,32 +762,109 @@ LOGGER.addFilter(LogFilter())
 LOGGER.setLevel(1 if config.DEBUG or config.DEBUG_DB else 20)
 
 
-class FakeArgparserParent(object):
-    """This is a stub to implement a parent-like behavior when
-    optparse has to be used.
-
-    """
-
-    def __init__(self):
-        self.args = []
-
-    def add_argument(self, *args, **kargs):
-        """Stores parent's arguments for latter (manual)
-        processing.
+if USE_ARGPARSE:
+    def ArgparserParent():
+        return argparse.ArgumentParser(add_help=False)
+else:
+    class ArgparserParent(object):
+        """This is a stub to implement a parent-like behavior when
+        optparse has to be used.
 
         """
-        self.args.append((args, kargs))
+
+        def __init__(self):
+            self.args = []
+
+        def add_argument(self, *args, **kargs):
+            """Stores parent's arguments for latter (manual)
+            processing.
+
+            """
+            self.args.append((args, kargs))
+
+
+def create_argparser(description, extraargs=None):
+    """This function helps create a parser with either argparse (if it is
+    available) or optparse. This pattern exists because argparse does
+    not exist by default in Python 2.6.
+
+    `description` is used as the description argument of
+    argparse.ArgumentParser() or optparse.OptionParser().
+
+    This function returns a tuple corresponding to the parser and a
+    boolean (True iff argparse is used).
+
+    """
+    if USE_ARGPARSE:
+        return argparse.ArgumentParser(description=__doc__), True
+    parser = optparse.OptionParser(description=__doc__)
+    parser.parse_args_orig = parser.parse_args
+
+    def my_parse_args():
+        res = parser.parse_args_orig()
+        if extraargs is None:
+            if res[1]:
+                raise optparse.OptionError(
+                    'unrecognized arguments', res[1]
+                )
+        else:
+            res = parser.parse_args_orig()
+            res[0].ensure_value(extraargs, res[1])
+            return res[0]
+
+    parser.parse_args = my_parse_args
+    parser.add_argument = parser.add_option
+    return parser, False
+
+
+CLI_ARGPARSER = ArgparserParent()
+# DB
+CLI_ARGPARSER.add_argument('--init', '--purgedb', action='store_true',
+                           help='Purge or create and initialize the database.')
+CLI_ARGPARSER.add_argument('--ensure-indexes', action='store_true',
+                           help='Create missing indexes (will lock the '
+                           'database).')
+CLI_ARGPARSER.add_argument('--update-schema', action='store_true',
+                           help='update (host) schema. Use with --version to '
+                           'specify your current version')
+# Actions / display modes
+CLI_ARGPARSER.add_argument('--delete', action='store_true',
+                           help='DELETE the matched results instead of '
+                           'displaying them.')
+CLI_ARGPARSER.add_argument('--short', action='store_true',
+                           help='Output only IP addresses, one per line.')
+CLI_ARGPARSER.add_argument('--count', action='store_true',
+                           help='Count matched results.')
+CLI_ARGPARSER.add_argument('--explain', action='store_true',
+                           help='MongoDB specific: .explain() the query.')
+CLI_ARGPARSER.add_argument('--distinct', metavar='FIELD',
+                           help='Output only unique FIELD part of the '
+                           'results, one per line.')
+CLI_ARGPARSER.add_argument('--json', action='store_true',
+                           help='Output results as JSON documents.')
+if USE_ARGPARSE:
+    CLI_ARGPARSER.add_argument('--sort', metavar='FIELD / ~FIELD', nargs='+',
+                               help='Sort results according to FIELD; use '
+                               '~FIELD to reverse sort order.')
+else:
+    CLI_ARGPARSER.add_argument('--sort', metavar='FIELD / ~FIELD',
+                               help='Sort results according to FIELD; use '
+                               '~FIELD to reverse sort order.')
+CLI_ARGPARSER.add_argument('--limit', type=int,
+                           help='Ouput at most LIMIT results.')
+CLI_ARGPARSER.add_argument('--skip', type=int, help='Skip first SKIP results.')
 
 
 # Country aliases:
 #   - UK: GB
-#   - EU*: EU + 28 EU member states
+#   - EU: 28 EU member states, + EU itself, for historical reasons
 COUNTRY_ALIASES = {
     "UK": "GB",
-    "EU*": [
-        "EU", "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI",
-        "FR", "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT",
-        "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "GB",
+    "EU": [
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+        "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+        "SI", "ES", "SE", "GB",
+        "EU",
     ],
 }
 
@@ -600,15 +877,16 @@ def country_unalias(country):
 
       - "UK": alias for "GB".
 
-      - "EU*": alias for a list containing "EU" (which is a code used
-        in Maxming GeoIP database) plus the list of the country codes
-        of the European Union member states.
+      - "EU": alias for a list containing the list of the country
+        codes of the European Union member states. It also includes
+        "EU" itself, because that was a valid "country" code in
+        previous Maxmind GeoIP databases.
 
     """
     if isinstance(country, basestring):
         return COUNTRY_ALIASES.get(country, country)
     if hasattr(country, '__iter__'):
-        return reduce(
+        return functools.reduce(
             lambda x, y: x + (y if isinstance(y, list) else [y]),
             (country_unalias(country_elt) for country_elt in country),
             [],
@@ -645,6 +923,7 @@ def screenwords(imgdata):
                         break
         if result:
             return result
+
 
 if USE_PIL:
     def _img_size(bbox):
@@ -770,6 +1049,7 @@ _NMAP_CUR_PROBE = None
 def _read_nmap_probes():
     global _NMAP_CUR_PROBE, _NMAP_PROBES_POPULATED
     _NMAP_CUR_PROBE = None
+
     def parse_line(line):
         global _NMAP_PROBES, _NMAP_CUR_PROBE
         if line.startswith(b'match '):
@@ -781,6 +1061,12 @@ def _read_nmap_probes():
         elif line.startswith(b'Probe '):
             _NMAP_CUR_PROBE = []
             proto, name, probe = line[6:].split(b' ', 2)
+            if not (len(probe) >= 3 and probe[:2] == b'q|' and
+                    probe[-1:] == b'|'):
+                LOGGER.warning('Invalid nmap probe %r', probe)
+            else:
+                probe = nmap_decode_data(probe[2:-1].decode(),
+                                         arbitrary_escapes=True)
             _NMAP_PROBES.setdefault(proto.lower().decode(),
                                     {})[name.decode()] = {
                 "probe": probe, "fp": _NMAP_CUR_PROBE
@@ -827,6 +1113,7 @@ def _read_nmap_probes():
                 except UnicodeDecodeError:
                     value = repr(value)
             info[key] = (value, flag)
+            data = data.lstrip(b' ')
         _NMAP_CUR_PROBE.append((service.decode(), info))
     try:
         with open(os.path.join(config.NMAP_SHARE_PATH, 'nmap-service-probes'),
@@ -845,6 +1132,34 @@ def get_nmap_svc_fp(proto="tcp", probe="NULL"):
     if not _NMAP_PROBES_POPULATED:
         _read_nmap_probes()
     return _NMAP_PROBES[proto][probe]
+
+
+def match_nmap_svc_fp(output, proto="tcp", probe="NULL"):
+    """Take output from a given probe and return the closest nmap
+    fingerprint."""
+    softmatch = {}
+    result = {}
+    try:
+        fingerprints = get_nmap_svc_fp(
+            proto=proto,
+            probe=probe,
+        )['fp']
+    except KeyError:
+        pass
+    else:
+        for service, fingerprint in fingerprints:
+            match = fingerprint['m'][0].search(output)
+            if match is not None:
+                doc = softmatch if fingerprint['soft'] else result
+                doc['service_name'] = service
+                for elt, key in viewitems(NMAP_FINGERPRINT_IVRE_KEY):
+                    if elt in fingerprint:
+                        doc[key] = nmap_svc_fp_format_data(
+                            fingerprint[elt][0], match
+                        )
+                if not fingerprint['soft']:
+                    return result
+    return softmatch
 
 
 _IKESCAN_VENDOR_IDS = {}
@@ -886,15 +1201,87 @@ def find_ike_vendor_id(vendorid):
             return name
 
 
-_REPRS = {b'\r': b'\\r', b'\n': b'\\n', b'\t': b'\\t', b'\\': b'\\\\'}
+# Nmap (and Bro) encoding & decoding
+
+
+_REPRS = {b'\r': '\\r', b'\n': '\\n', b'\t': '\\t', b'\\': '\\\\'}
+_RAWS = {'r': b'\r', 'n': b'\n', 't': b'\t', '\\': b'\\', '0': b'\x00'}
 
 
 def nmap_encode_data(data):
-    return b"".join(
-        _REPRS[d] if d in _REPRS else d if b" " <= d <= b"~" else
-        ('\\x%02x' % ord(d)).encode()
-        for d in (data[i:i+1] for i in range(len(data)))
+    return "".join(
+        _REPRS[d] if d in _REPRS else d.decode() if b" " <= d <= b"~" else
+        '\\x%02x' % ord(d)
+        for d in (data[i:i + 1] for i in range(len(data)))
     )
+
+
+def _nmap_decode_data(data, arbitrary_escapes=False):
+    status = 0
+    first_byte = None
+    for char in data:
+        if status == 0:
+            # not in an escape sequence
+            if char == '\\':
+                status = 1
+                continue
+            yield char.encode()
+            continue
+        if status == 1:
+            # after a backslash
+            if char in _RAWS:
+                yield _RAWS[char]
+                status = 0
+                continue
+            if char == 'x':
+                status = 2
+                continue
+            if arbitrary_escapes:
+                LOGGER.debug('nmap_decode_data: unnecessary escape %r',
+                             '\\' + char)
+            else:
+                LOGGER.warning('nmap_decode_data: cannot decode %r',
+                               '\\' + char)
+                yield b'\\'
+            yield char.encode()
+            status = 0
+            continue
+        if status == 2:
+            # after \x
+            try:
+                first_byte = int(char, 16)
+            except ValueError:
+                LOGGER.warning('nmap_decode_data: cannot decode %r',
+                               '\\x' + char)
+                yield b'\\x'
+                yield char.encode()
+                status = 0
+                continue
+            status = 3
+            continue
+        if status == 3:
+            # after \x?
+            try:
+                value = bytes([first_byte * 16 + int(char, 16)])
+            except ValueError:
+                LOGGER.warning('nmap_decode_data: cannot decode %r',
+                               '\\x%x%s' % (first_byte, char))
+                yield ('\\x%x%s' % (first_byte, char)).encode()
+                status = 0
+                continue
+            yield value
+            first_byte = None
+            status = 0
+            continue
+    if status:
+        LOGGER.warning(
+            'nmap_decode_data: invalid escape sequence at end of string'
+        )
+
+
+def nmap_decode_data(data, arbitrary_escapes=False):
+    return b''.join(_nmap_decode_data(data,
+                                      arbitrary_escapes=arbitrary_escapes))
 
 
 def nmap_svc_fp_format_data(data, match):
@@ -903,7 +1290,7 @@ def nmap_svc_fp_format_data(data, match):
             if '$%d' % (i + 1) in data:
                 return
             continue
-        data = data.replace('$%d' % (i + 1), nmap_encode_data(value).decode())
+        data = data.replace('$%d' % (i + 1), nmap_encode_data(value))
     return data
 
 
@@ -922,8 +1309,14 @@ def normalize_props(props):
     return props
 
 
-def datetime2timestamp(dtetme):
-    return float(dtetme.strftime("%s.%f"))
+def datetime2timestamp(dtm):
+    """Returns the timestamp (as a float value) corresponding to the
+datetime.datetime instance `dtm`"""
+    # Python 2/3 compat: python 3 has datetime.timestamp()
+    try:
+        return dtm.timestamp()
+    except AttributeError:
+        return time.mktime(dtm.timetuple()) + dtm.microsecond / (1000000.)
 
 
 _UNITS = ['']
@@ -942,7 +1335,6 @@ def num2readable(value):
     if isinstance(value, float):
         return '%.3f%s' % (value / idx, unit)
     return '%d%s' % (value / idx, unit)
-
 
 
 _DECODE_HEX = codecs.getdecoder("hex_codec")
@@ -965,3 +1357,338 @@ def decode_b64(value):
 
 def encode_b64(value):
     return _ENCODE_B64(value)[0].replace(b'\n', b'')
+
+
+def printable(string):
+    if PY3 and isinstance(string, bytes):
+        return bytes(c if 32 <= c <= 126 else 46 for c in string)
+    return "".join(c if ' ' <= c <= '~' else '.' for c in string)
+
+
+def parse_ssh_key(data):
+    """Generates SSH key elements"""
+    while data:
+        length = struct.unpack('>I', data[:4])[0]
+        yield data[4:4 + length]
+        data = data[4 + length:]
+
+
+# https://www.iana.org/assignments/ipv6-address-space/ipv6-address-space.xhtml
+# Consulted february 2019
+_ADDR_TYPES = [
+    "Unspecified",
+    "Loopback",
+    "Reserved",
+    "Current-Net",
+    None,
+    "Private",
+    None,
+    "CGN",
+    None,
+    "Loopback",
+    None,
+    "Link-Local",
+    None,
+    "Private",
+    None,
+    "IPv6-to-IPv4",
+    None,
+    "Private",
+    None,
+    "Multicast",
+    "Reserved",
+    "Broadcast",
+    "Reserved",
+    "Well-known prefix",
+    "Reserved",
+    # RFC 6666 Remote Triggered Black Hole
+    "Discard (RTBH)",
+    "Reserved",
+    None,
+    "Protocol assignements",
+    None,
+    "Documentation",
+    None,
+    "6to4",
+    None,
+    "Reserved",
+    "Unique Local Unicast",
+    "Reserved",
+    "Link Local Unicast",
+    "Reserved",
+    "Multicast",
+]
+
+_ADDR_TYPES_LAST_IP = [
+    ip2int("::"),
+    ip2int("::1"),
+    ip2int("::fffe:ffff:ffff"),
+    ip2int("::ffff:0.255.255.255"),
+    ip2int("::ffff:9.255.255.255"),
+    ip2int("::ffff:10.255.255.255"),
+    ip2int("::ffff:100.63.255.255"),
+    ip2int("::ffff:100.127.255.255"),
+    ip2int("::ffff:126.255.255.255"),
+    ip2int("::ffff:127.255.255.255"),
+    ip2int("::ffff:169.253.255.255"),
+    ip2int("::ffff:169.254.255.255"),
+    ip2int("::ffff:172.15.255.255"),
+    ip2int("::ffff:172.31.255.255"),
+    ip2int("::ffff:192.88.98.255"),
+    ip2int("::ffff:192.88.99.255"),
+    ip2int("::ffff:192.167.255.255"),
+    ip2int("::ffff:192.168.255.255"),
+    ip2int("::ffff:223.255.255.255"),
+    ip2int("::ffff:239.255.255.255"),
+    ip2int("::ffff:255.255.255.254"),
+    ip2int("::ffff:255.255.255.255"),
+    ip2int("64:ff9a:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("64:ff9b::ffff:ffff"),
+    ip2int("ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("100::ffff:ffff:ffff:ffff"),
+    ip2int("1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2001:db7:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+    ip2int("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+]
+
+
+def get_addr_type(addr):
+    """Returns the type (Private, Loopback, etc.) of an IPv4 address, or
+None if it is a "normal", usable address.
+
+    """
+
+    if ':' not in addr:
+        addr = "::ffff:" + addr
+    try:
+        addr = ip2int(addr)
+    except (TypeError, socket.error):
+        return None
+    return _ADDR_TYPES[bisect_left(_ADDR_TYPES_LAST_IP, addr)]
+
+
+_CERTINFOS = [
+    re.compile(
+        b'\n *'
+        b'Issuer: (?P<issuer>.*)'
+        b'\n(?:.*\n)* *'
+        b'Subject: (?P<subject>.*)'
+        b'\n(?:.*\n)* *'
+        b'Public Key Algorithm: (?P<pubkeyalgo>rsaEncryption)'
+        b'\n *'
+        b'Public-Key: \\((?P<bits>[0-9]+) bit\\)'
+        b'\n *'
+        b'Modulus: *\n(?P<modulus>[\\ 0-9a-f:\n]+)'
+        b'\n *'
+        b'Exponent: (?P<exponent>[0-9]+) .*'
+        b'(?:\n|$)'
+    ),
+    re.compile(
+        b'\n *'
+        b'Issuer: (?P<issuer>.*)'
+        b'\n(?:.*\n)* *'
+        b'Subject: (?P<subject>.*)'
+        b'\n(?:.*\n)* *'
+        b'Public Key Algorithm: (?P<pubkeyalgo>.*)'
+        b'(?:\n|$)'
+    ),
+]
+
+_CERTINFOS_SAN = re.compile(
+    b'\n *'
+    b'X509v3 Subject Alternative Name: *\n *(?P<san>.*)'
+    b'(?:\n|$)'
+)
+
+_CERTKEYS = {
+    'C': 'countryName',
+    'CN': 'commonName',
+    'DC': 'domainComponent',
+    'L': 'localityName',
+    'O': 'organizationName',
+    'OU': 'organizationalUnitName',
+    'ST': 'stateOrProvinceName',
+    'SN': 'surname',
+}
+
+
+def _parse_cert_subject(subject):
+    status = 0
+    curkey = []
+    curvalue = []
+    for char in subject:
+        if status == -1:
+            # reading space before the key
+            if char == ' ':
+                continue
+            curkey.append(char)
+            status += 1
+        elif status == 0:
+            # reading key
+            if char == ' ':
+                status += 1
+                continue
+            if char == '=':
+                status += 2
+                continue
+            curkey.append(char)
+        elif status == 1:
+            # reading '='
+            if char != '=':
+                return
+            status += 1
+        elif status == 2:
+            # reading space after '='
+            if char == ' ':
+                continue
+            # reading beginning of value
+            if char == '"':
+                status += 2
+                continue
+            curvalue.append(char)
+            status += 1
+        elif status == 3:
+            # reading value without quotes
+            if char == ',':
+                yield "".join(curkey), "".join(curvalue)
+                curkey = []
+                curvalue = []
+                status = -1
+                continue
+            curvalue.append(char)
+        elif status == 4:
+            # reading value with quotes
+            if char == '"':
+                status -= 1
+                continue
+            if char == '\\':
+                status += 1
+                continue
+            curvalue.append(char)
+        elif status == 5:
+            curvalue.append(char)
+            status -= 1
+    yield "".join(curkey), "".join(curvalue)
+
+
+def get_cert_info(cert):
+    """Extract info from a certificate (hash values, issuer, subject,
+    algorithm) in an handy-to-index-and-query form.
+
+    """
+    result = {}
+    for hashtype in ['md5', 'sha1', 'sha256']:
+        result[hashtype] = hashlib.new(hashtype, cert).hexdigest()
+    proc = subprocess.Popen([config.OPENSSL_CMD, 'x509', '-noout', '-text',
+                             '-inform', 'DER'], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    proc.stdin.write(cert)
+    proc.stdin.close()
+    data = proc.stdout.read()
+    for expr in _CERTINFOS:
+        match = expr.search(data)
+        if match is not None:
+            break
+    else:
+        LOGGER.info("Cannot parse certificate %r - no matching expression",
+                    cert)
+        return result
+    try:
+        for field, fdata in viewitems(match.groupdict()):
+            fdata = fdata.decode()
+            if field in ['issuer', 'subject']:
+                fdata = [(_CERTKEYS.get(key, key), value)
+                         for key, value in _parse_cert_subject(fdata)]
+                # replace '.' by '_' in keys to produce valid JSON
+                result[field] = dict((key.replace('.', '_'), value)
+                                     for key, value in fdata)
+                result['%s_text' % field] = '/'.join('%s=%s' % item
+                                                     for item in fdata)
+            else:
+                result[field] = fdata
+    except Exception:
+        LOGGER.info("Cannot parse certificate %r", cert, exc_info=True)
+    san = _CERTINFOS_SAN.search(data)
+    if san is not None:
+        try:
+            result['san'] = san.groups()[0].decode().split(', ')
+        except Exception:
+            LOGGER.info("Cannot parse subjectAltName in certificate %r", cert,
+                        exc_info=True)
+    return result
+
+
+def display_top(db, arg, flt, lmt):
+    field, least = ((arg[1:], True)
+                    if arg[:1] in '!-~' else
+                    (arg, False))
+    for entry in db.topvalues(field, flt=flt, topnbr=lmt or 10, least=least):
+        if isinstance(entry['_id'], (list, tuple)):
+            sep = ' / ' if isinstance(entry['_id'], tuple) else ', '
+            if entry['_id']:
+                if isinstance(entry['_id'][0], (list, tuple)):
+                    entry['_id'] = sep.join(
+                        '/'.join(str(subelt) for subelt in elt)
+                        if elt else "None"
+                        for elt in entry['_id']
+                    )
+                elif isinstance(entry['_id'][0], dict):
+                    entry['_id'] = sep.join(
+                        json.dumps(elt, default=serialize)
+                        for elt in entry['_id']
+                    )
+                else:
+                    entry['_id'] = sep.join(str(elt)
+                                            for elt in entry['_id'])
+            else:
+                entry['_id'] = "None"
+        elif isinstance(entry['_id'], dict):
+            entry['_id'] = json.dumps(entry['_id'],
+                                      default=serialize)
+        print("%(_id)s: %(count)d" % entry)
+
+
+if PY3:
+
+    # https://stackoverflow.com/a/26348624
+    @functools.total_ordering
+    class MinValue(object):
+        def __le__(self, other):
+            return True
+
+        def __eq__(self, other):
+            return self is other
+
+    MIN_VALUE = MinValue()
+
+    def key_sort_none(value):
+        """This function can be used as `key=` argument for sorted() and
+.sort(), in order to sort values that can be of a certain type (e.g.,
+str), or None, so that None is always lower.
+
+We just need to replace None with MIN_VALUE, which is an object that
+happily compares with anything, and is lower than anything.
+
+        """
+        if value is None:
+            return MIN_VALUE
+        return value
+
+else:
+    def key_sort_none(value):
+        """In Python 2, None is lower than most types (int, str, etc.), so we
+have nothing to do here.
+
+        """
+        return value

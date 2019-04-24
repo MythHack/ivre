@@ -61,11 +61,12 @@ end
 action = function(host, port)
   local timeout = tonumber(stdnse.get_script_args(SCRIPT_NAME .. '.timeout')) or 300
   local geom = stdnse.get_script_args(SCRIPT_NAME .. '.geometry') or '1024x768'
-  local ssl = port.version.service_tunnel == "ssl"
+  local ssl = port.version.service_tunnel == "ssl" or (
+    port.version.sevice_name == nil and port.service:match("https") ~= nil
+  )
   local port = port.number
-  local fname, strport
+  local fname, strport, width, height, cmd
   local hostname = get_hostname(host)
-  local width, height
   if hostname == host.ip then
     fname = ("screenshot-%s-%d.jpg"):format(host.ip, port)
   else
@@ -103,7 +104,11 @@ setTimeout(phantom.exit, %d * 1000);
 ]]):format(width, height, ssl and "https" or "http", hostname, strport, fname,
 	   timeout))
   tmpfdesc:close()
-  os.execute(("phantomjs %s >/dev/null 2>&1"):format(tmpfname))
+  cmd = ("phantomjs --ignore-ssl-errors=true %s >/dev/null 2>&1"):format(tmpfname)
+  if not os.execute(cmd) then
+    -- See <https://github.com/ariya/phantomjs/issues/14376#issuecomment-236213526>
+    os.execute("QT_QPA_PLATFORM=offscreen " .. cmd)
+  end
   os.remove(tmpfname)
   return (os.rename(fname, fname)
 	    and ("Saved to %s"):format(fname)

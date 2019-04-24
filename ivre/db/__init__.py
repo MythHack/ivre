@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2019 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,7 +22,6 @@ database backends.
 """
 
 
-import datetime
 from functools import reduce
 import json
 import os
@@ -44,7 +43,7 @@ import xml.sax
 
 
 from builtins import range
-from future.utils import viewitems
+from future.utils import viewitems, viewvalues
 # tests: I don't want to depend on cluster for now
 try:
     import cluster
@@ -53,7 +52,7 @@ except ImportError:
     USE_CLUSTER = False
 
 
-from ivre import config, utils, xmlnmap, nmapout
+from ivre import config, geoiputils, nmapout, utils, xmlnmap
 
 
 class DB(object):
@@ -79,14 +78,88 @@ class DB(object):
     """
     globaldb = None
 
+    def __init__(self):
+        self.argparser = utils.ArgparserParent()
+        self.argparser.add_argument(
+            '--country', metavar='CODE',
+            help='show only results from this country'
+        )
+        self.argparser.add_argument(
+            '--asnum', metavar='NUM[,NUM[...]]',
+            help='show only results from this(those) AS(es)'
+        )
+        self.argparser.add_argument('--port', metavar='PORT')
+        self.argparser.add_argument('--service', metavar='SVC')
+        self.argparser.add_argument('--svchostname', metavar='HOSTNAME')
+        self.argparser.add_argument('--useragent', metavar='USER-AGENT',
+                                    nargs='?', const=False)
+
+    def parse_args(self, args, flt=None):
+        if flt is None:
+            flt = self.flt_empty
+        if args.country is not None:
+            flt = self.flt_and(flt, self.searchcountry(
+                utils.str2list(args.country)
+            ))
+        if args.asnum is not None:
+            if args.asnum[:1] in '!-':
+                flt = self.flt_and(flt, self.searchasnum(
+                    utils.str2list(args.asnum[1:]), neg=True
+                ))
+            else:
+                flt = self.flt_and(flt, self.searchasnum(
+                    utils.str2list(args.asnum)
+                ))
+        if args.port is not None:
+            port = args.port.replace('_', '/')
+            if '/' in port:
+                proto, port = port.split('/', 1)
+            else:
+                proto = 'tcp'
+            port = int(port)
+            flt = self.flt_and(
+                flt,
+                self.searchport(port=port, protocol=proto)
+            )
+        if args.service is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchservice(utils.str2regexp(args.service)),
+            )
+        if args.svchostname is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchsvchostname(utils.str2regexp(args.svchostname))
+            )
+        if args.useragent is not None:
+            if args.useragent is False:
+                flt = self.flt_and(flt, self.searchuseragent())
+            else:
+                flt = self.flt_and(
+                    flt,
+                    self.searchuseragent(
+                        useragent=utils.str2regexp(args.useragent)
+                    ),
+                )
+        return flt
+
+    @staticmethod
+    def to_binary(data):
+        return data
+
+    @staticmethod
+    def from_binary(data):
+        return data
+
     # filters
 
-    def flt_and(self, *args):
+    @classmethod
+    def flt_and(cls, *args):
         """Returns a condition that is true iff all of the given
         conditions is true.
 
         """
-        return reduce(self._flt_and, args)
+        return reduce(cls._flt_and, args)
 
     @staticmethod
     def _flt_and(cond1, cond2):
@@ -99,12 +172,13 @@ class DB(object):
         """
         raise NotImplementedError
 
-    def flt_or(self, *args):
+    @classmethod
+    def flt_or(cls, *args):
         """Returns a condition that is true iff any of the given
         conditions is true.
 
         """
-        return reduce(self._flt_or, args)
+        return reduce(cls._flt_or, args)
 
     @staticmethod
     def _flt_or(cond1, cond2):
@@ -118,31 +192,259 @@ class DB(object):
         raise NotImplementedError
 
     @staticmethod
-    def convert_ip(addr):
-        try:
-            return utils.int2ip(addr)
-        except (TypeError, struct.error):
-            return addr
+    def ip2internal(addr):
+        """Converts an IP address (given as either an integer or a string) to
+        the internal value used by the backend.
+
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def internal2ip(addr):
+        """Converts an IP address (given as the internal value used by the backend) to
+        its classical form as a string.
+
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def features_addr_list(use_asnum, use_ipv6, use_single_int):
+        """Returns a list of IP address features (for ML algorithms)
+
+If `use_asnum` is true, the first element is the AS number associated
+with the address (or 0 if no AS number has been found).
+
+If `use_single_int` is true, the next value is an integer representing
+the IP address (IPv4 addresses are converted to IPv6 using the
+standard ::ffff:A.B.C.D mapping when `use_ipv6` is true).
+
+If `use_single_int` is false, the next values are each byte of the IP
+address (4 bytes if `use_ipv6` is false, 16 otherwise, using the
+standard ::ffff:A.B.C.D mapping for IPv4 addresses).
+
+        """
+        result = ['asnum'] if use_asnum else []
+        if use_single_int:
+            return result + ['addr']
+        return result + ['addr_%d' % d for d in range(16 if use_ipv6 else 4)]
+
+    def features_addr_get(self, addr, use_asnum, use_ipv6, use_single_int):
+        """Returns a list of feature values (for ML algorithms) for an IP address.
+
+See .features_addr_list() for the number and meaning of the features.
+
+        """
+        if use_asnum:
+            result = [self.globaldb.data.as_byip(addr).get('as_num', 0)]
+        else:
+            result = []
+        if use_single_int:
+            if use_ipv6:
+                return result + [utils.ip2int(addr if ':' in addr
+                                              else ('::ffff:%s' % addr))]
+            return result + [utils.ip2int(addr)]
+        addrbin = utils.ip2bin(addr)
+        if use_ipv6:
+            return result + [
+                ord(addrbin[i:i + 1]) for i in range(len(addrbin))
+            ]
+        return result + [
+            ord(addrbin[i:i + 1]) for i in range(len(addrbin))
+        ][-4:]
+
+    def features_port_list(self, flt, yieldall, use_service, use_product,
+                           use_version):
+        """Returns a list of ports features (for ML algorithms) as tuples of
+existing values.
+
+The first element of each tuple is the port number; if `use_service`
+is true, the next element is the service name; if `use_product` is
+true, the next element is the product name; if `use_version` is true,
+the next element is the string representing the version.
+
+If `yieldall` is true, when a specific feature exists (e.g., `(80,
+'http', 'Apache httpd')`), more generic features are also generated
+(e.g., `(80, 'http', None)`, `(80, None, None)`).
+
+`use_version` implies `use_product`, and `use_product` implies
+`use_service`.
+
+        """
+        if not yieldall:
+            # when `yieldall` is false, the sort operation is done in
+            # database, unless we are using MongoDB < 3.2
+            try:
+                supports_sort = self.mongodb_32_more
+            except AttributeError:
+                supports_sort = True
+            if supports_sort:
+                return list(
+                    tuple(val) for val in
+                    self._features_port_list(flt, yieldall, use_service,
+                                             use_product, use_version)
+                )
+            return sorted(set(
+                tuple(val) for val in
+                self._features_port_list(flt, yieldall, use_service,
+                                         use_product, use_version)
+            ), key=lambda val: [utils.key_sort_none(v) for v in val])
+
+        def _gen(val):
+            yield tuple(val)
+            for i in range(-1, -len(val), -1):
+                val[i] = None
+                yield tuple(val)
+        return sorted(set(
+            val
+            for vals in self._features_port_list(flt, yieldall, use_service,
+                                                 use_product, use_version)
+            for val in _gen(vals)
+        ), key=lambda val: [utils.key_sort_none(v) for v in val])
+
+    def _features_port_list(self, flt, yieldall, use_service, use_product,
+                            use_version):
+        raise NotImplementedError()
+
+    def features_port_get(self, features, flt, yieldall, use_service,
+                          use_product, use_version):
+        """Generates `(addr, port_features)` tuples where `addr` is a host IP
+address and `port_features` a list of values ports feature values (for ML
+algorithms) as lists of values.
+
+`features` is a list of features that may be generated, as provided by
+.features_port_list().
+
+        """
+        features = dict((f, i) for i, f in enumerate(features))
+        return self._features_port_get(features, flt, yieldall, use_service,
+                                       use_product, use_version)
+
+    def _features_port_get(self, features, flt, yieldall, use_service,
+                           use_product, use_version):
+        raise NotImplementedError()
+
+    def features(self, headers=True, flt=None, use_asnum=True, use_ipv6=True,
+                 use_single_int=False, yieldall=True, use_service=True,
+                 use_product=False, use_version=False, subflts=None):
+        """Returns a two-element tuple. The first element is a list on feature
+names, the second is a generator of lists of feature values. This is
+meant to be used with ML algorithms).
+
+If `headers` is true, the first generated list will be the list of the
+feature names (a kind of header line).
+
+`flt` is a base filter, (`.flt_empty` will be used by default).
+
+If `subflts` is provided, it must be a list of filters, or a list of
+(label, filter) tuples. A "category" field will be appended at the end
+of the feature values, which will be set to the index (or label) of
+the sub-filter used to generate the result.
+
+For example, to find differences between two networks, one could do:
+
+    dbase.features(subflts=[dbase.searchasnum(1234), dbase.searchasnum(4321)])
+
+The last value of each feature will be 0 for AS number 1234 and 1 for
+AS number 4321.
+
+To use this to create a pandas DataFrame, you can run:
+
+    import pandas
+    columns, data = dbase.features()
+    df = pandas.DataFrame(data=data, columns=columns)
+
+        """
+        if flt is None:
+            flt = self.flt_empty
+        use_service = use_service or use_product or use_version
+        use_product = use_product or use_version
+        features_port = self.features_port_list(
+            flt,
+            yieldall,
+            use_service,
+            use_product,
+            use_version,
+        )
+        headers = self.features_addr_list(
+            use_asnum,
+            use_ipv6,
+            use_single_int,
+        ) + features_port
+        if subflts:
+            if isinstance(subflts[0], (list, tuple)) and len(subflts[0]) == 2:
+                generator = subflts
+            else:
+                generator = enumerate(subflts)
+            headers.append('category')
+            return (
+                headers,
+                (
+                    self.features_addr_get(
+                        addr,
+                        use_asnum,
+                        use_ipv6,
+                        use_single_int,
+                    ) + features + [label]
+                    for label, subflt in generator
+                    for addr, features in self.features_port_get(
+                        features_port,
+                        self.flt_and(flt, subflt),
+                        yieldall,
+                        use_service,
+                        use_product,
+                        use_version,
+                    )
+                )
+            )
+        else:
+            return (
+                headers,
+                (
+                    self.features_addr_get(
+                        addr,
+                        use_asnum,
+                        use_ipv6,
+                        use_single_int
+                    ) + features
+                    for addr, features in self.features_port_get(
+                        features_port,
+                        flt,
+                        yieldall,
+                        use_service,
+                        use_product,
+                        use_version,
+                    )
+                )
+            )
 
     @staticmethod
     def searchversion(version):
         """Filters documents based on their schema's version."""
         raise NotImplementedError
 
-    def searchnet(self, net, neg=False):
+    @classmethod
+    def searchnet(cls, net, neg=False):
         """Filters (if `neg` == True, filters out) one particular IP
         network (CIDR notation).
 
         """
-        return self.searchrange(*utils.net2range(net), neg=neg)
+        return cls.searchrange(*utils.net2range(net), neg=neg)
 
     @staticmethod
     def searchrange(start, stop, neg=False):
         """Filters (if `neg` == True, filters out) one particular IP
-        range given its boudaries `start` and `stop`.
+        range given its boundaries `start` and `stop`.
 
         """
         raise NotImplementedError
+
+    @classmethod
+    def searchipv4(cls):
+        return cls.searchnet('0.0.0.0/0')
+
+    @classmethod
+    def searchipv6(cls):
+        return cls.searchnet('0.0.0.0/0', neg=True)
 
     def searchphpmyadmin(self):
         """Finds phpMyAdmin instances based on its cookies."""
@@ -183,10 +485,12 @@ class DB(object):
 
     def searchjavaua(self):
         """Finds Java User-Agent."""
-        return self.searchuseragent(re.compile('(^| )(Java|javaws)/', flags=0))
+        return self.searchuseragent(
+            useragent=re.compile('(^| )(Java|javaws)/', flags=0),
+        )
 
     @staticmethod
-    def searchuseragent(useragent):
+    def searchuseragent(useragent=None, neg=False):
         """Finds specified User-Agent(s)."""
         raise NotImplementedError
 
@@ -228,6 +532,26 @@ class DB(object):
         raise NotImplementedError
 
     @staticmethod
+    def _ja3keyvalue(value_or_hash):
+        """Returns the key and the value to search for according
+        to the nature of the given argument for ja3 filtering"""
+        if isinstance(value_or_hash, utils.REGEXP_T):
+            return ('raw', value_or_hash)
+        if utils.HEX.search(value_or_hash):
+            key = {32: 'md5', 40: 'sha1',
+                   64: 'sha256'}.get(len(value_or_hash), 'raw')
+        else:
+            key = 'raw'
+        # If we have the raw value, we compute the MD5 hash because it
+        # is indexed, so it will be faster to query.
+        if key == 'raw':
+            return (
+                'md5',
+                utils.hashlib.new('md5', value_or_hash.encode()).hexdigest(),
+            )
+        return (key, value_or_hash)
+
+    @staticmethod
     def str2id(string):
         """Returns a unique identifier from `string`.
 
@@ -245,7 +569,7 @@ class DB(object):
             return cluster.HierarchicalClustering(
                 [rec for rec in values],
                 lambda x, y: abs(x['mean'] - y['mean'])
-                )
+            )
 
     @staticmethod
     def serialize(obj):
@@ -256,14 +580,10 @@ class DB(object):
         return 0
 
 
-class DBNmap(DB):
-    def __init__(self, output_mode="json", output=sys.stdout):
-        self.content_handler = xmlnmap.Nmap2Txt
-        self.output_function = {
-            "normal": nmapout.displayhosts,
-        }.get(output_mode, nmapout.displayhosts_json)
-        self.output = output
-        self.__schema_migrations = {
+class DBActive(DB):
+    def __init__(self):
+        super(DBActive, self).__init__()
+        self._schema_migrations = {
             "hosts": {
                 None: (1, self.__migrate_schema_hosts_0_1),
                 1: (2, self.__migrate_schema_hosts_1_2),
@@ -273,32 +593,24 @@ class DBNmap(DB):
                 5: (6, self.__migrate_schema_hosts_5_6),
                 6: (7, self.__migrate_schema_hosts_6_7),
                 7: (8, self.__migrate_schema_hosts_7_8),
+                8: (9, self.__migrate_schema_hosts_8_9),
+                9: (10, self.__migrate_schema_hosts_9_10),
+                10: (11, self.__migrate_schema_hosts_10_11),
             },
         }
-        try:
-            import argparse
-            self.argparser = argparse.ArgumentParser(add_help=False)
-            USING_ARGPARSE = True
-        except ImportError:
-            self.argparser = utils.FakeArgparserParent()
-            USING_ARGPARSE = False
         self.argparser.add_argument(
             '--category', metavar='CAT',
-            help='show only results from this category')
-        self.argparser.add_argument(
-            '--country', metavar='CODE',
-            help='show only results from this country')
-        self.argparser.add_argument(
-            '--asnum', metavar='NUM[,NUM[...]]',
-            help='show only results from this(those) AS(es)')
+            help='show only results from this category'
+        )
         self.argparser.add_argument(
             '--asname', metavar='NAME',
-            help='show only results from this(those) AS(es)')
+            help='show only results from this(those) AS(es)'
+        )
         self.argparser.add_argument('--source', metavar='SRC',
                                     help='show only results from this source')
         self.argparser.add_argument('--version', metavar="VERSION", type=int)
         self.argparser.add_argument('--timeago', metavar='SECONDS', type=int)
-        if USING_ARGPARSE:
+        if utils.USE_ARGPARSE:
             self.argparser.add_argument('--id', metavar='ID', help='show only '
                                         'results with this(those) ID(s)',
                                         nargs='+')
@@ -316,19 +628,19 @@ class DBNmap(DB):
         self.argparser.add_argument('--net', metavar='IP/MASK')
         self.argparser.add_argument('--range', metavar='IP', nargs=2)
         self.argparser.add_argument('--hop', metavar='IP')
-        self.argparser.add_argument('--port', metavar='PORT')
         self.argparser.add_argument('--not-port', metavar='PORT')
         self.argparser.add_argument('--openport', action='store_true')
         self.argparser.add_argument('--no-openport', action='store_true')
         self.argparser.add_argument('--countports', metavar='COUNT',
-                                    help='show only results with a number of open '
-                                    'ports within the provided range', nargs=2)
+                                    help='show only results with a number of '
+                                    'open ports within the provided range',
+                                    nargs=2)
         self.argparser.add_argument('--no-countports', metavar='COUNT',
-                                    help='show only results with a number of open '
-                                    'ports NOT within the provided range', nargs=2)
-        self.argparser.add_argument('--service', metavar='SVC')
+                                    help='show only results with a number of '
+                                    'open ports NOT within the provided range',
+                                    nargs=2)
         self.argparser.add_argument('--script', metavar='ID[:OUTPUT]')
-        self.argparser.add_argument('--svchostname')
+        self.argparser.add_argument('--no-script', metavar='ID[:OUTPUT]')
         self.argparser.add_argument('--os')
         self.argparser.add_argument('--anonftp', action='store_true')
         self.argparser.add_argument('--anonldap', action='store_true')
@@ -338,92 +650,16 @@ class DBNmap(DB):
         self.argparser.add_argument('--nfs', action='store_true')
         self.argparser.add_argument('--x11', action='store_true')
         self.argparser.add_argument('--xp445', action='store_true')
+        self.argparser.add_argument('--httphdr')
         self.argparser.add_argument('--owa', action='store_true')
         self.argparser.add_argument('--vuln-boa', '--vuln-intersil',
                                     action='store_true')
         self.argparser.add_argument('--torcert', action='store_true')
         self.argparser.add_argument('--sshkey', metavar="FINGERPRINT")
-        self.argparser.add_argument('--archives', action='store_true')
-
-    def is_scan_present(self, _):
-        return False
-
-    def store_scan(self, fname, **kargs):
-        """This method opens a scan result, and calls the appropriate
-        store_scan_* method to parse (and store) the scan result.
-
-        """
-        scanid = utils.hash_file(fname, hashtype="sha256")
-        if self.is_scan_present(scanid):
-            utils.LOGGER.debug("Scan already present in Database (%r).", fname)
-            return False
-        with utils.open_file(fname) as fdesc:
-            fchar = fdesc.read(1)
-        try:
-            store_scan_function = {
-                b'<': self.store_scan_xml,
-                b'{': self.store_scan_json,
-            }[fchar]
-        except KeyError:
-            raise ValueError("Unknown file type %s" % fname)
-        return store_scan_function(fname, filehash=scanid, **kargs)
-
-    def store_scan_xml(self, fname, **kargs):
-        """This method parses an XML scan result, displays a JSON
-        version of the result, and return True if everything went
-        fine, False otherwise.
-
-        In backend-specific subclasses, this method stores the result
-        instead of displaying it, thanks to the `content_handler`
-        attribute.
-
-        """
-        parser = xml.sax.make_parser()
-        self.start_store_hosts()
-        try:
-            content_handler = self.content_handler(fname, **kargs)
-        except Exception:
-            utils.LOGGER.warning('Exception (file %r)', fname, exc_info=True)
-        else:
-            parser.setContentHandler(content_handler)
-            parser.setEntityResolver(xmlnmap.NoExtResolver())
-            parser.parse(utils.open_file(fname))
-            if self.output_function is not None:
-                self.output_function(content_handler._db, out=self.output)
-            self.stop_store_hosts()
-            return True
-        self.stop_store_hosts()
-        return False
 
     @staticmethod
-    def merge_host_docs(rec1, rec2):
-        raise NotImplementedError
-
-    def merge_host(self, host):
-        """Attempt to merge `host` with an existing record.
-
-        Return `True` if another record for the same address (and
-        source if `host['source'] exists`) has been found, merged and
-        the resulting document inserted in the database, `False`
-        otherwise (in that case, it is the caller's responsibility to
-        add `host` to the database if necessary).
-
-        """
-        try:
-            flt = self.searchhost(host['addr'])
-            if host.get("source"):
-                flt = self.flt_and(
-                    flt,
-                    self.searchsource(host["source"]),
-                )
-            rec = self.get(flt)[0]
-        except IndexError:
-            # "Merge" mode but no record for that host, let's add
-            # the result normally
-            return False
-        self.store_host(self.merge_host_docs(rec, host))
-        self.remove(rec)
-        return True
+    def is_scan_present(_):
+        return False
 
     def start_store_hosts(self):
         """Backend-specific subclasses may use this method to create some bulk
@@ -439,73 +675,6 @@ insert structures.
         """
         pass
 
-    def store_scan_json(self, fname, filehash=None,
-                        needports=False, needopenports=False,
-                        categories=None, source=None,
-                        gettoarchive=None, add_addr_infos=True,
-                        force_info=False, merge=False, **_):
-        """This method parses a JSON scan result as exported using
-        `ivre scancli --json > file`, displays the parsing result, and
-        return True if everything went fine, False otherwise.
-
-        In backend-specific subclasses, this method stores the result
-        instead of displaying it, thanks to the `store_host`
-        method.
-
-        """
-        if categories is None:
-            categories = []
-        scan_doc_saved = False
-        self.start_store_hosts()
-        with utils.open_file(fname) as fdesc:
-            for line in fdesc:
-                host = self.json2dbrec(json.loads(line.decode()))
-                for fname in ["_id"]:
-                    if fname in host:
-                        del host[fname]
-                host["scanid"] = filehash
-                if categories:
-                    host["categories"] = categories
-                if source is not None:
-                    host["source"] = source
-                if add_addr_infos and self.globaldb is not None and (
-                        force_info or 'infos' not in host or not host['infos']
-                ):
-                    host['infos'] = {}
-                    for func in [self.globaldb.data.country_byip,
-                                 self.globaldb.data.as_byip,
-                                 self.globaldb.data.location_byip]:
-                        data = func(host['addr'])
-                        if data:
-                            host['infos'].update(data)
-                if ((not needports or 'ports' in host) and
-                    (not needopenports or
-                     host.get('openports', {}).get('count'))):
-                    # Update schema if/as needed.
-                    while host.get(
-                            "schema_version"
-                    ) in self.__schema_migrations["hosts"]:
-                        oldvers = host.get("schema_version")
-                        self.__schema_migrations["hosts"][oldvers][1](host)
-                        if oldvers == host.get("schema_version"):
-                            utils.LOGGER.warning(
-                                "[%r] could not migrate host from version %r [%r]",
-                                self.__class__, oldvers, host
-                            )
-                            break
-                    # We are about to insert data based on this file,
-                    # so we want to save the scan document
-                    if not scan_doc_saved:
-                        self.store_scan_doc({'_id': filehash})
-                        scan_doc_saved = True
-                    if merge and self.merge_host(host):
-                        pass
-                    else:
-                        self.archive_from_func(host, gettoarchive)
-                        self.store_host(host)
-        self.stop_store_hosts()
-        return True
-
     @staticmethod
     def getscreenshot(port):
         """Returns the content of a port's screenshot."""
@@ -515,7 +684,7 @@ insert structures.
         if url == "field":
             return port.get('screendata')
 
-    def migrate_schema(self, archive, version):
+    def migrate_schema(self, version):
         """Implemented in backend-specific classes.
 
         """
@@ -623,7 +792,8 @@ insert structures.
         for port in doc.get('ports', []):
             if port['port'] == 'host':
                 port['port'] = -1
-        for state, (total, counts) in list(viewitems(doc.get('extraports', {}))):
+        for state, (total, counts) in list(viewitems(doc.get('extraports',
+                                                             {}))):
             doc['extraports'][state] = {"total": total, "reasons": counts}
 
     @staticmethod
@@ -688,23 +858,111 @@ insert structures.
                                            viewitems(script['vulns'])]
 
     @staticmethod
+    def __migrate_schema_hosts_8_9(doc):
+        """Converts a record from version 8 to version 9. Version 9 creates a
+        structured output for http-headers script.
+
+        """
+        assert doc["schema_version"] == 8
+        doc["schema_version"] = 9
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] == "http-headers":
+                    if 'http-headers' not in script:
+                        data = xmlnmap.add_http_headers_data(script)
+                        if data is not None:
+                            script['http-headers'] = data
+
+    @staticmethod
+    def __migrate_schema_hosts_9_10(doc):
+        """Converts a record from version 9 to version 10. Version 10 changes
+the field names of the structured output for s7-info script.
+
+        """
+        assert doc["schema_version"] == 9
+        doc["schema_version"] = 10
+        for port in doc.get('ports', []):
+            for script in port.get('scripts', []):
+                if script['id'] == "s7-info":
+                    if 's7-info' in script:
+                        xmlnmap.change_s7_info_keys(script['s7-info'])
+
+    @staticmethod
+    def __migrate_schema_hosts_10_11(doc):
+        """Converts a record from version 10 to version 11. Version 11 changes
+the way IP addresses are stored, the way coordinates are stored in
+JSON and the structured output of ssl-cert from Masscan results to
+make it more similar to Nmap.
+
+In version 10, IP addresses are stored as integers. In version 11,
+they are stored as canonical string representations.
+
+        """
+        assert doc["schema_version"] == 10
+        doc["schema_version"] = 11
+        try:
+            doc['addr'] = utils.force_int2ip(doc['addr'])
+        except KeyError:
+            pass
+        if "infos" in doc and "loc" in doc["infos"]:
+            doc["infos"]["coordinates"] = doc["infos"].pop(
+                "loc"
+            )["coordinates"][::-1]
+        for port in doc.get('ports', []):
+            if 'state_reason_ip' in port:
+                try:
+                    port['state_reason_ip'] = utils.force_int2ip(
+                        port['state_reason_ip']
+                    )
+                except ValueError:
+                    pass
+            for script in port.get('scripts', []):
+                if script['id'] == 'ssl-cert':
+                    if 'pem' in script['ssl-cert']:
+                        data = ''.join(
+                            script['ssl-cert']['pem'].splitlines()[1:-1]
+                        ).encode()
+                        try:
+                            newout, newinfo = xmlnmap.create_ssl_cert(data)
+                        except Exception:
+                            utils.LOGGER.warning('Cannot parse certificate %r',
+                                                 data,
+                                                 exc_info=True)
+                        else:
+                            script['output'] = '\n'.join(newout)
+                            script['ssl-cert'] = newinfo
+                            continue
+                    try:
+                        pubkeytype = {
+                            'rsaEncryption': 'rsa',
+                            'id-ecPublicKey': 'ec',
+                            'id-dsa': 'dsa',
+                            'dhpublicnumber': 'dh',
+                        }[script['ssl-cert'].pop('pubkeyalgo')]
+                    except KeyError:
+                        pass
+                    else:
+                        script['pubkey'] = {'type': pubkeytype}
+        for trace in doc.get('traces', []):
+            for hop in trace.get('hops', []):
+                if 'ipaddr' in hop:
+                    try:
+                        hop['ipaddr'] = utils.force_int2ip(hop['ipaddr'])
+                    except ValueError:
+                        pass
+        return doc
+
+    @staticmethod
     def json2dbrec(host):
         return host
-
-    def store_host(self, host):
-        if self.output_function is not None:
-            self.output_function([host], out=self.output)
 
     def store_scan_doc(self, scan):
         pass
 
-    def archive_from_func(self, _ig1, _ig2):
-        pass
-
-    def remove(self, host, archive=False):
+    def remove(self, host):
         raise NotImplementedError
 
-    def get_mean_open_ports(self, flt, archive=False):
+    def get_mean_open_ports(self, flt):
         """This method returns for a specific query `flt` a list of
         dictionary objects whose keys are `id` and `mean`; the value
         for `id` is a backend-dependant and uniquely identifies a
@@ -726,7 +984,7 @@ insert structures.
                         (0, 0)
                     )
                 )
-            } for host in self.get(flt, archive=archive, fields=["ports"])
+            } for host in self.get(flt, fields=["ports"])
         ]
         # result = []
         # for host in self.get(flt, fields=["ports"]):
@@ -750,7 +1008,7 @@ insert structures.
         if key is not None:
             params.setdefault("values", {})['key'] = key
         if keytype is not None:
-            params.setdefault("values", {})['type'] = keytype
+            params.setdefault("values", {})['type'] = 'ssh-%s' % keytype
         if bits is not None:
             params.setdefault("values", {})['bits'] = bits
         if output is not None:
@@ -814,7 +1072,8 @@ insert structures.
     def searchowa(self):
         return self.searchscript(
             name=re.compile('^(http-(headers|auth-finder|title)|html-title)$'),
-            output=re.compile('[ /](owa|exchweb)|X-OWA-Version|Outlook Web A', re.I)
+            output=re.compile('[ /](owa|exchweb)|X-OWA-Version|Outlook Web A',
+                              re.I)
         )
 
     def searchxp445(self):
@@ -832,13 +1091,26 @@ insert structures.
                                  output=re.compile('nfs', flags=0))
 
     def searchtorcert(self):
+        expr = re.compile(
+            '^commonName=www\\.[a-z2-7]{8,20}\\.(net|com)$',
+            flags=0
+        )
         return self.searchscript(
             name='ssl-cert',
-            output=re.compile(
-                '^Subject: CN=www\\.[a-z2-7]{8,20}\\.(net|com)($|\n)',
-                flags=0,
-            ),
+            values={'subject_text': expr, 'issuer_text': expr},
         )
+
+    @classmethod
+    def searchhttphdr(cls, name=None, value=None):
+        if name is None and value is None:
+            return cls.searchscript(name="http-headers")
+        if value is None:
+            return cls.searchscript(name="http-headers", values={"name": name})
+        if name is None:
+            return cls.searchscript(name="http-headers",
+                                    values={"value": value})
+        return cls.searchscript(name="http-headers",
+                                values={"name": name, "value": value})
 
     def searchgeovision(self):
         return self.searchproduct(re.compile('^GeoVision', re.I))
@@ -855,7 +1127,7 @@ insert structures.
         raise NotImplementedError
 
     @staticmethod
-    def searchscript(name=None, output=None, values=None):
+    def searchscript(name=None, output=None, values=None, neg=False):
         raise NotImplementedError
 
     @staticmethod
@@ -863,7 +1135,8 @@ insert structures.
         raise NotImplementedError
 
     @staticmethod
-    def searchproduct(product, version=None, service=None, port=None):
+    def searchproduct(product, version=None, service=None, port=None,
+                      protocol=None):
         raise NotImplementedError
 
     @staticmethod
@@ -885,18 +1158,21 @@ insert structures.
             args['forest_dns'] = args.pop('forest')
         return cls.searchscript(name='smb-os-discovery', values=args)
 
+    @classmethod
+    def searchuseragent(cls, useragent=None, neg=False):
+        if useragent is None:
+            return cls.searchscript(name="http-user-agent", neg=neg)
+        return cls.searchscript(
+            name="http-user-agent",
+            values=useragent,
+            neg=neg
+        )
+
     def parse_args(self, args, flt=None):
-        if flt is None:
-            flt = self.flt_empty
+        flt = super(DBActive, self).parse_args(args, flt=flt)
         if args.category is not None:
             flt = self.flt_and(flt, self.searchcategory(
                 utils.str2list(args.category)))
-        if args.country is not None:
-            flt = self.flt_and(flt, self.searchcountry(
-                utils.str2list(args.country)))
-        if args.asnum is not None:
-            flt = self.flt_and(flt, self.searchasnum(
-                utils.str2list(args.asnum)))
         if args.asname is not None:
             flt = self.flt_and(flt, self.searchasname(
                 utils.str2regexp(args.asname)))
@@ -942,16 +1218,6 @@ insert structures.
             flt = self.flt_and(flt, self.searchrange(*args.range))
         if args.hop is not None:
             flt = self.flt_and(flt, self.searchhop(args.hop))
-        if args.port is not None:
-            port = args.port.replace('_', '/')
-            if '/' in port:
-                proto, port = port.split('/', 1)
-            else:
-                proto = 'tcp'
-            port = int(port)
-            flt = self.flt_and(
-                flt,
-                self.searchport(port=port, protocol=proto))
         if args.not_port is not None:
             not_port = args.not_port.replace('_', '/')
             if '/' in not_port:
@@ -978,11 +1244,6 @@ insert structures.
                                self.searchcountopenports(minn=minn,
                                                          maxn=maxn,
                                                          neg=True))
-        if args.service is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchservice(utils.str2regexp(args.service)),
-            )
         if args.script is not None:
             if ':' in args.script:
                 name, output = (utils.str2regexp(string) for
@@ -991,14 +1252,20 @@ insert structures.
                 name, output = utils.str2regexp(args.script), None
             flt = self.flt_and(flt, self.searchscript(name=name,
                                                       output=output))
-        if args.svchostname is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchsvchostname(utils.str2regexp(args.svchostname)))
+        if args.no_script is not None:
+            if ':' in args.no_script:
+                name, output = (utils.str2regexp(string) for
+                                string in args.no_script.split(':', 1))
+            else:
+                name, output = utils.str2regexp(args.no_script), None
+            flt = self.flt_and(flt, self.searchscript(name=name,
+                                                      output=output,
+                                                      neg=True))
         if args.os is not None:
             flt = self.flt_and(
                 flt,
-                self.searchos(utils.str2regexp(args.os)))
+                self.searchos(utils.str2regexp(args.os))
+            )
         if args.anonftp:
             flt = self.flt_and(flt, self.searchftpanon())
         if args.anonldap:
@@ -1015,6 +1282,19 @@ insert structures.
             flt = self.flt_and(flt, self.searchx11access())
         if args.xp445:
             flt = self.flt_and(flt, self.searchxp445())
+        if args.httphdr is not None:
+            if not args.httphdr:
+                flt = self.flt_and(flt, self.searchhttphdr())
+            elif ":" in args.httphdr:
+                name, value = args.httphdr.split(':', 1)
+                name = utils.str2regexp(name.lower())
+                value = utils.str2regexp(value)
+                flt = self.flt_and(flt, self.searchhttphdr(name=name,
+                                                           value=value))
+            else:
+                flt = self.flt_and(flt, self.searchhttphdr(
+                    name=utils.str2regexp(args.httphdr.lower())
+                ))
         if args.owa:
             flt = self.flt_and(flt, self.searchowa())
         if args.vuln_boa:
@@ -1027,38 +1307,669 @@ insert structures.
         return flt
 
     @staticmethod
-    def cmp_schema_version_host(*_):
+    def cmp_schema_version_host(_):
         return 0
 
     @staticmethod
-    def cmp_schema_version_scan(*_):
+    def cmp_schema_version_scan(_):
         return 0
+
+
+class DBNmap(DBActive):
+
+    def __init__(self, output_mode="json", output=sys.stdout):
+        super(DBNmap, self).__init__()
+        self.content_handler = xmlnmap.Nmap2Txt
+        self.output_function = {
+            "normal": nmapout.displayhosts,
+        }.get(output_mode, nmapout.displayhosts_json)
+        self.output = output
+
+    def store_host(self, host):
+        if self.output_function is not None:
+            self.output_function([host], out=self.output)
+
+    def store_scan(self, fname, **kargs):
+        """This method opens a scan result, and calls the appropriate
+        store_scan_* method to parse (and store) the scan result.
+
+        """
+        scanid = utils.hash_file(fname, hashtype="sha256")
+        if self.is_scan_present(scanid):
+            utils.LOGGER.debug("Scan already present in Database (%r).", fname)
+            return False
+        with utils.open_file(fname) as fdesc:
+            fchar = fdesc.read(1)
+        try:
+            store_scan_function = {
+                b'<': self.store_scan_xml,
+                b'{': self.store_scan_json,
+            }[fchar]
+        except KeyError:
+            raise ValueError("Unknown file type %s" % fname)
+        return store_scan_function(fname, filehash=scanid, **kargs)
+
+    def store_scan_xml(self, fname, callback=None, **kargs):
+        """This method parses an XML scan result, displays a JSON
+        version of the result, and return True if everything went
+        fine, False otherwise.
+
+        In backend-specific subclasses, this method stores the result
+        instead of displaying it, thanks to the `content_handler`
+        attribute.
+
+        The callback is a function called after each host insertion
+        and takes this host as a parameter. This should be set to 'None'
+        if no action has to be taken.
+
+        """
+        parser = xml.sax.make_parser()
+        self.start_store_hosts()
+        try:
+            content_handler = self.content_handler(fname, **kargs)
+        except Exception:
+            utils.LOGGER.warning('Exception (file %r)', fname, exc_info=True)
+        else:
+            content_handler.callback = callback
+            parser.setContentHandler(content_handler)
+            parser.setEntityResolver(xmlnmap.NoExtResolver())
+            parser.parse(utils.open_file(fname))
+            if self.output_function is not None:
+                self.output_function(content_handler._db, out=self.output)
+            self.stop_store_hosts()
+            return True
+        self.stop_store_hosts()
+        return False
+
+    def store_scan_json(self, fname, filehash=None,
+                        needports=False, needopenports=False,
+                        categories=None, source=None,
+                        add_addr_infos=True, force_info=False,
+                        callback=None, **_):
+        """This method parses a JSON scan result as exported using
+        `ivre scancli --json > file`, displays the parsing result, and
+        return True if everything went fine, False otherwise.
+
+        In backend-specific subclasses, this method stores the result
+        instead of displaying it, thanks to the `store_host`
+        method.
+
+        The callback is a function called after each host insertion
+        and takes this host as a parameter. This should be set to 'None'
+        if no action has to be taken.
+
+        """
+        if categories is None:
+            categories = []
+        scan_doc_saved = False
+        self.start_store_hosts()
+        with utils.open_file(fname) as fdesc:
+            for line in fdesc:
+                host = self.json2dbrec(json.loads(line.decode()))
+                for fname in ["_id"]:
+                    if fname in host:
+                        del host[fname]
+                host["scanid"] = filehash
+                if categories:
+                    host["categories"] = categories
+                if source is not None:
+                    host["source"] = source
+                if add_addr_infos and self.globaldb is not None and (
+                        force_info or 'infos' not in host or not host['infos']
+                ):
+                    host['infos'] = {}
+                    for func in [self.globaldb.data.country_byip,
+                                 self.globaldb.data.as_byip,
+                                 self.globaldb.data.location_byip]:
+                        host['infos'].update(func(host['addr']) or {})
+                if ((not needports or 'ports' in host) and
+                    (not needopenports or
+                     host.get('openports', {}).get('count'))):
+                    # Update schema if/as needed.
+                    while host.get(
+                            "schema_version"
+                    ) in self._schema_migrations["hosts"]:
+                        oldvers = host.get("schema_version")
+                        self._schema_migrations["hosts"][oldvers][1](host)
+                        if oldvers == host.get("schema_version"):
+                            utils.LOGGER.warning(
+                                "[%r] could not migrate host from version "
+                                "%r [%r]",
+                                self.__class__, oldvers, host
+                            )
+                            break
+                    # We are about to insert data based on this file,
+                    # so we want to save the scan document
+                    if not scan_doc_saved:
+                        self.store_scan_doc({'_id': filehash})
+                        scan_doc_saved = True
+                    self.store_host(host)
+                if callback is not None:
+                    callback(host)
+        self.stop_store_hosts()
+        return True
+
+
+class DBView(DBActive):
+
+    def __init__(self):
+        super(DBView, self).__init__()
+        self.argparser.add_argument('--ssl-ja3-server',
+                                    metavar='JA3-SERVER[:JA3-CLIENT]',
+                                    nargs='?',
+                                    const=False,
+                                    default=None)
+        self.argparser.add_argument('--ssl-ja3-client',
+                                    metavar='JA3-CLIENT',
+                                    nargs='?',
+                                    const=False,
+                                    default=None)
+
+    def parse_args(self, args, flt=None):
+        flt = super(DBView, self).parse_args(args, flt=flt)
+        if args.ssl_ja3_client is not None:
+            cli = args.ssl_ja3_client
+            flt = self.flt_and(flt, self.searchja3client(
+                value_or_hash=(
+                    False if cli is False else utils.str2regexp(cli)
+                )
+            ))
+        if args.ssl_ja3_server is not None:
+            if args.ssl_ja3_server is False:
+                # There are no additional arguments
+                flt = self.flt_and(flt, self.searchja3server())
+            else:
+                split = [utils.str2regexp(v) if v else None
+                         for v in args.ssl_ja3_server.split(':', 1)]
+                if len(split) == 1:
+                    # Only a JA3 server is given
+                    flt = self.flt_and(flt, self.searchja3server(
+                        value_or_hash=split[0]
+                    ))
+                else:
+                    # Both client and server JA3 are given
+                    flt = self.flt_and(flt, self.searchja3server(
+                        value_or_hash=split[0],
+                        client_value_or_hash=split[1],
+                    ))
+        return flt
+
+    @staticmethod
+    def merge_ja3_scripts(curscript, script, script_id):
+
+        def is_server(script_id):
+            return script_id == 'ssl-ja3-server'
+
+        def ja3_equals(a, b, script_id):
+            return (a['raw'] == b['raw'] and
+                    (not is_server(script_id) or
+                     a['client']['raw'] == b['client']['raw']))
+
+        def ja3_output(ja3, script_id):
+            output = ja3['md5']
+            if is_server(script_id):
+                output += ' - ' + ja3['client']['md5']
+            return output
+        return DBView._merge_scripts(curscript, script, script_id,
+                                     ja3_equals, ja3_output)
+
+    @staticmethod
+    def merge_ua_scripts(curscript, script, script_id):
+
+        def ua_equals(a, b, script_id):
+            return a == b
+
+        def ua_output(ua, script_id):
+            return ua
+
+        return DBView._merge_scripts(curscript, script, script_id,
+                                     ua_equals, ua_output)
+
+    @staticmethod
+    def _merge_scripts(curscript, script, script_id,
+                       script_equals, script_output):
+        """Merge two scripts and return the result. Avoid duplicates.
+        """
+        to_merge_list = []
+        for to_add in script[script_id]:
+            to_merge = True
+            for cur in curscript[script_id]:
+                if script_equals(to_add, cur, script_id):
+                    to_merge = False
+                    break
+            if to_merge:
+                to_merge_list.append(to_add)
+        curscript[script_id].extend(to_merge_list)
+        # Compute output from curscript[script_id]
+        output = ""
+        for el in curscript[script_id]:
+            output += script_output(el, script_id) + '\n'
+        curscript['output'] = output
+        return curscript
+
+    @staticmethod
+    def merge_scripts(curscript, script, script_id):
+        if script_id.startswith('ssl-ja3-'):
+            return DBView.merge_ja3_scripts(curscript, script, script_id)
+        elif script_id == 'http-user-agent':
+            return DBView.merge_ua_scripts(curscript, script, script_id)
+        return {}
+
+    @staticmethod
+    def merge_host_docs(rec1, rec2):
+        """Merge two host records and return the result. Unmergeable /
+        hard-to-merge fields are lost (e.g., extraports).
+
+        """
+        if rec1.get("schema_version") != rec2.get("schema_version"):
+            raise ValueError("Cannot merge host documents. "
+                             "Schema versions differ (%r != %r)" % (
+                                 rec1.get("schema_version"),
+                                 rec2.get("schema_version")))
+        rec = {}
+        if "schema_version" in rec1:
+            rec["schema_version"] = rec1["schema_version"]
+        # When we have different values, we will use the one from the
+        # most recent scan, rec2
+        if rec1.get("endtime") > rec2.get("endtime"):
+            rec1, rec2 = rec2, rec1
+        for fname, function in [("starttime", min), ("endtime", max)]:
+            try:
+                rec[fname] = function(record[fname] for record in [rec1, rec2]
+                                      if fname in record)
+            except ValueError:
+                pass
+        rec["state"] = "up" if rec1.get("state") == "up" else rec2.get("state")
+        if rec["state"] is None:
+            del rec["state"]
+        rec["categories"] = list(
+            set(rec1.get("categories", [])).union(
+                rec2.get("categories", []))
+        )
+        for field in ["addr", "os"]:
+            rec[field] = rec2[field] if rec2.get(field) else rec1.get(field)
+            if not rec[field]:
+                del rec[field]
+        rec['source'] = list(set(rec1.get('source', []))
+                             .union(set(rec2.get('source', []))))
+        rec["traces"] = rec1.get("traces", []) + rec2.get("traces", [])
+        rec["infos"] = {}
+        for record in [rec1, rec2]:
+            rec["infos"].update(record.get("infos", {}))
+        # We want to make sure of (type, name) unicity
+        hostnames = dict(((h['type'], h['name']), h.get('domains'))
+                         for h in (rec1.get("hostnames", []) +
+                                   rec2.get("hostnames", [])))
+        rec["hostnames"] = [{"type": h[0], "name": h[1], "domains": d}
+                            for h, d in viewitems(hostnames)]
+        ports = dict(((port.get("protocol"), port["port"]), port.copy())
+                     for port in rec2.get("ports", []))
+        for port in rec1.get("ports", []):
+            if (port.get('protocol'), port['port']) in ports:
+                curport = ports[(port.get('protocol'), port['port'])]
+                if 'scripts' in curport:
+                    curport['scripts'] = curport['scripts'][:]
+                else:
+                    curport['scripts'] = []
+                present_scripts = set(
+                    script['id'] for script in curport['scripts']
+                )
+                for script in port.get("scripts", []):
+                    if script['id'] not in present_scripts:
+                        curport['scripts'].append(script)
+                    elif (script['id'] in ['ssl-ja3-server',
+                                           'ssl-ja3-client',
+                                           'http-user-agent']):
+                        # Merge scripts
+                        curscript = next(x for x in curport['scripts']
+                                         if x['id'] == script['id'])
+                        DBView.merge_scripts(curscript, script, script['id'])
+                if not curport['scripts']:
+                    del curport['scripts']
+                if 'service_name' in port:
+                    if 'service_name' not in curport:
+                        for key in port:
+                            if key.startswith("service_"):
+                                curport[key] = port[key]
+                    elif port['service_name'] == curport['service_name']:
+                        # if the "old" record has information missing
+                        # from the "new" record and information from
+                        # both records is consistent, let's keep the
+                        # "old" data.
+                        for key in port:
+                            if (
+                                    key.startswith("service_") and
+                                    key not in curport
+                            ):
+                                curport[key] = port[key]
+            else:
+                ports[(port.get('protocol'), port['port'])] = port
+        rec["ports"] = sorted(viewvalues(ports), key=lambda port: (
+            port.get('protocol') or '~', port.get('port'),
+        ))
+        rec["openports"] = {}
+        for record in [rec1, rec2]:
+            for proto in record.get('openports', {}):
+                if proto == 'count':
+                    continue
+                rec['openports'].setdefault(
+                    proto, {}).setdefault(
+                        'ports', set()).update(
+                            record['openports'][proto]['ports'])
+        if rec['openports']:
+            for proto in list(rec['openports']):
+                count = len(rec['openports'][proto]['ports'])
+                rec['openports'][proto]['count'] = count
+                rec['openports']['count'] = rec['openports'].get(
+                    'count', 0) + count
+                rec['openports'][proto]['ports'] = list(
+                    rec['openports'][proto]['ports'])
+        else:
+            rec['openports']["count"] = 0
+        for field in ["traces", "infos", "ports"]:
+            if not rec[field]:
+                del rec[field]
+        return rec
+
+    def merge_host(self, host):
+        """Attempt to merge `host` with an existing record.
+
+        Return `True` if another record for the same address has been found,
+        merged and the resulting document inserted in the database, `False`
+        otherwise (in that case, it is the caller's responsibility to
+        add `host` to the database if necessary).
+
+        """
+        try:
+            flt = self.searchhost(host['addr'])
+            rec = next(self.get(flt))
+        except StopIteration:
+            # "Merge" mode but no record for that host, let's add
+            # the result normally
+            return False
+        self.store_host(self.merge_host_docs(rec, host))
+        self.remove(rec)
+        return True
+
+    @classmethod
+    def _searchja3(cls, value_or_hash, script_id, neg):
+        if not value_or_hash:
+            return cls.searchscript(name=script_id, neg=neg)
+        key, value = cls._ja3keyvalue(value_or_hash)
+        return cls.searchscript(name=script_id, values={key: value}, neg=neg)
+
+    @classmethod
+    def searchja3client(cls, value_or_hash=None, neg=False):
+        return cls._searchja3(value_or_hash, 'ssl-ja3-client', neg=neg)
+
+    @classmethod
+    def searchja3server(cls, value_or_hash=None, client_value_or_hash=None,
+                        neg=False):
+        script_id = 'ssl-ja3-server'
+        if not client_value_or_hash:
+            return cls._searchja3(value_or_hash, script_id, neg=neg)
+        key_client, value_client = cls._ja3keyvalue(client_value_or_hash)
+        values = {'client.%s' % (key_client): value_client}
+        if value_or_hash:
+            key_srv, value_srv = cls._ja3keyvalue(value_or_hash)
+            values[key_srv] = value_srv
+        return cls.searchscript(
+            name=script_id,
+            values=values,
+            neg=neg,
+        )
+
+
+class _RecInfo(object):
+    __slots__ = ["count", "firstseen", "infos", "lastseen"]
+
+    def __init__(self, infos):
+        self.count = 0
+        self.firstseen = self.lastseen = None
+        self.infos = infos
+
+    @property
+    def data(self):
+        data = {'count': self.count}
+        if self.infos:
+            data['infos'] = self.infos
+        return data
+
+    def update_from_spec(self, spec):
+        self.count += spec.get('count')
+        firstseen = spec.get('firstseen')
+        if firstseen is not None:
+            if self.firstseen is None:
+                self.firstseen = firstseen
+            else:
+                self.firstseen = min(self.firstseen, firstseen)
+        lastseen = spec.get('lastseen')
+        if lastseen is not None:
+            if self.lastseen is None:
+                self.lastseen = lastseen
+            else:
+                self.lastseen = min(self.lastseen, lastseen)
+
+    def update(self, timestamp):
+        self.count += 1
+        if self.firstseen is None:
+            self.firstseen = timestamp
+        else:
+            self.firstseen = min(self.firstseen, timestamp)
+        if self.lastseen is None:
+            self.lastseen = timestamp
+        else:
+            self.lastseen = max(self.lastseen, timestamp)
 
 
 class DBPassive(DB):
 
-    def insert_or_update(self, timestamp, spec, getinfos=None):
+    def __init__(self):
+        super(DBPassive, self).__init__()
+        self.argparser.add_argument('--sensor')
+        self.argparser.add_argument('--torcert', action='store_true')
+        self.argparser.add_argument('--dns')
+        self.argparser.add_argument('--dnssub')
+        self.argparser.add_argument('--cert')
+        self.argparser.add_argument('--basicauth', action='store_true')
+        self.argparser.add_argument('--auth', action='store_true')
+        self.argparser.add_argument('--java', action='store_true')
+        self.argparser.add_argument('--ftp', action='store_true')
+        self.argparser.add_argument('--pop', action='store_true')
+        self.argparser.add_argument('--timeago', type=int)
+        self.argparser.add_argument('--timeagonew', type=int)
+
+    def parse_args(self, args, flt=None):
+        flt = super(DBPassive, self).parse_args(args, flt=flt)
+        if args.sensor is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchsensor(args.sensor)
+            )
+        if args.torcert:
+            flt = self.flt_and(flt, self.searchtorcert())
+        if args.basicauth:
+            flt = self.flt_and(flt, self.searchbasicauth())
+        if args.auth:
+            flt = self.flt_and(flt, self.searchhttpauth())
+        if args.java:
+            flt = self.flt_and(
+                flt,
+                self.searchjavaua()
+            )
+        if args.ftp:
+            flt = self.flt_and(flt, self.searchftpauth())
+        if args.pop:
+            flt = self.flt_and(flt, self.searchpopauth())
+        if args.dns is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchdns(utils.str2regexp(args.dns), subdomains=False)
+            )
+        if args.dnssub is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchdns(utils.str2regexp(args.dnssub), subdomains=True)
+            )
+        if args.cert is not None:
+            flt = self.flt_and(
+                flt,
+                self.searchcertsubject(utils.str2regexp(args.cert)),
+            )
+        if args.timeago is not None:
+            flt = self.flt_and(self.searchtimeago(args.timeago, new=False))
+        if args.timeagonew is not None:
+            flt = self.flt_and(self.searchtimeago(args.timeagonew, new=True))
+        return flt
+
+    def insert_or_update(self, timestamp, spec, getinfos=None, lastseen=None):
         raise NotImplementedError
 
-    def insert_or_update_bulk(self, specs, getinfos=None):
-        """Like `.insert_or_update()`, but `specs` parameter has to be
-        an iterable of (timestamp, spec) values. This generic
-        implementation does not use bulk capacity of the underlying DB
-        implementation but rather calls its `.insert_or_update()`
-        method.
+    def insert_or_update_bulk(self, specs, getinfos=None,
+                              separated_timestamps=True):
+        """Like `.insert_or_update()`, but `specs` parameter has to be an
+        iterable of (timestamp, spec) values. This generic
+        implementation does not use the bulk capacity of the
+        underlying DB implementation but rather calls its
+        `.insert_or_update()` method.
 
         """
-        for timestamp, spec in specs:
-            self.insert_or_update(timestamp, spec, getinfos=getinfos)
+        if separated_timestamps:
+            for tstamp, spec in specs:
+                self.insert_or_update(tstamp, spec, getinfos=getinfos)
+        else:
+            for spec in specs:
+                timestamp = spec.pop("firstseen", None)
+                lastseen = spec.pop("lastseen", None)
+                self.insert_or_update(timestamp or lastseen, spec,
+                                      getinfos=getinfos,
+                                      lastseen=lastseen or timestamp)
+
+    def insert_or_update_local_bulk(self, specs, getinfos=None,
+                                    separated_timestamps=True):
+        """Like `.insert_or_update()`, but `specs` parameter has to be an
+        iterable of (timestamp, spec) values. This generic
+        implementation does not use the bulk capacity of the
+        underlying DB implementation but uses a local cache and calls
+        its `.insert_or_update()` method.
+
+        """
+        def _bulk_execute(records):
+            utils.LOGGER.debug("DB:local bulk upsert: %d", len(records))
+            for spec, metadata in viewitems(records):
+                self.insert_or_update(metadata.firstseen,
+                                      dict(spec, **metadata.data),
+                                      getinfos=getinfos,
+                                      lastseen=metadata.lastseen)
+        records = {}
+        utils.LOGGER.debug("DB: creating a local bulk upsert (%d records)",
+                           config.LOCAL_BATCH_SIZE)
+        if separated_timestamps:
+            for timestamp, spec in specs:
+                if spec is None:
+                    continue
+                infos = spec.pop('infos', None)
+                spec = tuple((key, spec[key]) for key in sorted(spec))
+                records.setdefault(spec, _RecInfo(infos)).update(timestamp)
+                if len(records) >= config.LOCAL_BATCH_SIZE:
+                    _bulk_execute(records)
+                    records = {}
+        else:
+            for spec in specs:
+                if spec is None:
+                    continue
+                infos = spec.pop('infos', None)
+                basespec = tuple(
+                    (key, spec[key]) for key in sorted(spec)
+                    if key not in ['count', 'firstseen', 'lastseen']
+                )
+                records.setdefault(basespec,
+                                   _RecInfo(infos)).update_from_spec(spec)
+                if len(records) >= config.LOCAL_BATCH_SIZE:
+                    _bulk_execute(records)
+                    records = {}
+        _bulk_execute(records)
+
+    def searchcountry(self, code, neg=False):
+        return self.searchranges(
+            geoiputils.get_ranges_by_country(code), neg=neg
+        )
+
+    def searchasnum(self, asnum, neg=False):
+        return self.searchranges(
+            geoiputils.get_ranges_by_asnum(asnum), neg=neg
+        )
+
+    @classmethod
+    def searchranges(cls, ranges, neg=False):
+        """Filters (if `neg` == True, filters out) some IP address ranges.
+
+`ranges` is an instance of ivre.geoiputils.IPRanges().
+
+        """
+        flt = []
+        for start, stop in ranges.iter_ranges():
+            flt.append(cls.searchrange(cls.ip2internal(start),
+                                       cls.ip2internal(stop), neg=neg))
+        if flt:
+            return (cls.flt_and if neg else cls.flt_or)(*flt)
+        return cls.flt_empty if neg else cls.searchnonexistent()
 
     def searchtorcert(self):
         return self.searchcertsubject(
-            re.compile('^CN=www\\.[a-z2-7]{8,20}\\.(net|com)$',
-                       flags=0))
+            re.compile('^commonName=www\\.[a-z2-7]{8,20}\\.(net|com)$',
+                       flags=0),
+            issuer=re.compile('^commonName=www\\.[a-z2-7]{8,20}\\.(net|com)$',
+                              flags=0),
+        )
 
     @staticmethod
-    def searchcertsubject(expr):
+    def searchcertsubject(expr, issuer=None):
         raise NotImplementedError
+
+    @staticmethod
+    def searchdns(name, reverse=False, subdomains=False):
+        """Filters DNS records for domain `name`.
+        `name` can be a string, a list or a regular expression.
+        If `reverse` is set to True, filters reverse records.
+        If `subdomains` is set to True, the filter will match any subdomains.
+        """
+        raise NotImplementedError
+
+    def get(self, spec, **kargs):
+        """Queries the active column with the provided filter "spec",
+and returns a generator."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _update_dns_blacklist(old_spec):
+        """Create a new dns blacklist entry based on the value of
+the old dns entry"""
+        spec = {}
+        dnsbl_val = old_spec['value']
+        spec['recontype'] = 'DNS_BLACKLIST'
+        spec['value'] = old_spec['addr']
+        spec['source'] = "%s-%s" % (dnsbl_val.split('.', 4)[4],
+                                    old_spec['source'])
+        spec['addr'] = '.'.join(dnsbl_val.split('.')[3::-1])
+        spec['count'] = old_spec['count']
+        return spec
+
+    def update_dns_blacklist(self):
+        """Update the current database to detect blacklist domains.
+This function inserts a new element in the database, corresponding to the
+old element and delete the existing one."""
+
+        flt = self.searchdns(list(config.DNS_BLACKLIST_DOMAINS),
+                             subdomains=True)
+        base = self.get(flt)
+        for old_spec in base:
+            if any(old_spec['value'].endswith(dnsbl)
+                   for dnsbl in config.DNS_BLACKLIST_DOMAINS):
+                spec = self._update_dns_blacklist(old_spec)
+                self.insert_or_update(old_spec['firstseen'], spec,
+                                      lastseen=old_spec['lastseen'])
+                self.remove(old_spec['_id'])
 
 
 class DBData(DB):
@@ -1067,10 +1978,9 @@ class DBData(DB):
     def infos_byip(self, addr):
         infos = {}
         for infos_byip in [self.as_byip,
+                           self.country_byip,
                            self.location_byip]:
-            newinfos = infos_byip(addr)
-            if newinfos is not None:
-                infos.update(newinfos)
+            infos.update(infos_byip(addr) or {})
         if infos:
             return infos
 
@@ -1079,121 +1989,6 @@ class DBData(DB):
 
     def location_byip(self, addr):
         raise NotImplementedError
-
-    def parse_line_country_codes(self, line):
-        assert line.endswith(b'"\n')
-        line = line[:-2].split(b',"')
-        return {'code': line[0].decode(), 'name': line[1].decode()}
-
-    def parse_line_country(self, line, feedipdata=None,
-                           createipdata=False):
-        if line.endswith(b'\n'):
-            line = line[:-1]
-        if line.endswith(b'"'):
-            line = line[:-1]
-        if line.startswith(b'"'):
-            line = line[1:]
-        line = line.split(b'","')
-        if feedipdata is not None:
-            for dbinst in feedipdata:
-                dbinst.update_country(
-                    int(line[2]), int(line[3]), line[4],
-                    create=createipdata
-                )
-        return {'start': int(line[2]),
-                'stop': int(line[3]),
-                'country_code': line[4].decode()}
-
-    @staticmethod
-    def parse_line_city(line, feedipdata=None, createipdata=False):
-        if line.endswith(b'\n'):
-            line = line[:-1]
-        if line.endswith(b'"'):
-            line = line[:-1]
-        if line.startswith(b'"'):
-            line = line[1:]
-        line = line.split(b'","')
-        if feedipdata is not None:
-            for dbinst in feedipdata:
-                dbinst.update_city(
-                    int(line[0]), int(line[1]), int(line[2]),
-                    create=createipdata
-                )
-        return {'start': int(line[0]),
-                'stop': int(line[1]),
-                'location_id': int(line[2])}
-
-    @staticmethod
-    def parse_line_city_location(line):
-        if line.endswith(b'\n'):
-            line = line[:-1]
-        # Get an integer
-        i = line.index(b',')
-        parsedline = {'location_id': int(line[:i])}
-        line = line[i + 1:]
-        # Get 4 strings
-        for field in ['country_code', 'region_code', 'city',
-                      'postal_code']:
-            i = line.index(b'",')
-            curval = line[1:i]
-            if curval:
-                parsedline[field] = curval.decode('latin-1')
-            line = line[i + 2:]
-        # Get 2 floats
-        coords = []
-        for i in range(2):
-            i = line.index(b',')
-            curval = line[:i]
-            if curval:
-                coords.append(float(curval))
-            line = line[i + 1:]
-        if len(coords) == 2:
-            parsedline['loc'] = {
-                'type': 'Point',
-                'coordinates': [coords[1], coords[0]],
-            }
-        # Get 1 int
-        i = line.index(b',')
-        curval = line[:i]
-        if curval:
-            parsedline['metro_code'] = int(curval)
-        line = line[i + 1:]
-        # Pop 1 int or None (at the end of the line)
-        if line:
-            parsedline['area_code'] = int(line)
-        return parsedline
-
-    @staticmethod
-    def parse_line_asnum(line, feedipdata=None, createipdata=False):
-        if line.endswith(b'\n'):
-            line = line[:-1]
-        line = line.split(b',', 2)
-        parsedline = {
-            'start': int(line[0]),
-            'stop': int(line[1]),
-        }
-        data = line[2]
-        if data.endswith(b'"'):
-            data = data[:-1]
-        if data.startswith(b'"'):
-            data = data[1:]
-        if data.startswith(b'AS'):
-            data = data.split(None, 1)
-            parsedline['as_num'] = int(data[0][2:])
-            if len(data) == 2:
-                parsedline['as_name'] = data[1].decode('latin-1')
-        else:
-            parsedline['as_num'] = -1
-            parsedline['as_name'] = data.decode('latin-1')
-        if feedipdata is not None:
-            for dbinst in feedipdata:
-                dbinst.update_as(parsedline['start'],
-                                 parsedline['stop'],
-                                 parsedline['as_num'],
-                                 parsedline.get('as_name'),
-                                 create=createipdata)
-        return parsedline
-
 
 
 class LockError(RuntimeError):
@@ -1356,7 +2151,6 @@ class DBAgent(DB):
                 categories=scan['target_info']['categories'],
                 source=agent['source'],
             )
-            # TODO gettoarchive parameter
             self.incr_scan_results(self.str2id(scanid))
 
     def feed_all(self, masterid):
@@ -1483,7 +2277,7 @@ class DBAgent(DB):
         raise NotImplementedError
 
     def get_scan_target(self, scanid):
-        res =  pickle.loads(self._get_scan_target(scanid))
+        res = pickle.loads(self._get_scan_target(scanid))
         if hasattr(res, "fdesc"):
             opened, seekval = res.fdesc
             res.fdesc = open(res.target.filename)
@@ -1505,10 +2299,13 @@ and raises a LockError on failure.
         scan = self._lock_scan(scanid, None, lockid.bytes)
         if scan['lock'] is not None:
             # This might be a bug in uuid module, Python 2 only
-            ##  File "/opt/python/2.6.9/lib/python2.6/uuid.py", line 145, in __init__
-            ##    int = long(('%02x'*16) % tuple(map(ord, bytes)), 16)
+            #    File "/opt/python/2.6.9/lib/python2.6/uuid.py", line 145,
+            #   in __init__
+            #      int = long(('%02x'*16) % tuple(map(ord, bytes)), 16)
             # scan['lock'] = uuid.UUID(bytes=scan['lock'])
-            scan['lock'] = uuid.UUID(hex=utils.encode_hex(scan['lock']).decode())
+            scan['lock'] = uuid.UUID(
+                hex=utils.encode_hex(scan['lock']).decode()
+            )
         if scan['lock'] == lockid:
             return scan
 
@@ -1526,7 +2323,7 @@ LockError on failure.
     def _lock_scan(self, scanid, oldlockid, newlockid):
         raise NotImplementedError
 
-    def get_scan(self):
+    def get_scan(self, scanid):
         raise NotImplementedError
 
     def get_scans(self):
@@ -1606,7 +2403,8 @@ def _mongodb_url2dbinfos(url):
         username = url.netloc[:url.netloc.index('@')]
         if ':' in username:
             userinfo = dict(zip(["username", "password"],
-                                [unquote(val) for val in username.split(':', 1)]))
+                                [unquote(val) for val in
+                                 username.split(':', 1)]))
         else:
             username = unquote(username)
             if username == 'GSSAPI':
@@ -1637,8 +2435,19 @@ def _mongodb_url2dbinfos(url):
             (hostname, dbname),
             params)
 
+
 def _neo4j_url2dbinfos(url):
     return (url.scheme, (url._replace(scheme='http').geturl(),), {})
+
+
+def _maxmind_url2dbinfos(url):
+    return (url.scheme, (url.path,), {})
+
+
+def _sqlite_url2dbinfos(url):
+    # url.geturl() would remove two necessary '/' from url.
+    return (url.scheme, ("%s://%s" % (url.scheme, url.path),), {})
+
 
 class MetaDB(object):
     db_types = {
@@ -1647,14 +2456,18 @@ class MetaDB(object):
         "data": {},
         "agent": {},
         "flow": {},
+        "view": {},
     }
     nmap = None
     passive = None
     data = None
     agent = None
+    view = None
     extract_dbinfos = {
         "mongodb": _mongodb_url2dbinfos,
         "neo4j": _neo4j_url2dbinfos,
+        "maxmind": _maxmind_url2dbinfos,
+        "sqlite": _sqlite_url2dbinfos,
     }
 
     @classmethod
@@ -1667,14 +2480,14 @@ class MetaDB(object):
     def __init__(self, url=None, urls=None):
         try:
             from ivre.db.mongo import (MongoDBNmap, MongoDBPassive,
-                                       MongoDBData, MongoDBAgent)
+                                       MongoDBAgent, MongoDBView)
         except ImportError:
             pass
         else:
             self.db_types["nmap"]["mongodb"] = MongoDBNmap
             self.db_types["passive"]["mongodb"] = MongoDBPassive
-            self.db_types["data"]["mongodb"] = MongoDBData
             self.db_types["agent"]["mongodb"] = MongoDBAgent
+            self.db_types["view"]["mongodb"] = MongoDBView
         try:
             from ivre.db.neo4j import Neo4jDBFlow
         except ImportError:
@@ -1682,17 +2495,30 @@ class MetaDB(object):
         else:
             self.db_types["flow"]["neo4j"] = Neo4jDBFlow
         try:
-            from ivre.db.postgres import (PostgresDBFlow, PostgresDBData,
-                                          PostgresDBNmap, PostgresDBPassive)
+            from ivre.db.sql.postgres import (PostgresDBFlow, PostgresDBNmap,
+                                              PostgresDBPassive,
+                                              PostgresDBView)
         except ImportError:
             pass
         else:
             self.db_types["flow"]["postgresql"] = PostgresDBFlow
             self.db_types["nmap"]["postgresql"] = PostgresDBNmap
-            self.db_types["data"]["postgresql"] = PostgresDBData
             self.db_types["passive"]["postgresql"] = PostgresDBPassive
+            self.db_types["view"]["postgresql"] = PostgresDBView
+        try:
+            from ivre.db.sql.sqlite import SqliteDBPassive
+        except ImportError:
+            pass
+        else:
+            self.db_types["passive"]["sqlite"] = SqliteDBPassive
         if urls is None:
             urls = {}
+        try:
+            from ivre.db.maxmind import MaxMindDBData
+        except ImportError:
+            pass
+        else:
+            self.db_types["data"]["maxmind"] = MaxMindDBData
         for datatype, dbtypes in viewitems(self.db_types):
             specificurl = urls.get(datatype, url)
             if specificurl is not None:
@@ -1705,6 +2531,7 @@ class MetaDB(object):
                         datatype,
                         dbtypes[spurlscheme](*spurlargs, **spurlkargs))
                     getattr(self, datatype).globaldb = self
+
 
 db = MetaDB(
     url=config.DB if hasattr(config, "DB") else None,

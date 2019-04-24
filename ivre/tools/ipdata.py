@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -16,19 +16,14 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
+
 """This tool can be used to manage IP addresses related data, such as
 AS number and country information.
 
 """
 
+
 from __future__ import print_function
-import os
-try:
-    import argparse
-    USING_ARGPARSE = True
-except ImportError:
-    import optparse
-    USING_ARGPARSE = False
 import sys
 try:
     reload(sys)
@@ -38,121 +33,38 @@ else:
     sys.setdefaultencoding('utf-8')
 
 
-from builtins import input
 from future.utils import viewitems
 
 
-import ivre.db
-import ivre.geoiputils
-import ivre.config
+from ivre.db import db
+from ivre import geoiputils, utils
 
 
 def main():
-    if USING_ARGPARSE:
-        parser = argparse.ArgumentParser(description=__doc__)
-    else:
-        parser = optparse.OptionParser(
-            description=__doc__)
-        parser.parse_args_orig = parser.parse_args
-        def my_parse_args():
-            res = parser.parse_args_orig()
-            res[0].ensure_value('ip', res[1])
-            return res[0]
-        parser.parse_args = my_parse_args
-        parser.add_argument = parser.add_option
+    parser, use_argparse = utils.create_argparser(__doc__, extraargs='ip')
     torun = []
-    parser.add_argument('--init', '--purgedb', action='store_true',
-                        help='Purge or create and initialize the database.')
-    parser.add_argument('--ensure-indexes', action='store_true',
-                        help='Create missing indexes (will lock the database).')
     parser.add_argument('--download', action='store_true',
                         help='Fetch all data files.')
-    parser.add_argument('--country-csv', metavar='FILE',
-                        help='Import FILE into countries database.')
-    parser.add_argument('--asnum-csv', metavar='FILE',
-                        help='Import FILE into AS database.')
-    parser.add_argument('--city-csv', metavar='FILE',
-                        help='Import FILE into cities database.')
-    parser.add_argument('--location-csv', metavar='FILE',
-                        help='Import FILE into locations database.')
     parser.add_argument('--import-all', action='store_true',
-                        help='Import all files into databases.')
-    parser.add_argument('--no-update-passive-db', action='store_true',
-                        help='Do not update the passive database.')
-    parser.add_argument('--update-nmap-db', action='store_true',
-                        help='Update the active database.')
+                        help='Create all CSV files for reverse lookups.')
     parser.add_argument('--quiet', "-q", action='store_true',
                         help='Quiet mode.')
-    if USING_ARGPARSE:
+    if use_argparse:
         parser.add_argument('ip', nargs='*', metavar='IP',
                             help='Display results for specified IP addresses.')
     args = parser.parse_args()
-    if args.init:
-        if os.isatty(sys.stdin.fileno()):
-            sys.stdout.write(
-                'This will remove any country/AS information in your '
-                'database. Process ? [y/N] ')
-            ans = input()
-            if ans.lower() != 'y':
-                exit(0)
-        ivre.db.db.data.init()
-    if args.ensure_indexes:
-        if os.isatty(sys.stdin.fileno()):
-            sys.stdout.write(
-                'This will lock your database. Process ? [y/N] ')
-            ans = input()
-            if ans.lower() == 'y':
-                ivre.db.db.data.ensure_indexes()
     if args.download:
-        ivre.geoiputils.download_all(verbose=not args.quiet)
-    dbtofeed = {}
-    if not args.no_update_passive_db:
-        dbtofeed["feedipdata"] = [ivre.db.db.passive]
-    if args.update_nmap_db:
-        dbtofeed.setdefault("feedipdata", []).append(ivre.db.db.nmap)
-    if args.city_csv is not None:
-        torun.append((ivre.db.db.data.feed_geoip_city,
-                      [args.city_csv],
-                      dbtofeed))
-    if args.country_csv:
-        torun.append((ivre.db.db.data.feed_geoip_country,
-                      [args.country_csv],
-                      dbtofeed))
-    if args.asnum_csv:
-        torun.append((ivre.db.db.data.feed_geoip_asnum,
-                      [args.asnum_csv],
-                      dbtofeed))
-    if args.location_csv:
-        torun.append((ivre.db.db.data.feed_city_location,
-                      [args.location_csv], {}))
+        geoiputils.download_all(verbose=not args.quiet)
+        db.data.reload_files()
     if args.import_all:
-        for function, fname, kwargs in [
-                (ivre.db.db.data.feed_geoip_country,
-                 'GeoIPCountry.csv',
-                 dbtofeed),
-                (ivre.db.db.data.feed_country_codes,
-                 'iso3166.csv', {}),
-                (ivre.db.db.data.feed_city_location,
-                 'GeoIPCity-Location.csv', {}),
-                (ivre.db.db.data.feed_geoip_city,
-                 'GeoIPCity-Blocks.csv',
-                 dbtofeed),
-                (ivre.db.db.data.feed_geoip_asnum,
-                 'GeoIPASNum.csv',
-                 dbtofeed),
-        ]:
-            torun.append((function,
-                          [os.path.join(ivre.config.GEOIP_PATH,
-                                        fname)],
-                          kwargs))
+        torun.append((db.data.build_dumps, [], {}))
     for function, fargs, fkargs in torun:
         function(*fargs, **fkargs)
     for addr in args.ip:
         if addr.isdigit():
             addr = int(addr)
         print(addr)
-        for info in [ivre.db.db.data.as_byip(addr),
-                     ivre.db.db.data.location_byip(addr)]:
+        for info in [db.data.as_byip(addr), db.data.location_byip(addr)]:
             if info:
                 for key, value in viewitems(info):
                     print('    %s %s' % (key, value))

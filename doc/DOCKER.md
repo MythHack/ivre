@@ -111,9 +111,9 @@ that the version of IVRE on PyPI is not always up-to-date. From the
 ### Alternative build for the web image using Apache ###
 
 To use Apache (rather than Nginx) for the `ivre/web` image, simply
-run:
+run, from the `docker/` directory:
 
-    $ docker pull debian:stable
+    $ docker pull ivre/base  # or build it locally
     $ docker build -t ivre/web web-apache
 
 Unlike the default `ivre/web` image, this image uses the Debian
@@ -180,13 +180,11 @@ initialize the database:
 
     root@ivreclient:/# ivre ipinfo --init
     This will remove any passive information in your database. Process ? [y/N] y
-    root@ivreclient:/# ivre ipdata --init
-    This will remove any country/AS information in your database. Process ? [y/N] y
     root@ivreclient:/# ivre scancli --init
     This will remove any scan result in your database. Process ? [y/N] y
     root@ivreclient:/# ivre runscansagentdb --init
     This will remove any agent and/or scan in your database and files. Process ? [y/N] y
-    root@ivreclient:/# ivre ipdata --download --import-all --no-update-passive-db
+    root@ivreclient:/# ivre ipdata --download --import-all
     [...]
 
 The latest command will take a long time. Then we can integrate the
@@ -211,5 +209,5 @@ ivreclient`.
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2015
+This file is part of IVRE. Copyright 2011 - 2018
 [Pierre LALET](mailto:pierre.lalet@cea.fr)

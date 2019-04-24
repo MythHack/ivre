@@ -22,7 +22,7 @@ to integrate screenshots, install
 [FFmpeg](http://ffmpeg.org/) and [PhantomJS](http://phantomjs.org/).
 
 If you plan to analyze PCAP file on a machine, install, depending on
-your needs, [Bro](http://www.bro.org/) (version 2.3 minimum),
+your needs, [Bro](http://www.bro.org/) (version 2.5 minimum),
 [p0f](http://lcamtuf.coredump.cx/p0f/) (version 2, will not work with
 version 3), [Argus](http://qosient.com/argus/) and/or
 [Nfdump](http://nfdump.sourceforge.net/).
@@ -31,10 +31,11 @@ To install IVRE, you'll need [Python](http://www.python.org/) 2
 (version 2.6 minimum, prefer 2.7) or 3 (version 3.3 minimum), with the
 following modules:
 
+  * [Bottle](https://bottlepy.org/)
   * [Crypto](http://www.pycrypto.org/)
   * [pymongo](http://api.mongodb.org/python/) version 2.7.2 minimum.
-  * [py2neo](http://py2neo.org/v3/) version 3 minimum, optional, to
-    use the flow module.
+  * [py2neo](http://py2neo.org/v3/) version 3, optional, to use the
+    flow module.
   * [sqlalchemy](http://www.sqlalchemy.org/) and
     [psycopg2](http://initd.org/psycopg/) to use the experimental
     PostgreSQL backend.
@@ -118,10 +119,10 @@ can be achieved with users or hosts dedicated to insertion tasks.
 Once IVRE has been properly configured, it's time to initialize its
 databases.
 
-For that, the command-line tools (namely `ivre ipdata`, `ivre ipinfo`,
-`ivre scancli` and `ivre runscansagentdb`, respectively for
-information about IP addresses, passive information, active
-information and running scans through agents) have a `--init` option.
+For that, the command-line tools (namely `ivre ipinfo`, `ivre scancli`
+and `ivre runscansagentdb`, respectively for information about IP
+addresses, passive information, active information and running scans
+through agents) have a `--init` option.
 
 So you can run, with a user or from a host where the configuration has
 a write access to the database (add `< /dev/null` to skip the
@@ -131,15 +132,13 @@ confirmation):
     This will remove any scan result in your database. Process ? [y/N] y
     $ ivre ipinfo --init
     This will remove any passive information in your database. Process ? [y/N] y
-    $ ivre ipdata --init
-    This will remove any country/AS information in your database. Process ? [y/N] y
     # ivre runscansagentdb --init
     This will remove any agent and/or scan in your database and files. Process ? [y/N] y
 
 ### Getting IP data ###
 
     # ivre ipdata --download
-    $ ivre ipdata --import-all --no-update-passive-db
+    $ ivre ipdata --import-all
 
 ### Web Server ###
 
@@ -148,9 +147,10 @@ have to copy or symlink IVRE files to your web server directories, or
 configure your web server to use IVRE files directly.
 
 The files the web server should serve statically are located in
-`[PREFIX]/share/ivre/web/static`, the folder the web server should
-serve as CGI is located in `[PREFIX]/share/ivre/web/cgi-bin`, and the
-(optional) folders to use as Dokuwiki content are located in
+`[PREFIX]/share/ivre/web/static`, the WSGI application the web server
+should forward `/cgi` requests is located in
+`[PREFIX]/share/ivre/web/wsgi/app.wsgi`, and the (optional) folders to
+use as Dokuwiki content are located in
 `[PREFIX]/share/ivre/dokuwiki/doc` and
 `[PREFIX]/share/ivre/dokuwiki/media`. Make sure your Dokuwiki has been
 configured with server-side URL rewriting; this means using proper
@@ -167,13 +167,16 @@ installed with the distribution packages, these files should be copied
 or (sym)linked at these locations:
 
  - `[PREFIX]/share/ivre/web/static/*` -> `/var/www` or `/var/www/html`
- - `[PREFIX]/share/ivre/web/cgi-bin/*` -> `/usr/lib/cgi-bin/`
  - `[PREFIX]/share/ivre/dokuwiki/doc`
      -> `/var/lib/dokuwiki/data/pages/`
  - `[PREFIX]/share/ivre/dokuwiki/media/logo.png`
      -> `/var/lib/dokuwiki/data/media/`
  - `[PREFIX]/share/ivre/dokuwiki/media/doc`
      -> `/var/lib/dokuwiki/data/media/`
+
+A specific configuration should also be done to serve the WSGI
+application. You can have a look at the file `pkg/apache/ivre.conf` as
+an example.
 
 ### Getting screenshots ###
 
@@ -185,7 +188,7 @@ and IVRE have been installed in `/usr`:
 
     # cp /usr/share/ivre/nmap_scripts/*.nse /usr/share/nmap/scripts/
     # patch /usr/share/nmap/scripts/rtsp-url-brute.nse \
-	> /usr/share/ivre/nmap_scripts/patches/rtsp-url-brute.patch
+	< /usr/share/ivre/nmap_scripts/patches/rtsp-url-brute.patch
     # nmap --script-updatedb
 
 And now, you can play:
@@ -210,5 +213,5 @@ information about that.
 
 ---
 
-This file is part of IVRE. Copyright 2011 - 2017
+This file is part of IVRE. Copyright 2011 - 2018
 [Pierre LALET](mailto:pierre.lalet@cea.fr)

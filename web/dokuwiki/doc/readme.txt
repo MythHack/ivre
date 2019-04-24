@@ -17,19 +17,20 @@ IVRE is a **framework**. Meaning it does **not** come with ready-to-run scripts 
 
 IVRE relies on:
 
-  * [[http://www.python.org/|Python]] 2 (version 2.6 minimum), or 3 (version 3.3 minimum). Python 2.6 compatibility is important to make sure IVRE works with RHEL and CentOS version 6.
-    * the [[http://www.pycrypto.org/|Crypto]] module.
+  * [[http://www.python.org/|Python]] 2 (version 2.6 minimum), or 3 (version 3.3 minimum). Python 2.6 compatibility is important to make sure IVRE works with [[https://www.redhat.com/fr/technologies/linux-platforms/enterprise-linux|RHEL]] and [[https://www.centos.org/|CentOS]] version 6.
+    * the [[https://bottlepy.org/|Bottle]] module,
+    * the [[http://www.pycrypto.org/|Crypto]] module,
     * the [[http://api.mongodb.org/python/|pymongo]] module, version 2.7.2 minimum.
     * optionally [[http://www.pythonware.com/products/pil/|PIL]], to trim screenshots.
     * optionally [[http://py2neo.org/v3/|py2neo]] to use the flow module, version 3 minimum.
     * optionally [[http://www.sqlalchemy.org/|sqlalchemy]] and [[http://initd.org/psycopg/|psycopg2]] to use the **experimental** PostgreSQL backend.
-  * [[http://nmap.org/|Nmap]]
-  * optionnaly [[https://zmap.io/|ZMap]] and/or [[https://github.com/robertdavidgraham/masscan|Masscan]]
-  * [[http://www.bro.org/|Bro]] (version 2.3 minimum), [[http://qosient.com/argus/|Argus]], [[http://nfdump.sourceforge.net/|Nfdump]]& [[http://lcamtuf.coredump.cx/p0f/|p0f]] (version 2, will not work with version 3) for the passive fingerprint and flow modules.
-  * [[http://www.mongodb.org/|MongoDB]], version 2.6 minimum (tests are run with versions 2.6.12, 3.0.14, 3.2.12, 3.4.2 and 3.5.3).
-  * optionnaly [[http://neo4j.com/|Neo4j]] for the flow module.
-  * optionnaly [[https://www.postgresql.org/|PostgreSQL]], version 9.5 minimum (tests are run with versions 9.5.6 and 9.6.2), for the **experimental** PostgreSQL backend.
-  * a web server (successfully tested with [[https://httpd.apache.org/|Apache]] and [[http://nginx.org/|Nginx]], should work with anything capable of serving static files and run a Python-based CGI), although a test web server is now distributed with IVRE (''%%ivre httpd%%'').
+  * [[http://nmap.org/|Nmap]] version 7.25BETA2 minimum (actually, earlier versions can be used by setting ''%%script_timeout%%'' to ''%%None%%'' in each scan template).
+  * optionally [[https://zmap.io/|ZMap]] and/or [[https://github.com/robertdavidgraham/masscan|Masscan]]
+  * [[http://www.bro.org/|Bro]] (version 2.5 minimum), [[http://qosient.com/argus/|Argus]], [[https://github.com/phaag/nfdump|Nfdump]]& [[http://lcamtuf.coredump.cx/p0f/|p0f]] (version 2, will not work with version 3) for the passive fingerprint and flow modules.
+  * [[http://www.mongodb.org/|MongoDB]], version 2.6 minimum (tests are run with versions 2.6.12, 3.0.15, 3.2.21, 3.4.17, 3.6.8, 4.0.2 and 4.1.3).
+  * optionally [[http://neo4j.com/|Neo4j]] for the flow module.
+  * optionally [[https://www.postgresql.org/|PostgreSQL]], version 9.5 minimum (tests are run with versions 9.5.10, 9.6.6 and 10.1), for the **experimental** PostgreSQL backend.
+  * a web server (successfully tested with [[https://httpd.apache.org/|Apache]] and [[http://nginx.org/|Nginx]], should work with anything capable of serving static files and run a Python-based CGI), although a test web server is distributed with IVRE (''%%ivre httpd%%'').
   * [[https://www.dokuwiki.org/|Dokuwiki]] or another Wiki to use as a notepad. Dokuwiki can also be used to display the documentation.
   * a web browser (successfully tested with recent versions of [[https://www.mozilla.org/firefox/|Firefox]] and [[http://www.chromium.org/|Chromium]]).
   * Maxmind [[https://www.maxmind.com/en/geolocation_landing|GeoIP]] free databases.
@@ -55,32 +56,36 @@ The following steps will show some examples of **passive** network recon with IV
 
 ===== Using Bro =====
 
-You need to run bro (2.3 minimum) with the option ''%%-b%%'' and the location of the ''%%passiverecon.bro%%'' file. If you want to run it on the ''%%eth0%%'' interface, for example, run:
+You need to run Bro (2.5 minimum, tested with 2.5 and 2.6) with the option ''%%-b%%'' and the location of the ''%%passiverecon/bare.bro%%'' file. If you want to run it on the ''%%eth0%%'' interface, for example, run (replace ''%%/usr/share/ivre%%'' by the appropriate location; use ''%%python -c 'import ivre.config; print(ivre.config.guess_prefix())'%%'' if you cannot find it):
 
 <code>
 # mkdir logs
 # LOG_PATH=logs/passiverecon \
-> bro -b /usr/local/share/ivre/passiverecon/passiverecon.bro -i eth0
+> bro -b /usr/share/ivre/bro/ivre/passiverecon/bare.bro -i eth0
+
 </code>
 If you want to run it on the ''%%capture%%'' file (''%%capture%%'' needs to a PCAP file), run:
 
 <code>
 $ mkdir logs
 $ LOG_PATH=logs/passiverecon \
-> bro -b /usr/local/share/ivre/passiverecon/passiverecon.bro -r capture
+> bro -b /usr/share/ivre/bro/ivre/passiverecon/bare.bro -r capture
+
 </code>
 This will produce log files in the ''%%logs%%'' directory. You need to run a ''%%ivre passivereconworker%%'' to process these files. You can try:
 
 <code>
 $ ivre passivereconworker --directory=logs
+
 </code>
 This program will not stop by itself. You can (''%%p%%'')''%%kill%%'' it, it will stop gently (as soon as it has finished to process the current file).
 
 You can also send the data from ''%%bro%%'' to the database without using intermediate files:
 
 <code>
-$ bro -b /usr/local/share/ivre/passiverecon/passiverecon.bro [option] \
+$ bro -b /usr/share/ivre/bro/ivre/passiverecon/bare.bro [option] \
 > | ivre passiverecon2db
+
 </code>
 ===== Using p0f =====
 
@@ -88,11 +93,13 @@ To start filling your database with information from the ''%%eth0%%'' interface,
 
 <code>
 # ivre p0f2db -s passiverecon iface:eth0
+
 </code>
 And from the same ''%%capture%%'' file:
 
 <code>
 $ ivre p0f2db -s passiverecon capture
+
 </code>
 ===== Using the results =====
 
@@ -106,6 +113,7 @@ For example, to show everything stored about an IP address or a network:
 <code>
 $ ivre ipinfo 1.2.3.4
 $ ivre ipinfo 1.2.3.0/24
+
 </code>
 See the output of ''%%ivre help ipinfo%%''.
 
@@ -115,6 +123,7 @@ To use the Python module, run for example:
 $ python
 >>> from ivre.db import db
 >>> db.passive.get(db.passive.flt_empty)[0]
+
 </code>
 For more, run ''%%help(db.passive)%%'' from the Python shell.
 
@@ -126,6 +135,7 @@ The easiest way is to install IVRE on the "scanning" machine and run:
 
 <code>
 # ivre runscans --routable --limit 1000 --output=XMLFork
+
 </code>
 This will run a standard scan against 1000 random hosts on the Internet by running 30 nmap processes in parallel. See the output of ''%%ivre help runscans%%'' if you want to do something else.
 
@@ -133,6 +143,7 @@ When it's over, to import the results in the database, run:
 
 <code>
 $ ivre scan2db -c ROUTABLE-CAMPAIGN-001 -s MySource -r scans/ROUTABLE/up
+
 </code>
 Here, ''%%ROUTABLE-CAMPAIGN-001%%'' is a category (just an arbitrary name that you will use later to filter scan results) and ''%%MySource%%'' is a friendly name for your scanning machine (same here, an arbitrary name usable to filter scan results; by default, when you insert a scan result, if you already have a scan result for the same host address with the same source, the previous result is moved to an "archive" collection (fewer indexes) and the new result is inserted in the database).
 
@@ -152,6 +163,7 @@ To get all the hosts with the port 22 open:
 
 <code>
 $ ivre scancli --port 22
+
 </code>
 See the output of ''%%ivre help scancli%%''.
 
@@ -163,6 +175,7 @@ To use the Python module, run for example:
 $ python
 >>> from ivre.db import db
 >>> db.nmap.get(db.nmap.flt_empty)[0]
+
 </code>
 For more, run ''%%help(db.nmap)%%'' from the Python shell.
 
@@ -203,5 +216,5 @@ You can also try to use the e-mail ''%%dev%%'' on the domain ''%%ivre.rocks%%'',
 
 ----
 
-This file is part of IVRE. Copyright 2011 - 2017 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
+This file is part of IVRE. Copyright 2011 - 2018 [[mailto:pierre.lalet@cea.fr|Pierre LALET]]
 

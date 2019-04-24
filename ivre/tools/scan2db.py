@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,6 +17,9 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 
+"""Parse NMAP scan results and add them in DB."""
+
+
 from __future__ import print_function
 import os
 
@@ -24,6 +27,8 @@ import os
 import ivre.db
 import ivre.utils
 import ivre.xmlnmap
+
+from ivre.view import nmap_record_to_view
 
 
 def recursive_filelisting(base_directories):
@@ -34,27 +39,13 @@ def recursive_filelisting(base_directories):
             for leaffile in files:
                 yield os.path.join(root, leaffile)
 
+
 def main():
-    try:
-        import argparse
-        parser = argparse.ArgumentParser(
-            description='Parse NMAP scan results and add them in DB.')
+    parser, use_argparse = ivre.utils.create_argparser(__doc__,
+                                                       extraargs='scan')
+    if use_argparse:
         parser.add_argument('scan', nargs='*', metavar='SCAN',
                             help='Scan results')
-
-    except ImportError:
-        import optparse
-        parser = optparse.OptionParser(
-            description='Parse NMAP scan results and add them in DB.')
-        parser.parse_args_orig = parser.parse_args
-
-        def my_parse_args():
-            res = parser.parse_args_orig()
-            res[0].ensure_value('scan', res[1])
-            return res[0]
-        parser.parse_args = my_parse_args
-        parser.add_argument = parser.add_option
-
     parser.add_argument('-c', '--categories', default='',
                         help='Scan categories.')
     parser.add_argument('-s', '--source', default=None,
@@ -67,13 +58,6 @@ def main():
                         help='Store only hosts with a "ports" element.')
     parser.add_argument('--open-ports', action='store_true',
                         help='Store only hosts with open ports.')
-    parser.add_argument('--never-archive', action='store_true',
-                        help='Never archive.')
-    parser.add_argument('--archive', '--archive-same-host', action='store_true',
-                        help='Archive results for the same host.')
-    parser.add_argument('--archive-same-host-and-source', action='store_true',
-                        help='Archive results with both the same host and'
-                        ' source (this is the default).')
     parser.add_argument('--merge', action='store_true', help='Merge '
                         'result with previous scan result for same host '
                         'and source. Useful to use multiple partial '
@@ -88,29 +72,28 @@ def main():
                         ' renewal (only useful with JSON format)')
     parser.add_argument('-r', '--recursive', action='store_true',
                         help='Import all files from given directories.')
+    parser.add_argument('--no-update-view', action='store_true',
+                        help='Do not merge hosts in current view')
     args = parser.parse_args()
     database = ivre.db.db.nmap
     categories = args.categories.split(',') if args.categories else []
     if args.test:
+        args.no_update_view = True
         database = ivre.db.DBNmap()
     if args.test_normal:
+        args.no_update_view = True
         database = ivre.db.DBNmap(output_mode="normal")
-    if args.never_archive:
-        def gettoarchive(addr, _):
-            return []
-    elif args.archive:
-        def gettoarchive(addr, _):
-            return database.get(database.searchhost(addr))
-    else:  #args.archive_same_host_and_source
-        def gettoarchive(addr, source):
-            return database.get(
-                database.flt_and(database.searchhost(addr),
-                                 database.searchsource(source))
-            )
     if args.recursive:
         scans = recursive_filelisting(args.scan)
     else:
         scans = args.scan
+    if args.no_update_view:
+        callback = None
+    else:
+        def callback(x):
+            return ivre.db.db.view.store_or_merge_host(
+                nmap_record_to_view(x)
+            )
     count = 0
     for scan in scans:
         try:
@@ -118,8 +101,8 @@ def main():
                     scan,
                     categories=categories, source=args.source,
                     needports=args.ports, needopenports=args.open_ports,
-                    gettoarchive=gettoarchive, force_info=args.force_info,
-                    merge=args.merge, masscan_probes=args.masscan_probes,
+                    force_info=args.force_info,
+                    masscan_probes=args.masscan_probes, callback=callback,
             ):
                 count += 1
         except Exception:

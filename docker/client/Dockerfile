@@ -1,5 +1,5 @@
 # This file is part of IVRE.
-# Copyright 2011 - 2016 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -15,7 +15,7 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 FROM ivre/base
-MAINTAINER Pierre LALET <pierre.lalet@cea.fr>
+LABEL maintainer="Pierre LALET <pierre.lalet@cea.fr>"
 
 # Tools
 ## non-free: s3270
@@ -25,7 +25,7 @@ RUN apt-get -q update
 ## libfreetype6 libfontconfig1 fonts-dejavu: screenshots w/ phantomjs
 RUN apt-get -qy install p0f rsync screen ipython openssl tesseract-ocr \
     libfreetype6 libfontconfig1 fonts-dejavu imagemagick ffmpeg s3270 \
-    patch bash-completion bzip2 bro
+    patch bash-completion bzip2 bro python-pil
 
 # Install Nmap. Use included libpcap because to use the workaround for
 # Nmap issue #34 (https://github.com/nmap/nmap/issues/34) since we do
@@ -45,7 +45,6 @@ RUN apt-get -qy install build-essential libssl-dev && \
     apt-get -qy --purge autoremove build-essential libssl-dev
 
 # "Install" phantomjs for our http-screenshot NSE script replacement
-# wget https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-1.9.8-linux-x86_64.tar.bz2 -O ./phantomjs-1.9.8-linux-x86_64.tar.bz2
 ADD https://bitbucket.org/ariya/phantomjs/downloads/phantomjs-1.9.8-linux-x86_64.tar.bz2 ./phantomjs-1.9.8-linux-x86_64.tar.bz2
 RUN tar jxf phantomjs-1.9.8-linux-x86_64.tar.bz2 phantomjs-1.9.8-linux-x86_64/bin/phantomjs && \
     mv phantomjs-1.9.8-linux-x86_64/bin/phantomjs /usr/local/bin/ && \

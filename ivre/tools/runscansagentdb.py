@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+
 
 """Manage scans run on remote agents."""
 
@@ -63,6 +64,7 @@ def display_scan(scan, verbose=True):
     for agent in scan['agents']:
         print("    - %s" % agent)
 
+
 def display_agent(agent, verbose=True):
     print("agent:")
     if verbose:
@@ -90,6 +92,7 @@ def display_agent(agent, verbose=True):
         ivre.db.db.agent.may_receive(agent['_id'])
     ))
 
+
 def display_master(master, verbose=True):
     print("master:")
     if verbose:
@@ -97,19 +100,21 @@ def display_master(master, verbose=True):
     print("  - hostname %s" % master["hostname"])
     print("  - path %s" % master["path"])
 
+
 WANT_DOWN = False
+
 
 def main():
     try:
         import argparse
         parser = argparse.ArgumentParser(
             description=__doc__,
-            parents=[ivre.target.argparser])
+            parents=[ivre.target.ARGPARSER])
     except ImportError:
         import optparse
         parser = optparse.OptionParser(
             description=__doc__)
-        for args, kargs in ivre.target.argparser.args:
+        for args, kargs in ivre.target.ARGPARSER.args:
             parser.add_option(*args, **kargs)
         parser.parse_args_orig = parser.parse_args
         parser.parse_args = lambda: parser.parse_args_orig()[0]
@@ -145,7 +150,7 @@ def main():
                         help='Purge or create and initialize the database.')
     parser.add_argument('--sleep', type=int, default=2,
                         help='Time to wait between each feed/sync '
-                        'cycle (only usefull with --daemon).')
+                        'cycle (only useful with --daemon).')
     parser.add_argument(
         '--daemon', action="store_true", help="""Run continuously
         feed/sync cycles. The "sync" part requires to be able to rsync
@@ -242,6 +247,7 @@ def main():
                 signum,
             )
             WANT_DOWN = True
+
         def terminate_now(signum, _):
             ivre.utils.LOGGER.info('shutdown: got signal %d, halting now.',
                                    signum)
